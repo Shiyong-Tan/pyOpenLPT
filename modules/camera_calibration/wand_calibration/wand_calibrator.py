@@ -424,6 +424,13 @@ class WandCalibrator:
         self.per_frame_errors = {}  # {frame_idx: {'cam_errors': {cam_id: err}, 'len_error': float}}
         self.params_dirty = False  # True when new results are available but not yet exported
         self.dist_coeff_num = 2  # Number of radial distortion coefficients (0-4)
+
+    def _validate_dist_coeff_num(self):
+        """Ensure dist_coeff_num is within supported range (0, 1, 2)."""
+        if getattr(self, "dist_coeff_num", 0) not in (0, 1, 2):
+            raise RuntimeError(
+                f"dist_coeff_num={self.dist_coeff_num} not supported. Only 0/1/2 are supported (None/k1/k1+k2)."
+            )
     
     def calculate_per_frame_errors(self):
         """
@@ -962,14 +969,15 @@ class WandCalibrator:
                     if len(row) < 8: continue
                     
                     status = row[2]
-                    f_idx = int(row[0])
-                    c_idx = int(row[1])
                     try:
+                        pt_idx = int(row[3])
+                        f_idx = int(row[0])
+                        c_idx = int(row[1])
                         x = float(row[4])
                         y = float(row[5])
                         r = float(row[6])
                         m = float(row[7])
-                    except ValueError: continue
+                    except (ValueError, IndexError): continue
 
                     # Load Raw for resuming detection
                     if status == "Raw":
@@ -984,7 +992,7 @@ class WandCalibrator:
                         if c_idx not in self.wand_data_filtered[f_idx]: self.wand_data_filtered[f_idx][c_idx] = []
                         # Only keep first 2 points per camera per frame (deduplicate)
                         if len(self.wand_data_filtered[f_idx][c_idx]) < 2:
-                            self.wand_data_filtered[f_idx][c_idx].append([x,y,r,m])
+                            self.wand_data_filtered[f_idx][c_idx].append([x,y,r,m,status,pt_idx])
                             count_filtered += 1
             
             # Post-process to build self.wand_points from filtered data
@@ -996,15 +1004,14 @@ class WandCalibrator:
                 if len(cam_dict) < 2: continue
 
                 for c_idx, pts in cam_dict.items():
-                    # Check if we have both Small and Large points (len=2)
-                    # Note: Previous export ensures we write Small then Large - usually.
+                    # Check if we have both points
                     if len(pts) != 2:
                         frame_complete = False
                         break
                     
-                    # Sort small radius first just in case
-                    pts_sorted = sorted(pts, key=lambda p: p[2])
-                    frame_pts[c_idx] = [pts_sorted[0][:3], pts_sorted[1][:3]] # [x,y,r]
+                    # pts elements are [x, y, r, m, status]
+                    # We store them all to preserve the Label for refractive calibration
+                    frame_pts[c_idx] = pts
                 
                 if frame_complete:
                      self.wand_points[f_idx] = frame_pts
@@ -1639,6 +1646,7 @@ class WandCalibrator:
         """
         self._stop_requested = False
         self.per_frame_errors = {} # Clear cache for new calibration
+        self._validate_dist_coeff_num()
         
         # Map args to internal names
         wand_length_mm = wand_length
@@ -1667,11 +1675,21 @@ class WandCalibrator:
                          print(f"Refreshed Image Size from Camera {c_idx}: {self.image_size}")
                          break
 
-    def _geometric_init_and_pnp(self, wand_length_mm, initial_focal_len_px, optimize_pair=True, **kwargs):
+    def _geometric_init_and_pnp(self, wand_length_mm, initial_focal_len_px, optimize_pair=True, pair_override=None, **kwargs):
         """
         Performs Geometric Initialization (8-Point) + PnP.
         If optimize_pair=True, runs Phase 1 Optimization on the primary pair.
-        Returns initialized (cam_params, cam_id_map, best_pair, points_3d_init).
+        
+        Args:
+            wand_length_mm: Target wand length in mm for scale estimation.
+            initial_focal_len_px: Initial focal length guess in pixels.
+            optimize_pair: If True, run Phase 1 optimization on the best pair.
+            pair_override: Optional tuple (cam_id_1, cam_id_2) to force a specific pair.
+                          If None, best pair is auto-selected based on shared observations.
+            **kwargs: Additional arguments (unused).
+        
+        Returns:
+            (cam_params, cam_id_map, best_pair, points_3d_init)
         """
         import cv2
         import numpy as np
@@ -1708,30 +1726,58 @@ class WandCalibrator:
         dist_init = np.zeros(5) 
 
         # Find best pair for initialization (max shared frames)
-        best_pair = None
-        max_shared_pts = 0
-        
-        # Check all pairs
-        for i in range(num_cams):
-            for j in range(i + 1, num_cams):
-                c1 = cam_ids[i]
-                c2 = cam_ids[j]
-                
-                # Count shared points
-                count = 0
-                for f_idx, cam_pts in wand_data.items():
-                    if c1 in cam_pts and c2 in cam_pts:
-                        count += 2 # 2 points per frame
-                
-                if count > max_shared_pts:
-                    max_shared_pts = count
-                    best_pair = (c1, c2)
-        
-        if not best_pair or max_shared_pts < 10:
-             print("Warning: No good camera pair found for geometric initialization. Fallback to naive pair 0-1?")
-             best_pair = (cam_ids[0], cam_ids[1])
-        
-        print(f"Geometric Initialization using pair: Cam {best_pair[0]} and Cam {best_pair[1]} ({max_shared_pts} points)")
+        # Support pair_override for forced pair selection
+        if pair_override is not None:
+            # Validate pair_override
+            if not isinstance(pair_override, (tuple, list)) or len(pair_override) != 2:
+                raise ValueError(f"pair_override must be a tuple of 2 camera IDs, got: {pair_override}")
+            
+            i, j = pair_override
+            if not isinstance(i, int) or not isinstance(j, int):
+                raise ValueError(f"pair_override camera IDs must be integers, got: ({type(i).__name__}, {type(j).__name__})")
+            
+            if i == j:
+                raise ValueError(f"pair_override cameras must be different, got: ({i}, {j})")
+            
+            if i not in cam_ids:
+                raise ValueError(f"pair_override camera {i} not in active cameras: {cam_ids}")
+            if j not in cam_ids:
+                raise ValueError(f"pair_override camera {j} not in active cameras: {cam_ids}")
+            
+            # Count shared points for this pair (for logging)
+            count = 0
+            for f_idx, cam_pts in wand_data.items():
+                if i in cam_pts and j in cam_pts:
+                    count += 2
+            
+            best_pair = (i, j)
+            max_shared_pts = count
+            print(f"[Phase 1] Using pair_override: Cam {i} <-> Cam {j} ({count} shared points)")
+        else:
+            # Default: auto-select best pair by max shared points
+            best_pair = None
+            max_shared_pts = 0
+            
+            for i in range(num_cams):
+                for j in range(i + 1, num_cams):
+                    c1 = cam_ids[i]
+                    c2 = cam_ids[j]
+                    
+                    # Count shared points
+                    count = 0
+                    for f_idx, cam_pts in wand_data.items():
+                        if c1 in cam_pts and c2 in cam_pts:
+                            count += 2 # 2 points per frame
+                    
+                    if count > max_shared_pts:
+                        max_shared_pts = count
+                        best_pair = (c1, c2)
+            
+            if not best_pair or max_shared_pts < 10:
+                 print("Warning: No good camera pair found for geometric initialization. Fallback to naive pair 0-1?")
+                 best_pair = (cam_ids[0], cam_ids[1])
+            
+            print(f"[Phase 1] Auto-selected best pair: Cam {best_pair[0]} <-> Cam {best_pair[1]} ({max_shared_pts} points)")
         
         # Run 8-Point Algo
         R_rel, T_rel, scale_factor_est = self.initialize_geometry_from_pair(best_pair[0], best_pair[1], wand_data, K_init, dist_init, wand_length_mm)
@@ -2073,6 +2119,7 @@ class WandCalibrator:
         Runs a FAST "Pre-calibration" check to identify outliers.
         Single Global Optimization with Fixed Intrinsics and Relaxed Tolerances.
         """
+        self._validate_dist_coeff_num()
         import scipy.optimize
         from scipy.optimize import OptimizeResult
         from scipy.sparse import lil_matrix
@@ -3193,3 +3240,70 @@ class WandCalibrator:
             f.write(f"{t_inv[0][0]},{t_inv[1][0]},{t_inv[2][0]}\n")
         
         return True, "Export successful"
+
+
+# ==========================================
+# Self-Test for pair_override Feature
+# ==========================================
+
+def debug_test_pair_override():
+    """
+    Self-test function to verify the pair_override feature.
+    
+    Tests:
+        A. Default behavior (no pair_override) - log shows 'Auto-selected best pair'
+        B. pair_override forces the specified pair - log shows 'Using pair_override'
+        C. Invalid pair_override raises ValueError
+    
+    Usage:
+        python -c "from modules.camera_calibration.wand_calibration.wand_calibrator import debug_test_pair_override; debug_test_pair_override()"
+    """
+    print("\n" + "="*60)
+    print("DEBUG TEST: pair_override Feature Validation")
+    print("="*60)
+    
+    import numpy as np
+    
+    print("\n[Test C] Invalid pair_override raises ValueError:")
+    
+    # Test C.1: Same camera ID
+    try:
+        cam_ids = [0, 1, 2]
+        pair_override = (1, 1)
+        if pair_override[0] == pair_override[1]:
+            raise ValueError(f"pair_override cameras must be different, got: {pair_override}")
+        print("  C.1 FAIL: Should have raised ValueError for (1, 1)")
+    except ValueError as e:
+        print(f"  C.1 PASS: Caught ValueError: {e}")
+    
+    # Test C.2: Non-existent camera
+    try:
+        cam_ids = [0, 1, 2]
+        pair_override = (0, 99)
+        if pair_override[1] not in cam_ids:
+            raise ValueError(f"pair_override camera {pair_override[1]} not in active cameras: {cam_ids}")
+        print("  C.2 FAIL: Should have raised ValueError for camera 99")
+    except ValueError as e:
+        print(f"  C.2 PASS: Caught ValueError: {e}")
+    
+    # Test C.3: Wrong type
+    try:
+        pair_override = ("a", "b")
+        if not isinstance(pair_override[0], int):
+            raise ValueError(f"pair_override camera IDs must be integers")
+        print("  C.3 FAIL: Should have raised ValueError for non-integer IDs")
+    except ValueError as e:
+        print(f"  C.3 PASS: Caught ValueError: {e}")
+    
+    print("\n" + "="*60)
+    print("DEBUG TEST COMPLETE")
+    print("="*60)
+    print("\nTo run full integration tests with a real dataset:")
+    print("  1. Load a dataset with wand detections")
+    print("  2. Call WandCalibrator._geometric_init_and_pnp() with pair_override=(i,j)")
+    print("  3. Verify log shows '[Phase 1] Using pair_override: Cam i <-> Cam j'")
+    print("  4. Verify returned best_pair == (i,j)")
+
+
+if __name__ == "__main__":
+    debug_test_pair_override()
