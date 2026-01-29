@@ -19,7 +19,6 @@ from .refractive_geometry import (
 )
 
 from .refractive_bootstrap import PinholeBootstrapP0, PinholeBootstrapP0Config, select_best_pair_via_precalib
-from .refractive_plane_optimizer import RefractivePlaneOptimizer, OptimizationConfig
 from .refractive_bundle_adjustment import RefractiveBAOptimizerPR4, PR4Config, RefractiveBAOptimizerPR5, PR5Config
 from scipy.optimize import least_squares
 
@@ -209,183 +208,6 @@ class RefractiveWandCalibrator:
         data = "|".join(parts)
         return hashlib.md5(data.encode()).hexdigest()[:8]
     
-    def save_p1_cache(self, path, window_planes, window_media, cam_to_window, 
-                      dataset, cam_params, diagnostics=None):
-        """
-        Save P1 plane optimization results to disk for reuse.
-        
-        Args:
-            path: Path to save cache file (.json)
-            window_planes: Dict[wid, {'plane_n': ndarray, 'plane_pt': ndarray}]
-            window_media: Dict[wid, {'thickness': float, 'n_obj': float, ...}]
-            cam_to_window: Dict[cid, wid]
-            dataset: Dataset dict with 'num_frames', 'cam_ids', etc.
-            cam_params: Dict[cid, ndarray] - current camera params
-            diagnostics: Optional dict with ray_rmse, wand_rmse, etc.
-        """
-        import json
-        from datetime import datetime
-        from pathlib import Path
-        
-        # Build windows dict
-        windows = {}
-        for wid, pl in window_planes.items():
-            wm = window_media.get(wid, {})
-            windows[str(wid)] = {
-                "plane_normal": pl['plane_n'].tolist(),
-                "plane_distance": float(np.dot(pl['plane_n'], pl['plane_pt'])),
-                "plane_pt_closest": pl['plane_pt'].tolist(),
-                "thickness": float(wm.get('thickness', 10.0)),
-                "refraction_indices": [
-                    float(wm.get('n_obj', 1.33)),
-                    float(wm.get('n_win', 1.52)),
-                    float(wm.get('n_air', 1.0))
-                ]
-            }
-        
-        cache = {
-            "cache_version": "P1_v1",
-            "timestamp": datetime.now().isoformat(),
-            "conventions": {
-                "plane_point_convention": "closest_interface",
-                "normal_convention": "camera_to_object",
-                "sign_rules": {"s_C": "<0", "s_X": ">0"}
-            },
-            "dataset_fingerprint": {
-                "num_frames": int(dataset.get('num_frames', 0)),
-                "camera_ids": sorted([int(c) for c in dataset.get('cam_ids', [])]),
-                "cam_to_window": {str(k): int(v) for k, v in cam_to_window.items()},
-                "config_hash": self._compute_config_hash(cam_params, cam_to_window, window_media)
-            },
-            "windows": windows,
-            "optimization_summary": diagnostics or {}
-        }
-        
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'w') as f:
-            json.dump(cache, f, indent=2)
-        
-        print(f"[P1][CACHE] Plane cache exported to: {path}")
-    
-    def load_p1_cache(self, path, window_media, cam_to_window, dataset, cam_params):
-        """
-        Load P1 cache from disk if valid.
-        
-        Args:
-            path: Path to cache file (.json)
-            window_media: Current window media config
-            cam_to_window: Current camera-to-window mapping
-            dataset: Current dataset info
-            cam_params: Current camera params (for hash validation)
-            
-        Returns:
-            (window_planes, True) if cache is valid & loaded
-            (None, False) if cache is invalid/missing
-        """
-        import json
-        from pathlib import Path
-        
-        if not Path(path).exists():
-            return None, False
-        
-        try:
-            with open(path, 'r') as f:
-                cache = json.load(f)
-        except Exception as e:
-            print(f"[P1][CACHE] Failed to load: {e}")
-            return None, False
-        
-        # Version check
-        if cache.get("cache_version") != "P1_v1":
-            print(f"[P1][CACHE] Version mismatch: {cache.get('cache_version')} != P1_v1")
-            return None, False
-        
-        # Convention check
-        conventions = cache.get("conventions", {})
-        if conventions.get("plane_point_convention") != "closest_interface":
-            print(f"[P1][CACHE] Convention mismatch: plane_point_convention")
-            return None, False
-        if conventions.get("normal_convention") != "camera_to_object":
-            print(f"[P1][CACHE] Convention mismatch: normal_convention")
-            return None, False
-        
-        fingerprint = cache.get("dataset_fingerprint", {})
-        
-        # Camera ID check
-        cached_cams = set(fingerprint.get("camera_ids", []))
-        current_cams = set(int(c) for c in dataset.get('cam_ids', []))
-        if cached_cams != current_cams:
-            print(f"[P1][CACHE] Camera mismatch: {cached_cams} != {current_cams}")
-            return None, False
-        
-        # cam_to_window check
-        cached_c2w = {int(k): int(v) for k, v in fingerprint.get("cam_to_window", {}).items()}
-        current_c2w = {int(k): int(v) for k, v in cam_to_window.items()}
-        if cached_c2w != current_c2w:
-            print(f"[P1][CACHE] cam_to_window mismatch")
-            return None, False
-        
-        # Config hash check
-        current_hash = self._compute_config_hash(cam_params, cam_to_window, window_media)
-        cached_hash = fingerprint.get("config_hash", "")
-        if current_hash != cached_hash:
-            print(f"[P1][CACHE] Config hash mismatch: {cached_hash} != {current_hash}")
-            return None, False
-        
-        # Load windows
-        cached_windows = cache.get("windows", {})
-        window_planes = {}
-        
-        for wid_str, wdata in cached_windows.items():
-            wid = int(wid_str)
-            wm = window_media.get(wid, {})
-            
-            # Validate thickness
-            cached_thick = wdata.get("thickness", 10.0)
-            current_thick = wm.get('thickness', 10.0)
-            if abs(cached_thick - current_thick) > 0.01:
-                print(f"[P1][CACHE] Thickness mismatch for window {wid}: {cached_thick} != {current_thick}")
-                return None, False
-            
-            # Validate RI
-            cached_ri = wdata.get("refraction_indices", [1.33, 1.52, 1.0])
-            current_ri = [wm.get('n_obj', 1.33), wm.get('n_win', 1.52), wm.get('n_air', 1.0)]
-            for i, (cr, curr) in enumerate(zip(cached_ri, current_ri)):
-                if abs(cr - curr) > 0.001:
-                    print(f"[P1][CACHE] RI mismatch for window {wid}: {cached_ri} != {current_ri}")
-                    return None, False
-            
-        # Validate normal is unit length
-            plane_n = np.array(wdata["plane_normal"], dtype=np.float64)
-            if abs(np.linalg.norm(plane_n) - 1.0) > 0.01:
-                print(f"[P1][CACHE] Invalid normal for window {wid}: not unit length")
-                return None, False
-            
-            plane_pt = np.array(wdata["plane_pt_closest"], dtype=np.float64)
-            
-            window_planes[wid] = {
-                'plane_n': plane_n,
-                'plane_pt': plane_pt,
-                'initialized': True,
-                'thick_mm': current_thick
-            }
-        
-        # Verify we have all required windows
-        required_wids = set(cam_to_window.values())
-        loaded_wids = set(window_planes.keys())
-        if required_wids != loaded_wids:
-            print(f"[P1][CACHE] Window mismatch: expected {required_wids}, got {loaded_wids}")
-            return None, False
-        
-        # Print summary
-        summary = cache.get("optimization_summary", {})
-        print(f"[P1][CACHE] Loaded plane cache successfully from: {path}")
-        print(f"  Windows: {list(window_planes.keys())}")
-        print(f"  Timestamp: {cache.get('timestamp', 'unknown')}")
-        print(f"  Note: Using cached planes with FRESH dataset observations.")
-        if summary:
-            print(f"  [Prior] Ray RMSE: {summary.get('ray_residual_rmse', 'N/A'):.4f}")
-            print(f"  [Prior] Wand RMSE: {summary.get('wand_length_rmse', 'N/A'):.4f}")
         
         return window_planes, True
 
@@ -408,10 +230,14 @@ class RefractiveWandCalibrator:
             raise ValueError("No wand points detected or loaded.")
         
         # Intersection over all frames to find cameras consistently seeing the wand
-        frames_list = sorted(self.base.wand_points.keys())
+        # PRIORITIZE filter if active
+        source_points = self.base.wand_points_filtered if self.base.wand_points_filtered else self.base.wand_points
+        frames_list = sorted(source_points.keys())
+        print(f"[Refractive] Using {len(frames_list)} frames (Filtered={self.base.wand_points_filtered is not None})")
+
         active_cams = None
         for fid in frames_list:
-            cams_in_frame = set(self.base.wand_points[fid].keys())
+            cams_in_frame = set(source_points[fid].keys())
             if active_cams is None:
                 active_cams = cams_in_frame
             else:
@@ -443,7 +269,7 @@ class RefractiveWandCalibrator:
             radii_large[fid] = {}
             mask_A[fid] = {}
             mask_B[fid] = {}
-            frame_data = self.base.wand_points[fid]
+            frame_data = source_points[fid]
             
             for cid in active_cams:
                 pts = frame_data[cid]
@@ -1158,98 +984,7 @@ class RefractiveWandCalibrator:
         return out_dir
 
 
-    def optimize_planes(self, dataset, cam_to_window, window_media, window_planes, cam_params, cams_cpp, active_cam_ids, verbosity: int = 0, progress_callback=None):
-        """
-        PR4: Refractive Plane Optimization.
-        Returns updated window_planes.
-        """
-        if verbosity >= 0:
-            print("\n" + "="*60)
-            print("[Refractive] Phase P1: Plane Optimization (Fixed Extrinsics)")
-            print("="*60)
-        
-        wand_len_target = dataset.get('wand_length', 10.0)
-        
-        # Inject bootstrap points for P1 sanity Check
-        if hasattr(self, 'X_B_list') and self.X_B_list:
-            dataset['bootstrap_points'] = [x for x in self.X_B_list.values() if x is not None]
-        
-        # Create optimizer with all necessary data
-        optimizer = RefractivePlaneOptimizer(
-            dataset=dataset,
-            cam_params=cam_params,
-            cams_cpp=cams_cpp,
-            cam_to_window=cam_to_window,
-            window_media=window_media,
-            window_planes=window_planes,
-            wand_length=wand_len_target,
-            config=OptimizationConfig(
-                lambda_reg=10.0,
-                alpha_beta_bound=0.5, # ~28.6 degrees
-                max_frames=50000,
-                verbosity=verbosity
-            ),
-            progress_callback=progress_callback
-        )
-        
-        # P1.1 / P1.2: Per-Window Optimization
-        if progress_callback:
-            try:
-                progress_callback("Optimizing Window Parameters...", 0.0, 0.0, 0.0)
-            except:
-                pass
-        opt_planes = optimizer.optimize_per_window()
-        
-        # P1.3: Joint Optimization (All Windows)
-        if verbosity >= 1:
-            print("\n" + "="*60)
-            print("[Refractive] Phase P1.3: Joint Optimization")
-            print("="*60)
-        
-        if progress_callback:
-            try:
-                progress_callback("Refining All Windows Jointly...", 0.0, 0.0, 0.0)
-            except:
-                pass
-        opt_planes = optimizer.optimize_joint()
 
-        
-        # P1 Summary
-        print("\n[Refractive] P1 Optimization Summary (d_key = dist from mean cam center):")
-        # Build cam centers for d_key calc
-        import cv2
-        center_cache = {}
-        for cid, p in cam_params.items():
-             R, _ = cv2.Rodrigues(p[0:3])
-             center_cache[cid] = -R.T @ p[3:6] # Recompute or assume helper avail? Use canonical helper if possible?
-             # Actually I have camera_center helper imported
-             # from .refractive_geometry import camera_center
-             # Let's use it if available in self scope? 
-             # No, this is inside method. Let's use helper as I imported it at top of file.
-             
-        for wid, pl in opt_planes.items():
-             n = pl['plane_n']
-             pt = pl['plane_pt']
-             
-             # Compute d_key
-             cams = [c for c, w in cam_to_window.items() if w == wid and c in cam_params]
-             d_key = 0.0
-             if cams:
-                 centers = [camera_center(cv2.Rodrigues(cam_params[c][0:3])[0], cam_params[c][3:6]) for c in cams]
-                 C_mean = np.mean(centers, axis=0)
-                 d_key = np.dot(n, pt - C_mean)
-             
-             thick = window_media.get(wid, {}).get('thickness', 0)
-             print(f"  Win {wid}: d_key={d_key:.2f}mm, thick={thick:.1f}mm, n={n.round(4)}")
-
-        # [CRITICAL] Final Sync to C++ objects (Ensures next stage stars from P1 results)
-        optimizer._apply_planes_to_cpp(opt_planes)
-        
-        if verbosity >= 1:
-            optimizer.print_diagnostics()
-            print("\n[Refractive] P1 Optimization Complete.")
-        
-        return opt_planes
 
     def _init_cams_cpp_in_memory(self, cam_params, window_media, cam_to_window, window_planes):
         """
@@ -1583,21 +1318,21 @@ class RefractiveWandCalibrator:
             est_r_small = 0.0
             est_r_large = 0.0
             if X_A_scaled and X_B_scaled:
-                 est_r_small, est_r_large = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="P1")
+                 est_r_small, est_r_large = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="Bootstrap")
             
             # Store in dataset for later stages (Step 2)
             dataset['est_radius_small_mm'] = est_r_small
             dataset['est_radius_large_mm'] = est_r_large
-            print(f"[P1] Stored estimated radii in dataset: Small={est_r_small:.3f}mm, Large={est_r_large:.3f}mm")
+            print(f"[BOOT] Stored estimated radii in dataset: Small={est_r_small:.3f}mm, Large={est_r_large:.3f}mm")
 
 
             if self.window_planes is None:
-                print("[P1] Plane initialization failed.")
+                print("[BOOT] Plane initialization failed.")
                 if progress_callback: progress_callback("Plane initialization failed.", 0, 0, 0)
                 return None, False
                 
             # [DEBUG] Inspect window_planes keys
-            print(f"[DEBUG] P1 returned window_planes keys: {list(self.window_planes.keys())}")
+            print(f"[BOOT] Initialized window_planes keys: {list(self.window_planes.keys())}")
             if self.window_planes:
                 k0 = list(self.window_planes.keys())[0]
                 print(f"[DEBUG] Key type: {type(k0)}")
@@ -1685,7 +1420,7 @@ class RefractiveWandCalibrator:
         print(f"  Max Baseline: {max_b:.2f} mm (N_cam={len(cams_reported)})")
         assert max_b > 10.0 or len(dataset['cam_ids']) < 2, f"Degenerate Max Baseline: {max_b:.2f} mm"
 
-        print("\n[Refractive][SANITY] Window Parameters (P1 Initial)")
+        print("\n[Refractive][SANITY] Window Parameters (Initial)")
         for wid, media in window_media.items():
             wp = self.window_planes.get(wid)
             if wp is None:
@@ -1727,61 +1462,6 @@ class RefractiveWandCalibrator:
                 pass
 
 
-        # === Phase P1: Refractive Plane Optimization ===
-        # Save cache in PARENT directory (dataset root) to share across timestamped runs
-        p1_cache_path = os.path.join(str(Path(out_path).parent), "p1_plane_cache.json")
-        
-        # Try to load P1 cache
-        cached_planes, cache_valid = self.load_p1_cache(
-            p1_cache_path, window_media, cam_to_window, dataset, cam_params
-        )
-        
-        if cache_valid:
-            print("[P1][CACHE] Loaded plane cache successfully, skipping P1 optimization")
-            self.window_planes = cached_planes
-        else:
-            # Run P1 optimization
-            # Progress callback: report P1 Plane Optimization
-            if progress_callback:
-                try:
-                    progress_callback("Initializing Window Optimization...", 0.0, 0.0, 0.0)
-                except:
-                    pass
-            
-            # [USER REQUEST] P1 SKIPPED -> Use P0 result directly
-            print("[P1] Skipped (User Request). Using P0 initialization.")
-            optimized_planes = None 
-            
-            # optimized_planes = self.optimize_planes(
-            #     dataset, cam_to_window, window_media, self.window_planes, 
-            #     cam_params, cams_cpp, active_cam_ids, verbosity=verbosity,
-            #     progress_callback=progress_callback
-            # )
-            
-            # [CRITICAL] Update internal self.window_planes with optimized result
-            if optimized_planes:
-                self.window_planes = optimized_planes
-
-
-
-            
-            # Collect diagnostics for cache
-            p1_diagnostics = {
-                "ray_residual_rmse": getattr(self, '_last_ray_rmse', 0.0),
-                "wand_length_rmse": getattr(self, '_last_wand_rmse', 0.0),
-                "wand_length_bias": getattr(self, '_last_wand_bias', 0.0)
-            }
-            
-            # Save P1 cache (Even if skipped, save current P0-state as P1 result to avoid repeated re-init attempts?)
-            # No, if skipped we might effectively not have a "P1 result". 
-            # But PR4 needs `self.window_planes` to be valid. It is from P0.
-            # Let's save it so next run loads this "skipped" state as "P1 result".
-            # CAREFUL: If we save it, next run says "Loaded plane cache successfully". 
-            # If that satisfies user, great.
-            self.save_p1_cache(
-                p1_cache_path, self.window_planes, window_media, cam_to_window, 
-                dataset, cam_params, p1_diagnostics
-            )
         
 
         # === Phase PR4: Bundle Adjustment (Selective BA) ===

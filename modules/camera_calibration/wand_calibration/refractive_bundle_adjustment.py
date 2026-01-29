@@ -31,16 +31,6 @@ import json
 import os
 from pathlib import Path
 
-from .refractive_constraints import (
-    PlaneOrderConfig, 
-    PointSideConfig,
-    compute_plane_order_penalties,
-    compute_point_side_penalty,
-    compute_camera_side_penalty,
-    compute_soft_barrier_penalty,
-    clamp_ray_parameter,
-    print_plane_side_verification
-)
 
 
 try:
@@ -229,36 +219,11 @@ class PR4Config:
     lambda_reg_tvec: float = 1.0    # Translation drift penalty
     lambda_reg_rvec: float = 50.0   # Rotation drift penalty (standard)
     
-    # Strong rvec constraints (15-20 deg)
-    allow_weak_rvec: bool = True    # If True, allow OPT_STRONG for 15-20 deg
-    prior_lambda_rot_base: float = 1.0
-    prior_p_rot: float = 2.0
-    step_cap_rot_deg_strong: float = 0.1
-    step_cap_rot_deg_weak: float = 0.5
-    step_cap_rot_deg_normal: float = 2.0
-    
-    # Tvec step caps (mm per round)
-    step_cap_tvec_weak_mm: float = 0.5   # For STRONG/REGULARIZED
-    step_cap_tvec_normal_mm: float = 1.0 # For normal OPTIMIZE
-
-    
-    # Observability thresholds
-    theta_freeze: float = 15.0        # Hard freeze below this
-    theta_enable_rot: float = 20.0    # Normal optimization above this
-    theta_strong_rot: float = 35.0    # Very strong diversity
-    baseline_guard_mm: float = 10.0   # Below this, keep rvec heavily damped
-    
-    # Bounds
-    alpha_beta_bound: float = 0.5  # radians
-    tvec_bound: float = 50.0       # mm
-    rvec_bound: float = 0.1        # radians (~5.7 degrees)
-    
     # Sampling
     max_frames: int = 50000  # Default to all (high limit)
     random_seed: int = 42
     
     # Unit Normalization
-    px_target: float = 0.5            # 投影误差目标 (px)
     px_target: float = 0.5            # 投影误差目标 (px)
     wand_tol_pct: float = 0.02        # 棒长容忍度 (2% 即 0.2mm)
     
@@ -410,14 +375,6 @@ class RefractiveBAOptimizerPR4:
              self.fids_optim = sorted(rnd.sample(all_frames, self.config.max_frames))
         else:
              self.fids_optim = all_frames
-             
-        # Observability analysis
-        self.observability: Dict[int, ObservabilityInfo] = {}
-        self._compute_observability()
-        
-        # Freeze table (computed from observability)
-        self.freeze_table: Dict = {}
-        self._build_freeze_table()
         
     def _sync_initial_state(self):
         """Update initial_planes/cams from current state (Relinearization)."""
@@ -427,60 +384,12 @@ class RefractiveBAOptimizerPR4:
         
         self.initial_cam_params = {cid: p.copy() for cid, p in self.cam_params.items()}
         
-        # Active freeze table pointer (for staged optimization context switching)
-        self._freeze_table_active = self.freeze_table
-        
         self._last_ray_rmse = -1.0
         self._last_len_rmse = -1.0
         
         self.sigma_ray_global = 0.04  # Default, will be recalculated
         self.sigma_wand = 0.1        # Default, will be recalculated
     
-    def _rvec_step_cap_deg(self, status) -> float:
-        """Get step-cap in degrees for a given rvec freeze status.
-        
-        STRONG/REGULARIZED: need more constraint (smaller step)
-        OPTIMIZE: normal constraint (larger step)
-        FREEZE: return 0.0 (should not be called for frozen params)
-        
-        Also applies _step_cap_multiplier if set (from conditional accept).
-        """
-        cfg = self.config
-        if status == FreezeStatus.OPTIMIZE_STRONG:
-            # STRONG = needs stronger constraint, smaller step
-            base = cfg.step_cap_rot_deg_weak
-        elif status == FreezeStatus.OPTIMIZE_REGULARIZED:
-            # REGULARIZED = needs constraint, smaller step
-            base = cfg.step_cap_rot_deg_weak
-        elif status == FreezeStatus.OPTIMIZE:
-            # Normal = well-conditioned, larger step OK
-            base = cfg.step_cap_rot_deg_normal
-        elif status == FreezeStatus.FREEZE:
-            return 0.0  # Should not happen if logic is correct
-        else:
-            base = cfg.step_cap_rot_deg_normal  # Fallback
-        
-        # Apply multiplier if set (from conditional accept in rollback logic)
-        multiplier = getattr(self, '_step_cap_multiplier', 1.0)
-        return base * multiplier
-
-
-    
-    def _tvec_step_cap_mm(self, status) -> float:
-        """Get step-cap in mm for a given tvec freeze status.
-        
-        STRONG/REGULARIZED: need more constraint (smaller step)
-        OPTIMIZE: normal constraint (larger step)
-        """
-        cfg = self.config
-        if status in [FreezeStatus.OPTIMIZE_STRONG, FreezeStatus.OPTIMIZE_REGULARIZED]:
-            return cfg.step_cap_tvec_weak_mm
-        elif status == FreezeStatus.OPTIMIZE:
-            return cfg.step_cap_tvec_normal_mm
-        elif status == FreezeStatus.FREEZE:
-            return 0.0
-        else:
-            return cfg.step_cap_tvec_normal_mm  # Fallback
     
     def _build_obs_cache(self):
         """Build observation cache from dataset."""
@@ -506,211 +415,6 @@ class RefractiveBAOptimizerPR4:
                 if uvA is not None or uvB is not None:
                     self.obs_cache[fid][cid] = (uvA, uvB)
     
-    def _compute_observability(self):
-        """Compute observability metrics for each window."""
-        cfg = self.config
-        
-        for wid in self.window_ids:
-            cams = self.window_to_cams.get(wid, [])
-            n_cam = len(cams)
-            
-            info = ObservabilityInfo(
-                window_id=wid,
-                n_cam=n_cam,
-                camera_ids=cams.copy()
-            )
-            
-            if n_cam < 2:
-                info.freeze_reason = f"N_cam={n_cam} (single camera, insufficient baseline)"
-                self.observability[wid] = info
-                continue
-            
-            # Compute baselines with explicit constraints
-            baselines = []
-            baseline_pairs_str = []
-            camera_centers = {}
-            
-            # Helper to log centers
-            # Only print if requested (verbose debug)
-            # print(f"  [DEBUG] Window {wid} Camera Geometries:")
-            
-            for cid in cams:
-                if cid in self.cam_params:
-                    # Extract R, t from params
-                    p = self.cam_params[cid]
-                    rvec = p[0:3]
-                    tvec = p[3:6]
-                    R, _ = cv2.Rodrigues(rvec)
-                    C = camera_center(R, tvec)
-                    camera_centers[cid] = C
-                    # print(f"    Cam {cid}: tvec={tvec}, Center={C}")
-
-            for i, cid1 in enumerate(cams):
-                for cid2 in cams[i+1:]:
-                    if cid1 in camera_centers and cid2 in camera_centers:
-                        C1 = camera_centers[cid1]
-                        C2 = camera_centers[cid2]
-                        b = np.linalg.norm(C1 - C2)
-                        
-                        # Constraints
-                        if b < 0: 
-                            b = 0.0
-                        
-                        baselines.append(b)
-                        baseline_pairs_str.append(f"({cid1}-{cid2}: {b:.2f}mm)")
-            
-            if baselines:
-                info.baseline_max_mm = max(baselines)
-                info.baseline_median_mm = np.median(baselines)
-                # Verbosity 2: Audit baselines
-                if cfg.verbosity >= 2:
-                    print(f"  [DEBUG] Window {wid} Cams: {cams}")
-                    print(f"  [DEBUG] Window {wid} Baselines: {', '.join(baseline_pairs_str)}")
-                    print(f"  [DEBUG] Window {wid} Stats: max={info.baseline_max_mm:.2f}mm, median={info.baseline_median_mm:.2f}mm")
-            
-            # Compute view-angle diversity
-            # Mean optical axis direction per camera, then pairwise angles
-            plane_n = self.window_planes[wid]['plane_n']
-            view_dirs = []
-            
-            # Keep track of IDs to map back to pairs
-            dir_cam_ids = []
-            
-            for cid in cams:
-                if cid in self.cam_params:
-                    # Optical axis in world frame (Z-axis)
-                    p = self.cam_params[cid]
-                    rvec = p[0:3]
-                    R, _ = cv2.Rodrigues(rvec)
-                    axis = optical_axis_world(R)
-                    view_dirs.append(axis)
-                    dir_cam_ids.append(cid)
-            
-            if len(view_dirs) >= 2:
-                angles = []
-                angle_pairs_str = []
-                
-                for i, d1 in enumerate(view_dirs):
-                    for j, d2 in enumerate(view_dirs[i+1:]):
-                        real_j = i + 1 + j
-                        cid1 = dir_cam_ids[i]
-                        cid2 = dir_cam_ids[real_j]
-                        
-                        # angle_between_vectors returns DEGREES
-                        ang = angle_between_vectors(d1, d2)
-                        
-                        # Sanity check
-                        ang = np.clip(ang, 0.0, 180.0)
-                            
-                        angles.append(ang)
-                        angle_pairs_str.append(f"({cid1}-{cid2}: {ang:.1f}deg)")
-                
-                # Verbosity 2: Audit angles
-                if cfg.verbosity >= 2:
-                    print(f"  [DEBUG] Window {wid} Angles: {', '.join(angle_pairs_str)}")
-                
-                if angles:
-                    info.angle_diversity_p50 = np.percentile(angles, 50)
-                    info.angle_diversity_p90 = np.percentile(angles, 90)
-            
-            # Compute view-angle diversity
-            # Mean optical axis direction per camera, then pairwise angles
-            plane_n = self.window_planes[wid]['plane_n']
-            view_dirs = []
-            
-            # Keep track of IDs to map back to pairs
-            dir_cam_ids = []
-            
-            for cid in cams:
-                if cid in self.cam_params:
-                    # Optical axis in world frame
-                    p = self.cam_params[cid]
-                    rvec = p[0:3]
-                    R, _ = cv2.Rodrigues(rvec)
-                    axis = optical_axis_world(R)
-                    view_dirs.append(axis)
-                    dir_cam_ids.append(cid)
-            
-            if len(view_dirs) >= 2:
-                angles = []
-                angle_pairs_str = []
-                
-                for i, d1 in enumerate(view_dirs):
-                    for j, d2 in enumerate(view_dirs[i+1:]):
-                        real_j = i + 1 + j
-                        cid1 = dir_cam_ids[i]
-                        cid2 = dir_cam_ids[real_j]
-                        
-                        # angle_between_vectors returns DEGREES
-                        ang = angle_between_vectors(d1, d2)
-                        
-                        # Sanity check
-                        if ang < 0 or ang > 180.1:
-                            print(f"  [Error] Impossible angle between Cam {cid1} and {cid2}: {ang:.2f}")
-                            ang = np.clip(ang, 0.0, 180.0)
-                            
-                        angles.append(ang)
-                        angle_pairs_str.append(f"({cid1}-{cid2}: {ang:.1f}deg)")
-                
-                print(f"  [DEBUG] Window {wid} Angles: {', '.join(angle_pairs_str)}")
-                
-                if angles:
-                    info.angle_diversity_p50 = np.percentile(angles, 50)
-                    info.angle_diversity_p90 = np.percentile(angles, 90)
-            
-            # Determine freeze status based on observability
-            # Default: plane OPTIMIZE, tvec FREEZE, rvec FREEZE
-            info.plane_status = FreezeStatus.OPTIMIZE
-            
-            # tvec enabled if N_cam >= 2
-            if n_cam >= 2:
-                info.tvec_status = FreezeStatus.OPTIMIZE
-                
-                # Check baseline guard for rvec
-                if info.baseline_median_mm < cfg.baseline_guard_mm:
-                    info.rvec_status = FreezeStatus.FREEZE
-                    info.freeze_reason = f"Baseline too small ({info.baseline_median_mm:.1f}mm < {cfg.baseline_guard_mm}mm)"
-                elif info.angle_diversity_p50 < cfg.theta_freeze:
-                    info.rvec_status = FreezeStatus.FREEZE
-                    info.freeze_reason = f"Angle diversity too low ({info.angle_diversity_p50:.1f}° < {cfg.theta_freeze}°)"
-                elif info.angle_diversity_p50 < cfg.theta_enable_rot:
-                    # Weak observability (15-20 deg)
-                    if cfg.allow_weak_rvec:
-                        info.rvec_status = FreezeStatus.OPTIMIZE_STRONG
-                        info.freeze_reason = f"Weak diversity ({info.angle_diversity_p50:.1f}°), Strong Constraints"
-                    else:
-                        info.rvec_status = FreezeStatus.FREEZE
-                        info.freeze_reason = f"Weak diversity ({info.angle_diversity_p50:.1f}°), Strong mode disabled"
-                elif info.angle_diversity_p50 < cfg.theta_strong_rot:
-                    info.rvec_status = FreezeStatus.OPTIMIZE_REGULARIZED
-                    info.freeze_reason = f"Moderate diversity ({info.angle_diversity_p50:.1f}°), regularized rvec"
-                else:
-                    info.rvec_status = FreezeStatus.OPTIMIZE
-                    info.freeze_reason = f"Good diversity ({info.angle_diversity_p50:.1f}°, baseline {info.baseline_median_mm:.1f}mm)"
-            else:
-                info.freeze_reason = f"N_cam={n_cam}, extrinsics frozen"
-            
-            self.observability[wid] = info
-    
-        # Verbosity 2: Summary after computing all
-        if cfg.verbosity >= 2:
-            print("\n  [PR4] Observability Analysis Complete.")
-
-    def _build_freeze_table(self):
-        """Build freeze table from observability analysis."""
-        self.freeze_table = {}
-        
-        for wid, info in self.observability.items():
-            self.freeze_table[wid] = {
-                'plane': info.plane_status,
-                'cameras': {}
-            }
-            
-            for cid in info.camera_ids:
-                self.freeze_table[wid]['cameras'][cid] = {
-                    'tvec': info.tvec_status,
-                    'rvec': info.rvec_status
-                }
 
     def _compute_physical_sigmas(self):
         """Estimate global sigma values across all optimize stages."""
@@ -763,21 +467,6 @@ class RefractiveBAOptimizerPR4:
             ang = angle_between_vectors(normals[0], normals[1])
             print(f"    Angle between Win 0 and Win 1: {ang:.2f}°")
     
-    def print_freeze_table(self):
-        """Print summary of freeze/optimize decisions."""
-        cfg = self.config
-        
-        if cfg.verbosity >= 1:
-            print("\n  [PR4] Optimization Freeze Table:")
-            print(f"    {'WinID':<6} {'N_cam':<6} {'Base(mm)':<10} {'Ang(deg)':<10} {'Region Pl':<12} {'Region Tv':<12} {'Region Rv':<12} {'Reason'}")
-            print("    " + "-"*96)
-            
-            for wid, info in self.observability.items():
-                print(f"    {wid:<6} {info.n_cam:<6} {info.baseline_max_mm:<10.1f} {info.angle_diversity_p90:<10.1f} "
-                      f"{info.plane_status.value:<12} {info.tvec_status.value:<12} {info.rvec_status.value:<12} {info.freeze_reason}")
-            print("    " + "-"*96 + "\n")
-        else:
-             print("  [PR4] Computed Freeze Table (details hidden, verbosity=0)")
 
     def print_diagnostics(self, current_planes: Dict, current_cam_params: Dict):
         """Print final comparison of parameters."""
@@ -1276,28 +965,9 @@ class RefractiveBAOptimizerPR4:
             elif ptype == 'cam_t':
                 reg_residuals.append(val * np.sqrt(cfg.lambda_reg_tvec))
             elif ptype == 'cam_r':
-                # Check weak vs strong regularization
-                wid = self.cam_to_window.get(pid)
-                ft = self.freeze_table.get(wid, {})
-                cft = ft.get('cameras', {}).get(pid, {})
-                status = cft.get('rvec')
-                
                 weight = cfg.lambda_reg_rvec
-                if status == FreezeStatus.OPTIMIZE_REGULARIZED:
-                    weight *= 2.0  # Double regularization for weak geometry
-                elif status == FreezeStatus.OPTIMIZE_STRONG:
-                    # Dynamic Strong Prior: lambda = base * (20 / angle)^p
-                    obs = self.observability.get(wid)
-                    angle = obs.angle_diversity_p50 if obs else 20.0
-                    angle = max(angle, 1e-6)
-                    s = (cfg.theta_enable_rot / angle) ** cfg.prior_p_rot
-                    weight = cfg.prior_lambda_rot_base * s
-                
                 reg_residuals.append(val * np.sqrt(weight))
         
-        if len(reg_residuals) > 0:
-            residuals = np.concatenate([residuals, np.array(reg_residuals)])
-                     
         if len(reg_residuals) > 0:
             residuals = np.concatenate([residuals, np.array(reg_residuals)])
 
@@ -3113,9 +2783,4 @@ class RefractiveBAOptimizerPR5:
             print(f"[PR5][CACHE] Save failed: {e}")
 
 
-# --------------------------------------------------------------------------------------
-# PR5_POLISH: REMOVED
-# --------------------------------------------------------------------------------------
-# RefractivePolishOptimizer and PolishConfig were removed to resolve C++ 
-# synchronization issues (non-existent set_rvec/set_tvec methods).
-# See implementation_plan.md for details.
+

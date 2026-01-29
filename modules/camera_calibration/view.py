@@ -390,9 +390,11 @@ class RefractiveCalibWorker(QObject):
     
     def __init__(self, wand_points, wand_length, initial_focal, dist_coeff_num, 
                  active_cam_ids, all_cam_ids, cams_intrinsics, image_size,
-                 num_windows, cam_to_window, window_media, out_path):
+                 num_windows, cam_to_window, window_media, out_path, 
+                 wand_points_filtered=None):
         super().__init__()
         self.wand_points = wand_points
+        self.wand_points_filtered = wand_points_filtered
         self.wand_length = wand_length
         self.initial_focal = initial_focal
         self.dist_coeff_num = dist_coeff_num
@@ -418,6 +420,7 @@ class RefractiveCalibWorker(QObject):
             
             mock_base = MockWandCalibrator()
             mock_base.wand_points = self.wand_points
+            mock_base.wand_points_filtered = self.wand_points_filtered
             mock_base.active_cam_ids = self.active_cam_ids
             mock_base.cams = self.cams_intrinsics
             mock_base.cameras = self.cams_intrinsics
@@ -5422,6 +5425,7 @@ class CameraCalibrationView(QWidget):
             self._refr_thread = QThread()
             self._refr_worker = RefractiveCalibWorker(
                 wand_points=self.wand_calibrator.wand_points,
+                wand_points_filtered=getattr(self.wand_calibrator, 'wand_points_filtered', None),
                 wand_length=wand_len,
                 initial_focal=initial_focal,
                 dist_coeff_num=dist_coeff_num,

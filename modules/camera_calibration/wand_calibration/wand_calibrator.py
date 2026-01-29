@@ -846,9 +846,11 @@ class WandCalibrator:
                 # Provide standard format for calibration
                 pts_map = {}
                 for c_idx, pair in frame_filtered.items():
-                    p1 = pair[0][:2]
-                    p2 = pair[1][:2]
-                    pts_map[c_idx] = np.array([p1, p2])
+                    # Align with CSV format: [x, y, r, m, label, idx]
+                    # pair = [best_s, best_l]. best_s/l are [x,y,r,m]
+                    s_full = list(pair[0]) + ["Filtered_Small", 0]
+                    l_full = list(pair[1]) + ["Filtered_Large", 1]
+                    pts_map[c_idx] = [s_full, l_full] # Store as LIST
                 
                 self.wand_points[f_idx] = pts_map
             else:
@@ -928,9 +930,10 @@ class WandCalibrator:
                         self.wand_data_filtered[f_idx] = frame_filtered
                         pts_map = {}
                         for c_idx, pair in frame_filtered.items():
-                            p1 = pair[0][:3]
-                            p2 = pair[1][:3]
-                            pts_map[c_idx] = np.array([p1, p2])
+                            # pair[0] is [x, y, r, m]
+                            s_full = list(pair[0]) + ["Filtered_Small", 0]
+                            l_full = list(pair[1]) + ["Filtered_Large", 1]
+                            pts_map[c_idx] = [s_full, l_full]
                         self.wand_points[f_idx] = pts_map
                 
                 print(f"Pass 2 Done. Valid Frames: {len(self.wand_data_filtered)} / {num_frames}")
