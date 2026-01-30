@@ -1,310 +1,160 @@
 # Refractive Wand Calibration Algorithm Documentation
 
-This document describes the refractive wand calibration algorithm implemented in `refractive_wand_calibrator.py` and `refractive_bundle_adjustment.py`. This calibration is used when cameras observe through refractive interfaces (e.g., glass/acrylic windows into water).
+This document describes the refractive wand calibration pipeline implemented in:
+
+- `refraction_wand_calibrator.py`
+- `refraction_calibration_BA.py`
+
+The pipeline calibrates cameras that view through refractive interfaces (air -> window -> water) and outputs PINPLATE camFiles plus triangulation reports.
 
 ## Overview
 
-The refractive calibrator extends the standard wand calibration to handle **multi-layer refraction** (Air → Glass → Water). It jointly optimizes:
-- Camera extrinsics (rotation, translation)
-- Camera intrinsics (focal length, principal point, distortion)
-- **Window plane parameters** (position and orientation)
+The refractive calibrator extends standard wand calibration to handle multi-layer refraction. It estimates and refines:
 
-> [!IMPORTANT]
-> This module requires an **initial pinhole calibration** as a starting point. The refractive optimization refines these parameters while accounting for ray bending at media interfaces.
+- Camera extrinsics (rvec, tvec)
+- Camera intrinsics (f, cx, cy, k1, k2)
+- Window plane geometry (plane_pt, plane_n)
+- Window thickness
 
----
+Key ideas:
+
+- C++ kernel traces refracted rays (Snell's Law)
+- Optimization uses ray distance + wand length residuals
+- Window orientation is enforced by camera/object side constraints
+- Final Round 4 refines intrinsics and thickness jointly with geometry
 
 ## Optical Model
 
-### Snell's Law at Interfaces
-Light rays are traced through three media layers:
+Rays pass through three media:
 
 ```
-Camera (Air, n₁=1.0) → Window (Glass, n₂≈1.52) → Tank (Water, n₃≈1.33)
+Camera (Air, n1=1.0) -> Window (Glass/Acrylic, n2~1.49) -> Water (n3~1.33)
 ```
 
-At each interface, Snell's Law is applied:
-$$n_1 \sin\theta_1 = n_2 \sin\theta_2$$
+Window parameters per window:
 
-### Window Plane Parameterization
-Each window is defined by:
-- **Plane Point** (`plane_pt`): A point on the front surface (mm)
-- **Plane Normal** (`plane_n`): Unit normal vector pointing into the tank
-- **Thickness** (`thickness`): Glass thickness (mm)
-- **Refractive Indices**: `n1` (air), `n2` (glass), `n3` (water)
+- `plane_pt`: a point on the closest interface (air side)
+- `plane_n`: unit normal pointing away from camera toward the object
+- `thickness`: window thickness in mm
+- `n_air`, `n_window`, `n_object`
 
----
+## Pipeline Phases
 
-## Algorithm Phases
+### Phase 0: Pinhole Bootstrap (P0)
 
-The calibration proceeds in **5 main phases**:
+Goal: estimate initial camera extrinsics from a pinhole model (no refraction).
 
-### Phase 0: Pinhole Bootstrap
-**Goal**: Establish initial camera poses using standard pinhole model (ignoring refraction).
+- Select best camera pair (max shared frames)
+- Essential matrix + pose recovery (seed pair)
+- Incremental registration (PnP) for other cameras
+- Intrinsics are frozen to UI values
+- Outputs: `cam_params` and scaled 3D points for all frames
 
-#### Step 1: Best Pair Selection
-- Scores each camera pair by number of **shared valid frames** (both wand points visible in both cameras).
-- Selects the pair with the **highest co-visibility score**.
-- This pair defines the initial world coordinate system.
+Bootstrap cache:
 
-#### Step 2: Primary Pair Initialization
-- Uses OpenCV's **8-Point Algorithm** (`findEssentialMat`, `recoverPose`) on the best pair.
-- Scales translation using known wand length to establish metric scale.
-- **Camera 0** of the pair: Origin (R=I, t=0).
-- **Camera 1** of the pair: Relative pose from decomposition.
+- File: `bootstrap_cache.json`
+- Validated by camera IDs, frame count, wand length
 
-#### Step 3: Incremental Registration
-- Remaining cameras are added one-by-one using **PnP** (`solvePnP`).
-- 3D points are triangulated from the already-registered cameras.
-- Each new camera's pose is computed relative to these 3D points.
+### Phase 1: Window Plane Initialization
 
-#### Step 4: Primary Pair Optimization (Locked Intrinsics)
-- Runs bundle adjustment on the **primary pair only**.
-- **Focal length**: Locked to user-provided initial guess (±1 px).
-- **Principal point**: Locked to image center.
-- **Distortion**: Locked to 0.
-- Purpose: Refine geometry without distorting optics.
+Goal: initialize plane geometry from bootstrapped camera centers and 3D wand midpoints.
 
-#### Outputs
-- Initial `cam_params` for all cameras.
-- Triangulated `X_A`, `X_B` (3D wand endpoints) for all frames.
-- Scale established from known wand length.
+- Group cameras by window (active vs inactive)
+- Estimate normal from camera optical axes + object direction
+- Compute a safe plane distance d0
+- Enforce camera-side and object-side sign conventions
 
----
+### Phase 2/3: Ray Building (C++ Kernel)
 
-### Phase 1 (P1): Window Plane Optimization
-**Goal**: Refine window plane positions and orientations.
+Goal: build refracted rays using `pyopenlpt.Camera` PINPLATE model.
 
-#### P1.1: Distance Optimization (1D per window)
-- Optimizes only the distance `d` from camera cluster to plane.
-- Uses joint triangulation with rays from ALL cameras.
+- C++ ray tracing is the authority
+- Ray validity is tracked and summarized
 
-#### P1.2: Angle Optimization (3D per window)
-- Optimizes `d`, `α` (tilt), `β` (pan) per window.
-- Regularization prevents normals from drifting too far.
+### Phase 4: Bundle Adjustment (Selective BA)
 
-#### P1.3: Joint Optimization
-- Simultaneously optimizes all window parameters.
-- Outer-loop λ adaptation balances ray and length residuals.
+Goal: refine window planes and camera extrinsics with staged constraints.
 
-**Cost Function**:
-$$J = S_{ray} + \lambda \cdot S_{len}$$
+Loop (up to 6 passes):
 
-Where:
-- $S_{ray}$: Sum of squared point-to-ray distances
-- $S_{len}$: Sum of squared wand length errors
-- $\lambda$: Adaptive weight (target ratio ≈ 1.0)
+- Step A: optimize planes only (strict angle bounds, weak-window bounds)
+- Step B: optimize camera extrinsics only (free bounds)
+- Early stop when plane angle constraints are inactive
 
----
+Final joint (Round 3):
 
-### Phase 2/3: Ray Building
-**Goal**: Construct refracted rays using C++ kernel.
+- Optimize planes + extrinsics with moderate bounds
 
-- Loads camera files with optimized plane parameters.
-- Uses `pyopenlpt.Camera.pinplateLine()` for accurate ray tracing.
-- Rays account for all three media layers.
+Round 4 (new):
 
----
+- Optimize planes + extrinsics + focal length + window thickness
+- Tight bounds: plane angle +/- 2.5 deg, plane distance +/- 5 mm, rvec +/- 5 deg
+- Intrinsics and thickness bounded by percentage (default 5%)
 
-### Phase 4 (PR4): Bundle Adjustment
-**Goal**: Jointly optimize cameras and planes with rollback protection.
-
-#### Camera Conditioning Classification
-Before optimization, each camera's parameters are classified based on geometric conditioning:
-
-| Status | Criteria | Step Cap |
-|--------|----------|----------|
-| **FREEZE** | Window has only 1 camera (under-constrained) | N/A (not optimized) |
-| **OPTIMIZE_STRONG** | Rays are near-parallel to window normal (high refraction sensitivity) | 0.1°/round |
-| **OPTIMIZE** | Well-conditioned geometry | 0.5°/round |
-
-**Conditioning Metric**: Angle between optical axis and window normal.
-- If angle < 15°: `OPTIMIZE` (well-conditioned, rays nearly perpendicular to glass)
-- If angle ≥ 15°: `OPTIMIZE_STRONG` (poorly-conditioned, needs tighter constraints)
-
-#### Freeze Table Structure
-```python
-freeze_table = {
-    window_id: {
-        'plane': FreezeStatus,      # Window plane parameters
-        'cameras': {
-            cam_id: {
-                'rvec': FreezeStatus,  # Rotation vector
-                'tvec': FreezeStatus,  # Translation vector
-                'intrinsics': FreezeStatus
-            }
-        }
-    }
-}
-```
-
-#### PR4.1: Plane + Selected TVec
-- **Planes**: `OPTIMIZE` (all windows with ≥2 cameras)
-- **TVec**: `OPTIMIZE_STRONG` for poorly-conditioned cameras only
-- **RVec**: `FREEZE` (all cameras)
-
-#### PR4.2: Add STRONG RVec
-- **RVec**: `OPTIMIZE_STRONG` for poorly-conditioned cameras
-- Uses **tiered rollback** (see below).
-
-#### PR4.3: Add Normal RVec
-- **RVec**: `OPTIMIZE` for well-conditioned cameras
-- Full extrinsic optimization with step capping.
-
-#### Tiered Rollback Logic (PR4.2/4.3)
-| Cost Increase | Action |
-|---------------|--------|
-| ≤ 1% | Direct Accept |
-| 1% - 5% + clamped ≥ 30% | Accept, step_cap *= 0.5 |
-| 1% - 5% + clamped < 30% | Accept, λ *= 2 |
-| > 5% | Reject, λ *= 2 |
-
-#### Step Capping
-- **RVec**: Default 0.5°/round (STRONG: 0.1°)
-- **TVec**: Default 5mm/round (STRONG: 1mm)
-
----
-
-### Phase 5 (PR5): Intrinsic Refinement
-**Goal**: Fine-tune focal lengths, distortion, and window thickness.
-
-#### PR5.1: Intrinsics Only
-- **Optimized**: `f`, `k1`, `k2` per camera (based on user selection)
-- **Fixed**: `rvec`, `tvec`, `cx`, `cy`, window planes, thickness
-- Uses prior-based regularization to prevent drift
-
-#### PR5.2: Intrinsics + Thickness
-- **Optimized**: `f`, `k1`, `k2` + **window thickness** per window
-- **Fixed**: `rvec`, `tvec`, `cx`, `cy`, window plane position/normal
-- Thickness is added as optimization variable to compensate for measurement errors
-
-#### Parameter Status
-| Parameter | PR5.1 | PR5.2 | Constraint |
-|-----------|-------|-------|------------|
-| `f` (focal) | OPTIMIZE | OPTIMIZE | Prior-based regularization |
-| `k1`, `k2` | OPTIMIZE/FREEZE | OPTIMIZE/FREEZE | Based on user selection |
-| `cx`, `cy` | FREEZE | FREEZE | Always locked to image center |
-| `rvec`, `tvec` | FREEZE | FREEZE | Extrinsics fixed from PR4 |
-| `thickness` | FREEZE | **OPTIMIZE** | Added in PR5.2 |
-
-- Output: Final camera parameters with refined intrinsics.
-
-
-
----
-
-## Residual Structure
-
-The optimizer minimizes a weighted residual vector:
-
-```python
-residuals = [
-    ray_residuals,           # Point-to-ray distances (pixels)
-    sqrt(λ) * len_residuals, # Wand length errors (mm)
-    sqrt(λ_reg) * reg_terms  # Regularization (optional)
-]
-```
-
----
-
-## Output Format
-
-### Camera Files
-Same as standard wand calibration, plus:
+Residuals:
 
 ```
-# Pinplate Param:
-# plane on pt: x,y,z
-# plane norm vector: nx,ny,nz
-# thickness: t
-# refraction index: n1,n2,n3
+J = S_ray + lambda * S_len + regularization
 ```
 
-### Report JSON
-```json
-{
-  "window_planes": {
-    "0": {"plane_pt": [...], "plane_n": [...]}
-  },
-  "ray_rmse_mm": 0.15,
-  "wand_len_rmse_mm": 0.08,
-  "final_wand_length_mm": 10.02
-}
-```
+- `S_ray`: sum of squared point-to-ray distances
+- `S_len`: sum of squared wand length errors
+- `lambda = 2 * N_cams` (forced to 1.0 if S_ray/S_len < 10)
 
----
+Side constraints:
 
-## Typical Performance
+- Object points must lie on positive side of the plane
+- Cameras must lie on negative side
 
-| Metric | Before Optimization | After Optimization |
-|--------|--------------------|--------------------|
-| Ray RMSE | 1-3 px | 0.1-0.3 px |
-| Wand Length RMSE | 0.5-2 mm | 0.02-0.1 mm |
-| Window Normal Drift | - | < 1° |
+Cache:
 
----
+- File: `bundle_cache.json`
+- Stores planes, cam_params, window_media, optional points_3d
 
-## Key Configuration Parameters
+### Phase 5: Alignment, Export, Verification
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `lambda0_init` | 200.0 | Initial length weight |
-| `outer_rounds` | 3 | Lambda adaptation rounds |
-| `step_cap_rot_deg_normal` | 0.5 | RVec step limit (normal) |
-| `step_cap_rot_deg_weak` | 0.1 | RVec step limit (STRONG) |
-| `alpha_beta_bound` | 0.5 | Max tilt/pan (radians) |
+- Coordinate alignment (Y axis from plane intersection)
+- Sync C++ state and save cache
+- Export PINPLATE camFiles (plane shifted to farthest interface)
+- Triangulation and residual report (JSON)
+- Plane side verification
+- Final close-loop verification
+- Per-frame reprojection error for UI
 
----
+## Output Artifacts
 
-## Key Dependencies
-
-- `scipy.optimize.least_squares`: Core optimizer
-- `pyopenlpt.Camera`: C++ ray tracing kernel
-- `numpy`: Linear algebra
-
----
+- `camFile/` PINPLATE camera files
+- `triangulation_report.json` (residuals, worst frames, samples)
+- Updated cache files
 
 ## Related Files
 
-| File | Purpose |
-|------|---------|
-| `refractive_wand_calibrator.py` | Main orchestration and caching |
-| `refractive_bundle_adjustment.py` | PR4/PR5 optimization |
-| `refractive_plane_optimizer.py` | P1 window optimization |
-| `refractive_geometry.py` | Ray tracing and triangulation |
-| `refractive_bootstrap.py` | Pinhole initialization |
-
----
+- `refraction_wand_calibrator.py`: pipeline orchestration
+- `refraction_calibration_BA.py`: bundle adjustment implementation
+- `refractive_bootstrap.py`: P0 bootstrap
+- `refractive_geometry.py`: ray tracing helpers and geometry
 
 ## Algorithm Flow Diagram
 
 ```mermaid
 graph TD
     A[Start] --> B[P0: Pinhole Bootstrap]
-    B --> C{Cache Valid?}
-    C -->|Yes| D[Load P1 Cache]
-    C -->|No| E[P1: Window Optimization]
-    E --> E1[P1.1: Distance]
-    E1 --> E2[P1.2: Angle]
-    E2 --> E3[P1.3: Joint]
-    E3 --> D
-    D --> F[P2/3: Build Rays C++]
-    F --> G[PR4: Bundle Adjustment]
-    G --> G1[PR4.1: Planes + TVec]
-    G1 --> G2[PR4.2: + STRONG RVec]
-    G2 --> G3[PR4.3: + Normal RVec]
-    G3 --> H[PR5: Intrinsics]
-    H --> I[Export Results]
-    I --> J[End]
+    B --> C{Bootstrap Cache Valid?}
+    C -->|Yes| D[Load Bootstrap Cache]
+    C -->|No| E[Run Bootstrap]
+    D --> F[Plane Initialization]
+    E --> F
+    F --> G[Build Refracted Rays]
+    G --> H[Selective BA Loop]
+    H --> I[Final Joint (Round 3)]
+    I --> J[Round 4: Intrinsics + Thickness]
+    J --> K[Alignment + Export]
+    K --> L[Triangulation Report + Verification]
+    L --> M[End]
 ```
 
----
+## Notes
 
-## Author Notes
-
-This module implements a **physically-accurate** refractive calibration pipeline. Key design decisions:
-
-1. **Outer-Loop λ Adaptation**: Prevents Jacobian instability by keeping λ fixed within each `least_squares` call.
-2. **Joint Triangulation**: Uses rays from ALL cameras for each 3D point, not just pairs.
-3. **Tiered Rollback**: Gracefully handles cost increases by adjusting step size or constraint strength.
-4. **C++ Ray Tracing**: Performance-critical Snell's Law calculations are done in C++.
+- The C++ PINPLATE kernel is the source of truth for ray tracing and triangulation.
+- All calibration steps assume wand length is correct and consistent.
+- Side constraint violations are reported with counts for debugging.

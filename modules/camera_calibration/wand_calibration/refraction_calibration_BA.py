@@ -46,6 +46,104 @@ from .refractive_geometry import (
 )
 
 
+class RefractiveCalibReporter:
+    def section(self, title: str, width: int = 60):
+        line = "=" * width
+        print(f"\n{line}")
+        print(f"[RefractiveCalib] {title}")
+        print(line)
+
+    def header(self, title: str):
+        print(f"\n[RefractiveCalib] {title}")
+
+    def info(self, message: str):
+        print(f"[RefractiveCalib] {message}")
+
+    def detail(self, message: str):
+        print(message)
+
+
+class CppSyncAdapter:
+    @staticmethod
+    def build_update_kwargs(
+        cam_params: Dict[int, np.ndarray],
+        window_planes: Dict[int, Dict],
+        window_media: Dict[int, Dict],
+        cam_to_window: Dict[int, int],
+        cam_id: int,
+    ) -> Dict:
+        update_kwargs = {}
+        if cam_id in cam_params:
+            p = cam_params[cam_id]
+            update_kwargs['extrinsics'] = {'rvec': p[0:3], 'tvec': p[3:6]}
+            update_kwargs['intrinsics'] = {
+                'f': p[6],
+                'cx': p[7],
+                'cy': p[8],
+                'dist': [p[9], p[10], 0, 0, 0]
+            }
+
+        wid = cam_to_window.get(cam_id)
+        if wid in window_planes:
+            pl = window_planes[wid]
+            update_kwargs['plane_geom'] = {
+                'pt': np.asarray(pl['plane_pt'], dtype=float).tolist(),
+                'n': np.asarray(pl['plane_n'], dtype=float).tolist()
+            }
+        if wid in window_media:
+            update_kwargs['media_props'] = window_media[wid]
+
+        return update_kwargs
+
+    @staticmethod
+    def apply(cams_cpp: Dict[int, 'lpt.Camera'], cam_id: int, update_kwargs: Dict):
+        if not update_kwargs:
+            return
+        update_cpp_camera_state(cams_cpp[cam_id], **update_kwargs)
+
+
+class CacheStore:
+    def __init__(self, cache_path: str):
+        self.cache_path = cache_path
+
+    def load(self) -> Optional[Dict]:
+        if not Path(self.cache_path).exists():
+            return None
+        with open(self.cache_path, 'r') as f:
+            return json.load(f)
+
+    def save(self, data: Dict):
+        with open(self.cache_path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+
+class ObsCacheBuilder:
+    @staticmethod
+    def build(dataset: Dict, active_cam_ids: List[int]) -> Dict[int, Dict[int, Tuple]]:
+        obs_cache = {}
+        obsA = dataset.get('obsA', {})
+        obsB = dataset.get('obsB', {})
+        all_fids = set(obsA.keys()) | set(obsB.keys())
+
+        for fid in all_fids:
+            obs_cache[fid] = {}
+            for cid in active_cam_ids:
+                uvA = None
+                uvB = None
+                if fid in obsA and cid in obsA[fid]:
+                    pt = obsA[fid][cid]
+                    if pt is not None and len(pt) >= 2 and np.all(np.isfinite(pt[:2])):
+                        uvA = pt[:2]
+                if fid in obsB and cid in obsB[fid]:
+                    pt = obsB[fid][cid]
+                    if pt is not None and len(pt) >= 2 and np.all(np.isfinite(pt[:2])):
+                        uvB = pt[:2]
+                if uvA is not None or uvB is not None:
+                    obs_cache[fid][cid] = (uvA, uvB)
+
+        return obs_cache
+
+
 
 
 
@@ -58,6 +156,7 @@ class RefractiveBAConfig:
     lambda_reg_rvec: float = 50.0   # Rotation drift penalty (standard)
     lambda_reg_f: float = 10.0      # Focal drift penalty
     lambda_reg_thick: float = 10.0  # Thickness drift penalty
+    lambda_reg_dist: float = 10.0   # Distortion drift penalty
     
     # Sampling
     max_frames: int = 50000  # Default to all (high limit)
@@ -83,6 +182,10 @@ class RefractiveBAConfig:
     # Bounds for Round 4 refinement
     bounds_thick_pct: float = 0.05
     bounds_f_pct: float = 0.05
+    bounds_dist_abs: float = 0.05
+
+    # Distortion optimization
+    dist_coeff_num: int = 0
     
     
 class RefractiveBAOptimizer:
@@ -124,6 +227,7 @@ class RefractiveBAOptimizer:
         self.wand_length = wand_length
         self.config = config or RefractiveBAConfig()
         self.progress_callback = progress_callback  # For UI progress updates
+        self.reporter = RefractiveCalibReporter()
 
         
         # Deep copy window_planes for modification
@@ -155,7 +259,7 @@ class RefractiveBAOptimizer:
                 self.window_to_cams[wid].append(cid)
         
         # Build observation cache
-        self._build_obs_cache()
+        self.obs_cache = ObsCacheBuilder.build(self.dataset, self.active_cam_ids)
         
         # Frame sampling
         all_frames = sorted(self.dataset.get('frames', []))
@@ -186,27 +290,7 @@ class RefractiveBAOptimizer:
     
     def _build_obs_cache(self):
         """Build observation cache from dataset."""
-        self.obs_cache = {}
-        obsA = self.dataset.get('obsA', {})
-        obsB = self.dataset.get('obsB', {})
-        
-        all_fids = set(obsA.keys()) | set(obsB.keys())
-        
-        for fid in all_fids:
-            self.obs_cache[fid] = {}
-            for cid in self.active_cam_ids:
-                uvA = None
-                uvB = None
-                if fid in obsA and cid in obsA[fid]:
-                    pt = obsA[fid][cid]
-                    if pt is not None and len(pt) >= 2 and np.all(np.isfinite(pt[:2])):
-                        uvA = pt[:2]
-                if fid in obsB and cid in obsB[fid]:
-                    pt = obsB[fid][cid]
-                    if pt is not None and len(pt) >= 2 and np.all(np.isfinite(pt[:2])):
-                        uvB = pt[:2]
-                if uvA is not None or uvB is not None:
-                    self.obs_cache[fid][cid] = (uvA, uvB)
+        self.obs_cache = ObsCacheBuilder.build(self.dataset, self.active_cam_ids)
     
 
     def _compute_physical_sigmas(self):
@@ -243,7 +327,11 @@ class RefractiveBAOptimizer:
         self.sigma_wand = self.wand_length * cfg.wand_tol_pct
         
         if cfg.verbosity >= 1:
-            print(f"  [BA] Unit Normalization: sigma_ray={self.sigma_ray_global:.4f}mm ({cfg.px_target}px at Z={avg_dist_z:.1f}mm), sigma_wand={self.sigma_wand:.4f}mm ({cfg.wand_tol_pct*100}%)")
+            self.reporter.info(
+                f"Unit Normalization: sigma_ray={self.sigma_ray_global:.4f}mm "
+                f"({cfg.px_target}px at Z={avg_dist_z:.1f}mm), "
+                f"sigma_wand={self.sigma_wand:.4f}mm ({cfg.wand_tol_pct*100}%)"
+            )
 
     def _print_plane_diagnostics(self, stage_name: str):
         """Print current plane normals and angles between them."""
@@ -259,15 +347,6 @@ class RefractiveBAOptimizer:
         if len(normals) == 2:
             ang = angle_between_vectors(normals[0], normals[1])
             print(f"    Angle between Win 0 and Win 1: {ang:.2f}°")
-    
-
-
-
-
-
-
-
-
 
     def evaluate_residuals(self, planes: Dict[int, Dict], cam_params: Dict[int, np.ndarray],
                            lambda_eff: float, window_media: Optional[Dict[int, Dict]] = None) -> Tuple[np.ndarray, float, float, int, int]:
@@ -280,34 +359,15 @@ class RefractiveBAOptimizer:
 
         for cid in self.active_cam_ids:
             if cid not in self.cams_cpp: continue
-            
-            # Prepare update arguments
-            update_kwargs = {}
-            
-            # 1. Extrinsics
-            if cid in cam_params:
-                p = cam_params[cid]
-                update_kwargs['extrinsics'] = {'rvec': p[0:3], 'tvec': p[3:6]}
-                update_kwargs['intrinsics'] = {
-                    'f': p[6],
-                    'cx': p[7],
-                    'cy': p[8],
-                    'dist': [p[9], p[10], 0, 0, 0]
-                }
-            
-            # 2. Plane Geometry
-            wid = self.cam_to_window.get(cid)
-            if wid in planes:
-                pl = planes[wid]
-                update_kwargs['plane_geom'] = {
-                    'pt': pl['plane_pt'].tolist(), 
-                    'n': pl['plane_n'].tolist()
-                }
-            if wid in media:
-                update_kwargs['media_props'] = media[wid]
-            
-            if update_kwargs:
-                update_cpp_camera_state(self.cams_cpp[cid], **update_kwargs)
+
+            update_kwargs = CppSyncAdapter.build_update_kwargs(
+                cam_params=cam_params,
+                window_planes=planes,
+                window_media=media,
+                cam_to_window=self.cam_to_window,
+                cam_id=cid,
+            )
+            CppSyncAdapter.apply(self.cams_cpp, cid, update_kwargs)
         
         # 1. Pre-calculate total possible counts for FIXED size
         total_ray_slots = 0
@@ -527,7 +587,8 @@ class RefractiveBAOptimizer:
         return residuals, S_ray, S_len, N_ray_actual, N_len_actual
 
     def _get_param_layout(self, enable_planes: bool, enable_cam_t: bool, enable_cam_r: bool,
-                          enable_cam_f: bool = False, enable_win_t: bool = False) -> List[Tuple]:
+                          enable_cam_f: bool = False, enable_win_t: bool = False,
+                          enable_cam_k1: bool = False, enable_cam_k2: bool = False) -> List[Tuple]:
         """
         Get layout of parameter vector x based on enabled flags.
         Returns list of (type, id, subparam_idx).
@@ -544,10 +605,14 @@ class RefractiveBAOptimizer:
                     layout.append(('win_t', wid, 0))
         
         # 2. Cameras
-        if enable_cam_t or enable_cam_r or enable_cam_f:
+        if enable_cam_t or enable_cam_r or enable_cam_f or enable_cam_k1 or enable_cam_k2:
             for cid in self.active_cam_ids:
                 if enable_cam_f:
                     layout.append(('cam_f', cid, 0))
+                if enable_cam_k1:
+                    layout.append(('cam_k1', cid, 0))
+                if enable_cam_k2:
+                    layout.append(('cam_k2', cid, 0))
                 if enable_cam_t:
                     layout.append(('cam_t', cid, 0)) # tx
                     layout.append(('cam_t', cid, 1)) # ty
@@ -597,7 +662,10 @@ class RefractiveBAOptimizer:
         # Let's iterate 'x' and accumulate updates
         
         plane_deltas = {wid: {'d': 0.0, 'a': 0.0, 'b': 0.0, 't': 0.0} for wid in self.window_ids}
-        cam_deltas = {cid: {'t': np.zeros(3), 'r': np.zeros(3), 'f': 0.0} for cid in self.active_cam_ids}
+        cam_deltas = {
+            cid: {'t': np.zeros(3), 'r': np.zeros(3), 'f': 0.0, 'k1': 0.0, 'k2': 0.0}
+            for cid in self.active_cam_ids
+        }
         
         idx = 0
         for (ptype, pid, subidx) in layout:
@@ -618,6 +686,10 @@ class RefractiveBAOptimizer:
                 cam_deltas[pid]['t'][subidx] = val
             elif ptype == 'cam_r':
                 cam_deltas[pid]['r'][subidx] = val
+            elif ptype == 'cam_k1':
+                cam_deltas[pid]['k1'] = val
+            elif ptype == 'cam_k2':
+                cam_deltas[pid]['k2'] = val
         
         # Apply Plane Deltas
         for wid, deltas in plane_deltas.items():
@@ -654,6 +726,12 @@ class RefractiveBAOptimizer:
             # Apply focal delta
             if len(current_cam_params[cid]) > 6:
                 current_cam_params[cid][6] = float(current_cam_params[cid][6]) + deltas['f']
+
+            # Apply distortion deltas
+            if len(current_cam_params[cid]) > 9:
+                current_cam_params[cid][9] = float(current_cam_params[cid][9]) + deltas['k1']
+            if len(current_cam_params[cid]) > 10:
+                current_cam_params[cid][10] = float(current_cam_params[cid][10]) + deltas['k2']
             
             # Apply rvec delta
             # R_new = R_delta * R_old  (global perturbation? or local?)
@@ -713,6 +791,8 @@ class RefractiveBAOptimizer:
                 reg_residuals.append(val * np.sqrt(weight))
             elif ptype == 'cam_f':
                 reg_residuals.append(val * np.sqrt(cfg.lambda_reg_f))
+            elif ptype == 'cam_k1' or ptype == 'cam_k2':
+                reg_residuals.append(val * np.sqrt(cfg.lambda_reg_dist))
             elif ptype == 'win_t':
                 reg_residuals.append(val * np.sqrt(cfg.lambda_reg_thick))
         
@@ -726,12 +806,16 @@ class RefractiveBAOptimizer:
                           limit_rot_rad: float, limit_trans_mm: float, 
                           limit_plane_d_mm: float, limit_plane_angle_rad: float,
                           enable_cam_f: bool = False, enable_win_t: bool = False,
+                          enable_cam_k1: bool = False, enable_cam_k2: bool = False,
                           plane_d_bounds: Dict[int, float] = None,
                           ftol: float = 1e-6):
         """
         Generic optimization loop with explicit bounds and parameter selection.
         """
-        layout = self._get_param_layout(enable_planes, enable_cam_t, enable_cam_r, enable_cam_f, enable_win_t)
+        layout = self._get_param_layout(
+            enable_planes, enable_cam_t, enable_cam_r,
+            enable_cam_f, enable_win_t, enable_cam_k1, enable_cam_k2
+        )
         
         if not layout:
             print(f"  [{description}] No parameters to optimize.")
@@ -740,7 +824,7 @@ class RefractiveBAOptimizer:
         x0 = np.zeros(len(layout), dtype=np.float64)
         cfg = self.config
         
-        print(f"  [{description}] optimizing {len(x0)} parameters ({len(layout)//3} blocks)...")
+        self.reporter.detail(f"  [{description}] optimizing {len(x0)} parameters ({len(layout)//3} blocks)...")
         # Calc initial RMSE for rollback reference
         planes0, cams0, media0 = self._unpack_params_delta(x0, layout)
         
@@ -754,10 +838,13 @@ class RefractiveBAOptimizer:
         
         # [Constraint] Force lambda=1 if S_ray / S_len < 10 (User Request)
         if S_len0 > 1e-9:
-             ratio_s = S_ray0 / S_len0
-             if ratio_s < 10.0:
-                 print(f"    [Constraint] S_ray/S_len ({ratio_s:.2f}) < 10. Forcing lambda=1.0 (was {lambda_fixed:.1f})")
-                 lambda_fixed = 1.0
+            ratio_s = S_ray0 / S_len0
+            if ratio_s < 10.0:
+                self.reporter.detail(
+                    f"    [Constraint] S_ray/S_len ({ratio_s:.2f}) < 10. "
+                    f"Forcing lambda=1.0 (was {lambda_fixed:.1f})"
+                )
+                lambda_fixed = 1.0
         
         rmse_ray0 = np.sqrt(S_ray0 / max(N_ray, 1))
         rmse_len0 = np.sqrt(S_len0 / max(N_len, 1)) if N_len > 0 else 0.0
@@ -766,8 +853,8 @@ class RefractiveBAOptimizer:
         J0 = (rmse_ray0**2) + lambda_fixed * (rmse_len0**2)
         self._j_ref = J0 if J0 > 1e-6 else 1.0
         
-        print(f"    Global Fixed Weighting: lambda={lambda_fixed:.1f} (N_cams={n_cams})")
-        print(f"    Initial: S_ray={S_ray0:.2f}, S_len={S_len0:.2f} (J0={J0:.4f})")
+        self.reporter.detail(f"    Global Fixed Weighting: lambda={lambda_fixed:.1f} (N_cams={n_cams})")
+        self.reporter.detail(f"    Initial: S_ray={S_ray0:.2f}, S_len={S_len0:.2f} (J0={J0:.4f})")
         
         # Build Bounds
         lb = []
@@ -798,6 +885,10 @@ class RefractiveBAOptimizer:
                 limit = abs(f0) * self.config.bounds_f_pct
                 lb.append(-limit)
                 ub.append(limit)
+            elif ptype == 'cam_k1' or ptype == 'cam_k2':
+                limit = self.config.bounds_dist_abs
+                lb.append(-limit)
+                ub.append(limit)
             else:
                 lb.append(-1.0)
                 ub.append(1.0)
@@ -818,12 +909,12 @@ class RefractiveBAOptimizer:
                          # Calculate percentage
                          j_ratio = getattr(self, '_last_ratio_cost', 0.0)
                          pct = (j_ratio / c_approx * 100) if c_approx > 0 else 0
-                         print(f"  [BA DEBUG] J_tot={c_approx:.1e}, J_ratio={j_ratio:.1e} ({pct:.1f}%) | {self._last_ratio_info}")
+                         self.reporter.detail(f"  [RefractiveCalib DEBUG] J_tot={c_approx:.1e}, J_ratio={j_ratio:.1e} ({pct:.1f}%) | {self._last_ratio_info}")
                          
                     if self.progress_callback:
                         self.progress_callback(f"{description}", self._last_ray_rmse, self._last_len_rmse, c_approx)
                 except Exception as e:
-                    print(f"[Warning] Progress callback failed: {e}")
+                    self.reporter.detail(f"[Warning] Progress callback failed: {e}")
             return res
 
 
@@ -845,7 +936,7 @@ class RefractiveBAOptimizer:
         # Print Barrier Stats
         if cfg.verbosity >= 1 and hasattr(self, '_last_barrier_stats') and self._last_barrier_stats:
             s = self._last_barrier_stats
-            print(f"    [BA][SIDE-BARRIER] min(sX)={s['min_sX']:.4f}mm, near(<20um)={s['pct_near']:.1f}%, vio={s.get('violations', 0)}, cost/J={s['ratio']:.1e}")
+            self.reporter.detail(f"    [RefractiveCalib][SIDE-BARRIER] min(sX)={s['min_sX']:.4f}mm, near(<20um)={s['pct_near']:.1f}%, vio={s.get('violations', 0)}, cost/J={s['ratio']:.1e}")
 
         # Final evaluation
         planes_final, cams_final, media_final = self._unpack_params_delta(res.x, layout)
@@ -855,9 +946,9 @@ class RefractiveBAOptimizer:
         rmse_lenF = np.sqrt(S_lenF / max(N_len, 1)) if N_len > 0 else 0.0
         JF = (rmse_rayF**2) + lambda_fixed * (rmse_lenF**2)
         
-        print(f"    Final:   S_ray={S_rayF:.2f}, S_len={S_lenF:.2f} (JF={JF:.4f})")
-        print(f"      RMSE Ray: {rmse_ray0:.4f} -> {rmse_rayF:.4f}")
-        print(f"      RMSE Len: {rmse_len0:.4f} -> {rmse_lenF:.4f}")
+        self.reporter.detail(f"    Final:   S_ray={S_rayF:.2f}, S_len={S_lenF:.2f} (JF={JF:.4f})")
+        self.reporter.detail(f"      RMSE Ray: {rmse_ray0:.4f} -> {rmse_rayF:.4f}")
+        self.reporter.detail(f"      RMSE Len: {rmse_len0:.4f} -> {rmse_lenF:.4f}")
         
         # Rollback check if degraded (Safety)
         # However, pure geometric optimization shouldn't degrade unless local minima.
@@ -1021,7 +1112,7 @@ class RefractiveBAOptimizer:
         self._strong_windows_list = []
         strong_dists = []
         
-        print("\n[BA] Detecting Weak Windows (Dist-Ratio Constraint)...")
+        self.reporter.header("Detecting Weak Windows (Dist-Ratio Constraint)")
         
         for wid in self.window_planes:
             cams = self.window_to_cams.get(wid, [])
@@ -1143,14 +1234,14 @@ class RefractiveBAOptimizer:
         self._weak_window_refs = {}
         
         enable_ray_tracking(True, reset=True)
-        print(f"\n[BA] Optimization Start ({len(self.active_cam_ids)} cameras, {len(self.window_ids)} windows)")
+        self.reporter.section(f"Bundle Adjustment Start ({len(self.active_cam_ids)} cameras, {len(self.window_ids)} windows)")
         for wid, pl in sorted(self.window_planes.items()):
             pt = pl['plane_pt']
             n = pl['plane_n']
-            print(f"  [BA][INIT] Win {wid}: pt=[{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}], n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}]")
+            self.reporter.detail(f"  [INIT] Win {wid}: pt=[{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}], n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}]")
 
         if skip_optimization or self.config.skip_optimization:
-            print("[BA] Skipped (config.skip_optimization=True).")
+            self.reporter.info("Skipped (config.skip_optimization=True).")
             return self.window_planes, self.cam_params
 
         # --- Alternating Loop ---
@@ -1158,7 +1249,7 @@ class RefractiveBAOptimizer:
         loop_iter = 0
         hit_boundary = True # Assume hit to start
         
-        print(f"\n[BA] Starting Alternating Loop (Max {max_loop_iters} passes)")
+        self.reporter.section(f"Alternating Loop (Max {max_loop_iters} passes)")
         
         while loop_iter < max_loop_iters:
             loop_iter += 1
@@ -1177,7 +1268,7 @@ class RefractiveBAOptimizer:
             # Formula: 0.1 * (0.5 ^ (loop_iter - 1))
             plane_d_bounds = {}
             if hasattr(self, '_weak_windows'):
-                print(f"  [BA][LOOP {loop_iter}] Bounds Configuration:")
+                self.reporter.detail(f"  [LOOP {loop_iter}] Bounds Configuration:")
                 print(f"    Global Plane Angle: +/- 2.5 deg")
                 
                 factor = 0.1 * (0.5 ** (loop_iter - 1))
@@ -1188,7 +1279,7 @@ class RefractiveBAOptimizer:
                         plane_d_bounds[wid] = limit
                         print(f"    [WEAK BOUNDS] Win {wid}: +/- {limit:.2f} mm ({factor*100:.2f}% of {d_ref:.1f}mm)")
             
-            print(f"\n[BA][LOOP {loop_iter}] Step A: Optimize Planes (Bounds: +/- 2.5 deg)")
+            self.reporter.header(f"Loop {loop_iter} - Step A: Optimize Planes (Bounds: +/- 2.5 deg)")
             self._print_plane_diagnostics(f"Pre-Loop {loop_iter} Planes")
             
             # Step A: Optimize Planes (Fixed Cams) - Strict Angle Bound (2.5 deg)
@@ -1225,12 +1316,12 @@ class RefractiveBAOptimizer:
                 idx += 1
             
             if hit_boundary:
-                print(f"  [BA][LOOP {loop_iter}] Plane constraints ACTIVE (hit 2.5 deg bound). Continuing loop.")
+                self.reporter.detail(f"  [LOOP {loop_iter}] Plane constraints ACTIVE (hit 2.5 deg bound). Continuing loop.")
             else:
-                print(f"  [BA][LOOP {loop_iter}] Plane constraints INACTIVE (all within 2.5 deg). Loop condition satisfied.")
+                self.reporter.detail(f"  [LOOP {loop_iter}] Plane constraints INACTIVE (all within 2.5 deg). Loop condition satisfied.")
 
             # Step B: Optimize Cameras (Fixed Planes) - Free Bounds
-            print(f"\n[BA][LOOP {loop_iter}] Step B: Optimize Cameras (Free Bounds)")
+            self.reporter.header(f"Loop {loop_iter} - Step B: Optimize Cameras (Free Bounds)")
             b_cam_free = (np.deg2rad(180.0), 2000.0)
             
             self._optimize_generic(
@@ -1249,15 +1340,15 @@ class RefractiveBAOptimizer:
 
             # Check termination
             if not hit_boundary:
-                print(f"  [BA] Converged early at Loop {loop_iter} (Planes inside 2.5 deg). Stopping loop.")
+                self.reporter.info(f"Converged early at Loop {loop_iter} (Planes inside 2.5 deg). Stopping loop.")
                 break
         
         if hit_boundary and loop_iter == max_loop_iters:
-             print(f"  [BA] Loop reached max iterations ({max_loop_iters}). Proceeding to Joint.")
+             self.reporter.info(f"Loop reached max iterations ({max_loop_iters}). Proceeding to Joint.")
 
         # --- Final Joint Optimization (Round 3) ---
         if stage >= 3:
-            print("\n[BA][FINAL] Joint Optimization (Round 3 Rules).")
+            self.reporter.section("Final Joint Optimization (Round 3 Rules)")
             
             # [NEW] Re-detect before final joint
             self._detect_weak_windows()
@@ -1279,19 +1370,27 @@ class RefractiveBAOptimizer:
                 limit_trans_mm=limit_tvec,
                 limit_plane_d_mm=limit_plane_d,
                 limit_plane_angle_rad=limit_plane_ang,
-                ftol=1e-5
+                ftol=5e-4
             )
             self._print_plane_diagnostics("Final Joint End")
 
         # --- Round 4: Joint + Intrinsics + Thickness ---
         if stage >= 4:
-            print("\n[BA][ROUND4] Joint Optimization + Intrinsics/Thickness.")
-            limit_rvec = np.radians(5.0)
+            self.reporter.section("Round 4: Joint Optimization + Intrinsics/Thickness")
+            limit_rvec = np.radians(10.0)
             limit_plane_d = 5.0
             limit_plane_ang = np.radians(2.5)
-            limit_tvec = 10.0
+            limit_tvec = 20.0
 
-            print(f"  Bounds: rvec < 5deg, plane_d < 5mm, plane_ang < 2.5deg, tvec < 10mm, f/thickness within {self.config.bounds_f_pct*100:.1f}%/{self.config.bounds_thick_pct*100:.1f}%")
+            print(
+                f"  Bounds: rvec < 10deg, plane_d < 5mm, plane_ang < 2.5deg, tvec < 20mm, "
+                f"f/thickness within {self.config.bounds_f_pct*100:.1f}%/{self.config.bounds_thick_pct*100:.1f}%"
+            )
+
+            enable_k1 = self.config.dist_coeff_num >= 1
+            enable_k2 = self.config.dist_coeff_num >= 2
+            if enable_k1 or enable_k2:
+                print(f"  Distortion: optimize k1={enable_k1}, k2={enable_k2} (|k| <= {self.config.bounds_dist_abs:.3f})")
 
             self._optimize_generic(
                 mode='round4_full',
@@ -1301,11 +1400,13 @@ class RefractiveBAOptimizer:
                 enable_cam_r=True,
                 enable_cam_f=True,
                 enable_win_t=True,
+                enable_cam_k1=enable_k1,
+                enable_cam_k2=enable_k2,
                 limit_rot_rad=limit_rvec,
                 limit_trans_mm=limit_tvec,
                 limit_plane_d_mm=limit_plane_d,
                 limit_plane_angle_rad=limit_plane_ang,
-                ftol=1e-6
+                ftol=1e-5
             )
             self._print_plane_diagnostics("Round4 End")
         
@@ -1315,7 +1416,7 @@ class RefractiveBAOptimizer:
         self.evaluate_residuals(self.window_planes, self.cam_params, lambda_fixed, window_media=self.window_media)
 
         self.print_diagnostics()
-        print("\n[BA] Optimization Complete.")
+        self.reporter.section("Bundle Adjustment Complete")
         print_ray_stats_report("Bundle")
         enable_ray_tracking(False)
         
@@ -1324,8 +1425,7 @@ class RefractiveBAOptimizer:
     
     def print_diagnostics(self):
         """Print comprehensive diagnostics after optimization."""
-        print("\n[BA] Final Diagnostics:")
-        print("-" * 40)
+        self.reporter.section("Final Diagnostics")
         
         # Evaluate final residuals
         n_cams = max(1, len(self.active_cam_ids))
@@ -1372,7 +1472,7 @@ class RefractiveBAOptimizer:
             
             print(f"    Window {wid}: d_internal={d_internal:.2f}mm, d_key_phys={d_key_phys:.2f}mm, n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}]")
         
-        print("-" * 40)
+        self.reporter.detail("-" * 40)
 
     def _get_cache_path(self, dataset_path: str) -> str:
         """Get path to cache file."""
@@ -1384,80 +1484,48 @@ class RefractiveBAOptimizer:
         Returns True if loaded successfully.
         """
         cache_path = self._get_cache_path(out_path)
-        if not Path(cache_path).exists():
+        store = CacheStore(cache_path)
+        data = store.load()
+        if not data:
             return False
-            
+
         try:
-            with open(cache_path, 'r') as f:
-                data = json.load(f)
-                
-            # Verify version matching or simple existance
-            # Cache structure is simple: planes, cam_params
-            
-            # Load Params (Params / Windows) - NO DATASET
             cached_cams = data.get('cam_params', {})
             for cid_str, p_list in cached_cams.items():
                 cid = int(cid_str)
                 if cid in self.cam_params:
                     self.cam_params[cid] = np.array(p_list)
-                    
-            # Load Planes
+
             planes_data = data.get('planes', {})
             for wid_str, pl in planes_data.items():
                 wid = int(wid_str)
                 if wid in self.window_planes:
-                     self.window_planes[wid]['plane_pt'] = np.array(pl['plane_pt'])
-                     self.window_planes[wid]['plane_n'] = np.array(pl['plane_n'])
+                    self.window_planes[wid]['plane_pt'] = np.array(pl['plane_pt'])
+                    self.window_planes[wid]['plane_n'] = np.array(pl['plane_n'])
 
-            # Load Window Media (optional)
             media_data = data.get('window_media', {})
             for wid_str, media in media_data.items():
                 wid = int(wid_str)
                 if wid in self.window_media and isinstance(media, dict):
                     self.window_media[wid].update(media)
 
-            # Apply to C++ objects (Consolidated Update)
             for cid in self.active_cam_ids:
-                if cid not in self.cams_cpp: continue
-                
-                # Prepare update arguments
-                update_kwargs = {}
-                
-                # 1. Extrinsics AND Intrinsics
-                if cid in self.cam_params:
-                    p = self.cam_params[cid]
-                    update_kwargs['extrinsics'] = {'rvec': p[0:3], 'tvec': p[3:6]}
-                    
-                    # [CRITICAL] Pass full intrinsics to ensure update_cpp_camera_state 
-                    # doesn't zero them out if C++ state is not fully initialized.
-                    # This prevents cache load from corrupting C++ state.
-                    update_kwargs['intrinsics'] = {
-                        'f': p[6],
-                        'cx': p[7],
-                        'cy': p[8],
-                        'dist': [p[9], p[10], 0, 0, 0]
-                    }
-                
-                # 2. Plane Geometry
-                wid = self.cam_to_window.get(cid)
-                if wid in self.window_planes:
-                    pl = self.window_planes[wid]
-                    update_kwargs['plane_geom'] = {
-                        'pt': pl['plane_pt'].tolist(), 
-                        'n': pl['plane_n'].tolist()
-                    }
-                if wid in self.window_media:
-                    update_kwargs['media_props'] = self.window_media[wid]
-                
-                if update_kwargs:
-                    update_cpp_camera_state(self.cams_cpp[cid], **update_kwargs)
-                
-            
-            print(f"[CACHE] Loaded parameters successfully from {cache_path}")
-            print(f"  Note: Using cached parameters with FRESH dataset observations.")
+                if cid not in self.cams_cpp:
+                    continue
+                update_kwargs = CppSyncAdapter.build_update_kwargs(
+                    cam_params=self.cam_params,
+                    window_planes=self.window_planes,
+                    window_media=self.window_media,
+                    cam_to_window=self.cam_to_window,
+                    cam_id=cid,
+                )
+                CppSyncAdapter.apply(self.cams_cpp, cid, update_kwargs)
+
+            self.reporter.info(f"Cache loaded: {cache_path}")
+            self.reporter.detail("  Note: Using cached parameters with FRESH dataset observations.")
             return True
         except Exception as e:
-            print(f"[CACHE] Load failed (ignored): {e}")
+            self.reporter.info(f"Cache load failed (ignored): {e}")
             return False
 
     def sync_cpp_state(self, cam_params: Optional[Dict[int, np.ndarray]] = None,
@@ -1477,26 +1545,14 @@ class RefractiveBAOptimizer:
                 continue
             p = cam_params[cid]
             wid = self.cam_to_window.get(cid)
-
-            update_kwargs = {
-                'extrinsics': {'rvec': p[0:3], 'tvec': p[3:6]},
-                'intrinsics': {
-                    'f': p[6],
-                    'cx': p[7],
-                    'cy': p[8],
-                    'dist': [p[9], p[10], 0, 0, 0]
-                }
-            }
-            if wid in window_planes:
-                pl = window_planes[wid]
-                update_kwargs['plane_geom'] = {
-                    'pt': np.asarray(pl['plane_pt'], dtype=float).tolist(),
-                    'n': np.asarray(pl['plane_n'], dtype=float).tolist()
-                }
-            if wid in window_media:
-                update_kwargs['media_props'] = window_media[wid]
-
-            update_cpp_camera_state(self.cams_cpp[cid], **update_kwargs)
+            update_kwargs = CppSyncAdapter.build_update_kwargs(
+                cam_params=cam_params,
+                window_planes=window_planes,
+                window_media=window_media,
+                cam_to_window=self.cam_to_window,
+                cam_id=cid,
+            )
+            CppSyncAdapter.apply(self.cams_cpp, cid, update_kwargs)
 
     def save_cache(self, out_path: str, points_3d: Optional[List[float]] = None):
         """Save results to cache."""
@@ -1524,12 +1580,10 @@ class RefractiveBAOptimizer:
             if points_3d is not None:
                 data['points_3d'] = points_3d
             
-            with open(cache_path, 'w') as f:
-                json.dump(data, f, indent=2)
-                
-            print(f"[CACHE] Saved results to {cache_path}")
+            CacheStore(cache_path).save(data)
+            self.reporter.info(f"Cache saved: {cache_path}")
             
         except Exception as e:
-            print(f"[CACHE] Save failed: {e}")
+            self.reporter.info(f"Cache save failed: {e}")
 
 

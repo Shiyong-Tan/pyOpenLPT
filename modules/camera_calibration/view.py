@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt
 from .widgets import RangeSlider
 from .wand_calibration.wand_calibrator import WandCalibrator
-from .wand_calibration.refractive_wand_calibrator import RefractiveWandCalibrator
+from .wand_calibration.refraction_wand_calibrator import RefractiveWandCalibrator
 from PySide6.QtGui import QPainter, QPen, QColor, QPixmap, QPainterPath
 from PySide6.QtCore import QRect, Signal, QPoint, QThread, QTimer, Slot, QObject
 
@@ -430,7 +430,7 @@ class RefractiveCalibWorker(QObject):
             mock_base.image_size = self.image_size
             
             # Instantiate
-            from .wand_calibration.refractive_wand_calibrator import RefractiveWandCalibrator
+            from .wand_calibration.refraction_wand_calibrator import RefractiveWandCalibrator
             calibrator = RefractiveWandCalibrator(mock_base)
             
             # Define callback
@@ -5305,7 +5305,7 @@ class CameraCalibrationView(QWidget):
             out_path = os.path.join(parent_dir, out_folder_name)
 
             # 3. Initialize and Calibrate
-            from .wand_calibration.refractive_wand_calibrator import RefractiveWandCalibrator
+            from .wand_calibration.refraction_wand_calibrator import RefractiveWandCalibrator
             ref_cal = RefractiveWandCalibrator(self.wand_calibrator)
             ref_cal.base.dist_coeff_num = dist_coeff_num # Pass dist_coeff_num
             ref_cal.base.wand_length = wand_len
@@ -5516,7 +5516,7 @@ class CameraCalibrationView(QWidget):
         for spine in self._refr_cost_ax.spines.values():
             spine.set_color('#444')
         self._refr_cost_ax.set_title('Optimization RMSE', color='white', fontsize=10)
-        self._refr_cost_ax.set_ylabel('RMSE (Ray=px, Len=mm)', color='white')
+        self._refr_cost_ax.set_ylabel('RMSE (Ray=mm, Len=mm)', color='white')
         self._refr_cost_ax.set_yscale('log')
         self._refr_cost_ax.grid(True, which="both", ls="--", color='#333', alpha=0.5)
 
