@@ -559,7 +559,7 @@ class Calibration3DViewer(QWidget):
         
         self.canvas.draw()
         
-    def plot_calibration(self, cameras, points_3d=None):
+    def plot_calibration(self, cameras, points_3d=None, axis_map: str = None):
         """Plot cameras and points in 3D (MATLAB style)."""
         self.ax.clear()
         
@@ -569,9 +569,14 @@ class Calibration3DViewer(QWidget):
         self.ax.xaxis.label.set_color('white')
         self.ax.yaxis.label.set_color('white')
         self.ax.zaxis.label.set_color('white')
-        self.ax.set_xlabel('X (m)')
-        self.ax.set_ylabel('Y (m)')
-        self.ax.set_zlabel('Z (m)')
+        if axis_map == 'y_up':
+            self.ax.set_xlabel('X (m)')
+            self.ax.set_ylabel('Z (m)')
+            self.ax.set_zlabel('Y (m)')
+        else:
+            self.ax.set_xlabel('X (m)')
+            self.ax.set_ylabel('Y (m)')
+            self.ax.set_zlabel('Z (m)')
         
         # Keep pane borders but remove fill
         self.ax.xaxis.pane.fill = False
@@ -583,14 +588,21 @@ class Calibration3DViewer(QWidget):
         
         # Convert mm to m (divide by 1000)
         scale = 1000.0
+        def map_point(p):
+            if axis_map == 'y_up':
+                return np.array([p[0], p[2], p[1]])
+            return np.array(p)
         
         all_x, all_y, all_z = [], [], []
         
         # 1. Plot Wand Points (Blue)
         if points_3d is not None and len(points_3d) > 0:
-            xs = points_3d[:, 0] / scale
-            ys = points_3d[:, 1] / scale
-            zs = points_3d[:, 2] / scale
+            pts = points_3d / scale
+            if axis_map == 'y_up':
+                pts = pts[:, [0, 2, 1]]
+            xs = pts[:, 0]
+            ys = pts[:, 1]
+            zs = pts[:, 2]
             self.ax.scatter(xs, ys, zs, c='#0077FF', s=5, marker='.', alpha=0.7, label='Wand Points')
             all_x.extend(xs)
             all_y.extend(ys)
@@ -605,6 +617,7 @@ class Calibration3DViewer(QWidget):
                     t = params['T']
                     C = -R.T @ t
                     C = C.flatten() / scale
+                    C = map_point(C)
                     camera_data.append((c_id, C, R))
                     all_x.append(C[0])
                     all_y.append(C[1])
@@ -633,6 +646,7 @@ class Calibration3DViewer(QWidget):
             
             # Direction line (length = half of range)
             z_dir = R.T @ np.array([0, 0, 1]) * axis_len_m
+            z_dir = map_point(z_dir)
             end_pt = C + z_dir
             self.ax.plot3D([C[0], end_pt[0]], [C[1], end_pt[1]], [C[2], end_pt[2]], 
                            color='#FFFF00', linewidth=2)
@@ -670,7 +684,7 @@ class Calibration3DViewer(QWidget):
 
         
         # First plot standard elements (cameras + points)
-        self.plot_calibration(converted_cams, points_3d)
+        self.plot_calibration(converted_cams, points_3d, axis_map='y_up')
         
         # Now add window planes (positioned between cameras and 3D points)
         scale = 1000.0  # mm -> m
@@ -846,11 +860,13 @@ class Calibration3DViewer(QWidget):
                 if len(poly_pts) < 3:
                     continue
 
-                poly = Poly3DCollection([poly_pts], alpha=0.3, facecolors='#00d4ff',
+                poly_pts_viz = np.array(poly_pts)[:, [0, 2, 1]]
+                poly = Poly3DCollection([poly_pts_viz], alpha=0.3, facecolors='#00d4ff',
                                         edgecolors='#00d4ff', linewidths=0.5)
                 self.ax.add_collection3d(poly)
 
                 label_pt = np.mean(poly_pts, axis=0)
+                label_pt = np.array([label_pt[0], label_pt[2], label_pt[1]])
                 self.ax.text(label_pt[0], label_pt[1], label_pt[2],
                              f"Win {wid}", color='#00d4ff', fontsize=8)
             
@@ -5635,8 +5651,10 @@ class CameraCalibrationView(QWidget):
             self.run_refr_btn.setEnabled(True)
             
         if success and cam_params:
-            msg = f"Refractive Calibration Completed.\nReport saved to output folder."
-            QMessageBox.information(self, "Success", msg)
+            msg_lines = [
+                "Refractive Calibration Completed.",
+                "Report saved to output folder."
+            ]
             if hasattr(self, 'status_label'):
                 self.status_label.setText("Refractive Calibration Successful")
             
@@ -5645,6 +5663,34 @@ class CameraCalibrationView(QWidget):
             if errors:
                 self.wand_calibrator.per_frame_errors = errors
                 print(f"[Refractive] Injected {len(errors)} frames of error data into UI calibrator.")
+
+                cam_errs = {}
+                len_errs = []
+                per_camera_mean = dataset.get('per_camera_mean_proj_err', {})
+                for err in errors.values():
+                    if 'len_error' in err:
+                        len_errs.append(float(err['len_error']))
+                    for cid, e in err.get('cam_errors', {}).items():
+                        cam_errs.setdefault(int(cid), []).append(float(e))
+
+                if len_errs:
+                    wand_rmse = float(np.sqrt(np.mean(np.square(len_errs))))
+                    msg_lines.append(f"Wand Length RMSE: {wand_rmse:.4f} mm")
+
+                if per_camera_mean:
+                    msg_lines.append("Per-Camera Mean Projection Error:")
+                    for cid in sorted(per_camera_mean.keys()):
+                        mean_err = float(per_camera_mean[cid])
+                        msg_lines.append(f"  Cam {cid}: {mean_err:.3f} px")
+                elif cam_errs:
+                    msg_lines.append("Per-Camera Mean Projection Error:")
+                    for cid in sorted(cam_errs.keys()):
+                        vals = cam_errs[cid]
+                        if vals:
+                            mean_err = float(np.mean(vals))
+                            msg_lines.append(f"  Cam {cid}: {mean_err:.3f} px")
+
+            QMessageBox.information(self, "Success", "\n".join(msg_lines))
             
             # 3D Visualization
             try:
@@ -5665,6 +5711,8 @@ class CameraCalibrationView(QWidget):
                 
                 if hasattr(self, 'calib_3d_view'):
                     self.calib_3d_view.plot_refractive(cam_params, win_planes, pts_3d)
+                    if hasattr(self, 'vis_tabs'):
+                        self.vis_tabs.setCurrentIndex(1)
                     
             except Exception as e:
                 print(f"[Refractive] Visualization Error: {e}")

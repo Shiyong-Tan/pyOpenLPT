@@ -889,7 +889,7 @@ std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_wo
     
     const int proj_nmax = _pinplate_param.proj_nmax;
     const double proj_tol = _pinplate_param.proj_tol;
-    const double eps = _pinplate_param.lr;
+    const double eps = 1e-5;
     
     // Check if we need to enforce radius constraint (total internal reflection zone)
     bool is_check_radius = false;
@@ -931,13 +931,32 @@ std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_wo
     }
     
     // 2D parametrization on first plane
-    std::vector<double> x(2);
-    projectPointToPlane2D(x, pt_init, _pinplate_param.plane, 
+    std::vector<double> x0(2);
+    projectPointToPlane2D(x0, pt_init, _pinplate_param.plane,
                          _pinplate_param.u_axis, _pinplate_param.v_axis);
+
+    const double L_min = 0.1;
+    const double mu_min = 1e-4;
+    const double mu_scale = 0.1;
+    double L = L_min;
+    {
+        Pt3D pt_exit_scale, exit_dir_scale;
+        if (forwardTrace(pt_exit_scale, exit_dir_scale, pt_world, pt_init)) {
+            Pt3D diff = pt_exit_scale - _pinplate_param.plane.pt;
+            double dist = myMATH::dot(diff, _pinplate_param.plane.norm_vector);
+            Pt3D pt_exit_proj = pt_exit_scale - _pinplate_param.plane.norm_vector * dist;
+            double line_dist = myMATH::dist(pt_exit_proj, line);
+            L = std::max(line_dist, L_min);
+        }
+    }
     
     // Reusable variables
     Pt3D pt_current, pt_exit, exit_direction;
     Pt3D vec_to_pinhole, residual_vec;
+    std::vector<double> delta_y(2, 0.0);
+    std::vector<double> delta_x(2);
+    std::vector<double> x(2);
+    std::vector<double> delta_y_perturb(2);
     std::vector<double> x_perturb(2);
     double J[2][2];
     double F[2];
@@ -948,10 +967,26 @@ std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_wo
     const double lambda_min = 1e-10;
     const double lambda_max = 1e10;
 
+    const double mu_max = 0.1 * L;
+
     for (int iter = 0; iter < proj_nmax; iter++) {
         // Reconstruct 3D point from 2D parameters
+        delta_x[0] = L * delta_y[0];
+        delta_x[1] = L * delta_y[1];
+        x[0] = x0[0] + delta_x[0];
+        x[1] = x0[1] + delta_x[1];
         reconstructFrom2D(pt_current, _pinplate_param.plane.pt, 
                          _pinplate_param.u_axis, _pinplate_param.v_axis, x);
+
+        double radius2_current = 0.0;
+        if (is_check_radius) {
+            radius2_current = myMATH::dist2(pt_current, pt_world);
+            if (radius2_current >= radius_max2) {
+                std::get<0>(result) = true;
+                std::get<3>(result) = iter + 1;
+                return result;
+            }
+        }
         
         // Forward trace to get exit ray
         if (!forwardTrace(pt_exit, exit_direction, pt_world, pt_current)) {
@@ -966,6 +1001,12 @@ std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_wo
         residual_vec = vec_to_pinhole - exit_direction * proj_along_ray;
         
         double residual = residual_vec.norm();
+        double barrier_current = 0.0;
+        if (is_check_radius) {
+            double mu = std::max(mu_min, std::min(mu_scale * residual, mu_max));
+            double d = radius_max2 - radius2_current;
+            barrier_current = -mu * std::log(d);
+        }
         
         if (residual < proj_tol) {
             std::get<1>(result) = pt_exit;
@@ -980,8 +1021,12 @@ std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_wo
         
         // Compute Jacobian using finite differences with radius constraint
         for (int j = 0; j < 2; j++) {
-            x_perturb = x;
-            x_perturb[j] += eps;
+            delta_y_perturb = delta_y;
+            delta_y_perturb[j] += eps;
+            delta_x[0] = L * delta_y_perturb[0];
+            delta_x[1] = L * delta_y_perturb[1];
+            x_perturb[0] = x0[0] + delta_x[0];
+            x_perturb[1] = x0[1] + delta_x[1];
 
             // Reconstruct perturbed 3D point
             reconstructFrom2D(pt_current, _pinplate_param.plane.pt, 
@@ -991,15 +1036,9 @@ std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_wo
             if (is_check_radius) {
                 double radius2 = myMATH::dist2(pt_current, pt_world);
                 if (radius2 >= radius_max2) {
-                    // Project point onto sphere boundary (97% for safety)
-                    double scale = std::sqrt(radius_max2 * 0.97 / radius2);
-                    for (int i = 0; i < 3; i++) {
-                        pt_current[i] = pt_world[i] + (pt_current[i] - pt_world[i]) * scale;
-                    }
-                    
-                    // Update x_perturb to reflect the clamped position
-                    projectPointToPlane2D(x_perturb, pt_current, _pinplate_param.plane,
-                                         _pinplate_param.u_axis, _pinplate_param.v_axis);
+                    std::get<0>(result) = true;
+                    std::get<3>(result) = iter + 1;
+                    return result;
                 }
             }
             
@@ -1020,8 +1059,8 @@ std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_wo
             F_perturb[1] = myMATH::dot(residual_vec, _pinplate_param.v_axis);
             
             // Compute finite difference with actual (possibly clamped) perturbation
-            J[0][j] = (F_perturb[0] - F[0]) / (x_perturb[j] - x[j]);
-            J[1][j] = (F_perturb[1] - F[1]) / (x_perturb[j] - x[j]);
+            J[0][j] = (F_perturb[0] - F[0]) / (delta_y_perturb[j] - delta_y[j]);
+            J[1][j] = (F_perturb[1] - F[1]) / (delta_y_perturb[j] - delta_y[j]);
         }
         
         // Levenberg-Marquardt: Solve (J^T*J + lambda*I) * dx = -J^T*F
@@ -1061,21 +1100,22 @@ std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_wo
         const int max_line_search = 10;
         
         for (int ls = 0; ls < max_line_search; ls++) {
-            x_perturb[0] = x[0] + alpha*dx[0];
-            x_perturb[1] = x[1] + alpha*dx[1];
+            delta_y_perturb[0] = delta_y[0] + alpha*dx[0];
+            delta_y_perturb[1] = delta_y[1] + alpha*dx[1];
+            delta_x[0] = L * delta_y_perturb[0];
+            delta_x[1] = L * delta_y_perturb[1];
+            x_perturb[0] = x0[0] + delta_x[0];
+            x_perturb[1] = x0[1] + delta_x[1];
             
             reconstructFrom2D(pt_current, _pinplate_param.plane.pt, 
                             _pinplate_param.u_axis, _pinplate_param.v_axis, x_perturb);
-            
+
             // Enforce radius constraint during line search too
             if (is_check_radius) {
                 double radius2 = myMATH::dist2(pt_current, pt_world);
                 if (radius2 >= radius_max2) {
-                    // Project onto boundary
-                    double scale = std::sqrt(radius_max2 * 0.97 / radius2);
-                    for (int i = 0; i < 3; i++) {
-                        pt_current[i] = pt_world[i] + (pt_current[i] - pt_world[i]) * scale;
-                    }
+                    alpha *= 0.5;
+                    continue;
                 }
             }
             
@@ -1085,10 +1125,19 @@ std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_wo
                 residual_vec = vec_to_pinhole - exit_direction * proj_along_ray;
                 double residual_new = residual_vec.norm();
                 
-                if (residual_new < residual) {
+                double barrier_new = 0.0;
+                if (is_check_radius) {
+                    double mu = std::max(mu_min, std::min(mu_scale * residual_new, mu_max));
+                    double d = radius_max2 - myMATH::dist2(pt_current, pt_world);
+                    barrier_new = -mu * std::log(d);
+                }
+
+                if (residual_new + barrier_new < residual + barrier_current) {
                     // Update x to reflect actual (possibly clamped) position
                     projectPointToPlane2D(x, pt_current, _pinplate_param.plane,
                                          _pinplate_param.u_axis, _pinplate_param.v_axis);
+                    delta_y[0] = (x[0] - x0[0]) / L;
+                    delta_y[1] = (x[1] - x0[1]) / L;
                     step_accepted = true;
                     lambda = std::max(lambda * 0.1, lambda_min);
                     break;

@@ -50,14 +50,14 @@ class RefractiveCalibReporter:
     def section(self, title: str, width: int = 60):
         line = "=" * width
         print(f"\n{line}")
-        print(f"[RefractiveCalib] {title}")
+        print(title)
         print(line)
 
     def header(self, title: str):
-        print(f"\n[RefractiveCalib] {title}")
+        print(f"\n{title}")
 
     def info(self, message: str):
-        print(f"[RefractiveCalib] {message}")
+        print(message)
 
     def detail(self, message: str):
         print(message)
@@ -157,6 +157,7 @@ class RefractiveBAConfig:
     lambda_reg_f: float = 10.0      # Focal drift penalty
     lambda_reg_thick: float = 10.0  # Thickness drift penalty
     lambda_reg_dist: float = 10.0   # Distortion drift penalty
+    use_regularization: bool = False
     
     # Sampling
     max_frames: int = 50000  # Default to all (high limit)
@@ -182,7 +183,7 @@ class RefractiveBAConfig:
     # Bounds for Round 4 refinement
     bounds_thick_pct: float = 0.05
     bounds_f_pct: float = 0.05
-    bounds_dist_abs: float = 0.05
+    bounds_dist_abs: float = 0.2
 
     # Distortion optimization
     dist_coeff_num: int = 0
@@ -200,6 +201,16 @@ class RefractiveBAConfig:
     # Weak-window control
     skip_weak_round3: bool = True
     skip_weak_round4: bool = True
+
+    # Finite difference step sizes (per-parameter)
+    diff_step_rvec: float = 1e-4
+    diff_step_tvec: float = 1e-2
+    diff_step_plane_d: float = 1e-2
+    diff_step_plane_ang: float = 1e-4
+    diff_step_f: float = 1e-1
+    diff_step_thick: float = 1e-3
+    diff_step_k: float = 1e-6
+    diff_step_default: float = 1e-4
     
     
 class RefractiveBAOptimizer:
@@ -868,32 +879,33 @@ class RefractiveBAOptimizer:
         self._last_len_rmse = np.sqrt(S_len / max(N_len, 1)) if N_len > 0 else 0.0
         
         # Regularization
-        reg_residuals = []
         cfg = self.config
-        
-        idx = 0
-        for (ptype, pid, subidx) in layout:
-            val = x[idx]
-            idx += 1
-            
-            if ptype.startswith('plane'):
-                # Plane regularization
-                # Penalty on deviation from initial (d, alpha, beta)
-                reg_residuals.append(val * np.sqrt(cfg.lambda_reg_plane))
-            elif ptype == 'cam_t':
-                reg_residuals.append(val * np.sqrt(cfg.lambda_reg_tvec))
-            elif ptype == 'cam_r':
-                weight = cfg.lambda_reg_rvec
-                reg_residuals.append(val * np.sqrt(weight))
-            elif ptype == 'cam_f':
-                reg_residuals.append(val * np.sqrt(cfg.lambda_reg_f))
-            elif ptype == 'cam_k1' or ptype == 'cam_k2':
-                reg_residuals.append(val * np.sqrt(cfg.lambda_reg_dist))
-            elif ptype == 'win_t':
-                reg_residuals.append(val * np.sqrt(cfg.lambda_reg_thick))
-        
-        if len(reg_residuals) > 0:
-            residuals = np.concatenate([residuals, np.array(reg_residuals)])
+        if cfg.use_regularization:
+            reg_residuals = []
+
+            idx = 0
+            for (ptype, pid, subidx) in layout:
+                val = x[idx]
+                idx += 1
+
+                if ptype.startswith('plane'):
+                    # Plane regularization
+                    # Penalty on deviation from initial (d, alpha, beta)
+                    reg_residuals.append(val * np.sqrt(cfg.lambda_reg_plane))
+                elif ptype == 'cam_t':
+                    reg_residuals.append(val * np.sqrt(cfg.lambda_reg_tvec))
+                elif ptype == 'cam_r':
+                    weight = cfg.lambda_reg_rvec
+                    reg_residuals.append(val * np.sqrt(weight))
+                elif ptype == 'cam_f':
+                    reg_residuals.append(val * np.sqrt(cfg.lambda_reg_f))
+                elif ptype == 'cam_k1' or ptype == 'cam_k2':
+                    reg_residuals.append(val * np.sqrt(cfg.lambda_reg_dist))
+                elif ptype == 'win_t':
+                    reg_residuals.append(val * np.sqrt(cfg.lambda_reg_thick))
+
+            if len(reg_residuals) > 0:
+                residuals = np.concatenate([residuals, np.array(reg_residuals)])
 
         return np.array(residuals)
 
@@ -921,6 +933,33 @@ class RefractiveBAOptimizer:
 
         x0 = np.zeros(len(layout), dtype=np.float64)
         cfg = self.config
+
+        diff_step = []
+        for (ptype, _, _) in layout:
+            if ptype == 'cam_r':
+                diff_step.append(cfg.diff_step_rvec)
+            elif ptype == 'cam_t':
+                diff_step.append(cfg.diff_step_tvec)
+            elif ptype == 'plane_d':
+                diff_step.append(cfg.diff_step_plane_d)
+            elif ptype == 'plane_a' or ptype == 'plane_b':
+                diff_step.append(cfg.diff_step_plane_ang)
+            elif ptype == 'cam_f':
+                diff_step.append(cfg.diff_step_f)
+            elif ptype == 'win_t':
+                diff_step.append(cfg.diff_step_thick)
+            elif ptype == 'cam_k1' or ptype == 'cam_k2':
+                diff_step.append(cfg.diff_step_k)
+            else:
+                diff_step.append(cfg.diff_step_default)
+
+        diff_step = np.array(diff_step, dtype=np.float64)
+        if cfg.verbosity >= 1:
+            self.reporter.detail(
+                f"  diff_step: rvec={cfg.diff_step_rvec:g}, tvec={cfg.diff_step_tvec:g}, "
+                f"plane_d={cfg.diff_step_plane_d:g}, plane_ang={cfg.diff_step_plane_ang:g}, "
+                f"f={cfg.diff_step_f:g}, thick={cfg.diff_step_thick:g}, k={cfg.diff_step_k:g}"
+            )
         
         self.reporter.detail(f"  [{description}] optimizing {len(x0)} parameters ({len(layout)//3} blocks)...")
         # Calc initial RMSE for rollback reference
@@ -1035,8 +1074,87 @@ class RefractiveBAOptimizer:
             f_scale=self.config.loss_f_scale if f_scale is None else f_scale,
             xtol=1e-6,
             gtol=1e-6,
-            max_nfev=50
+            max_nfev=50,
+            diff_step=diff_step
         )
+
+        if res is not None:
+            status = getattr(res, 'status', None)
+            message = getattr(res, 'message', '')
+            nfev = getattr(res, 'nfev', None)
+            reason_map = {
+                1: 'gtol',
+                2: 'ftol',
+                3: 'xtol',
+                4: 'ftol+xtol'
+            }
+            reason = reason_map.get(status, f'status_{status}')
+            nfev_str = f"{nfev}" if nfev is not None else "?"
+            self.reporter.detail(f"  Termination: {reason} (nfev={nfev_str})")
+            if message:
+                self.reporter.detail(f"  Message: {message}")
+
+            if layout and hasattr(res, 'x'):
+                cam_deltas = {}
+                plane_deltas = {}
+
+                for (ptype, pid, subidx), val in zip(layout, res.x):
+                    if ptype == 'cam_r':
+                        cam_deltas.setdefault(pid, {}).setdefault('r', np.zeros(3))
+                        cam_deltas[pid]['r'][subidx] = val
+                    elif ptype == 'cam_t':
+                        cam_deltas.setdefault(pid, {}).setdefault('t', np.zeros(3))
+                        cam_deltas[pid]['t'][subidx] = val
+                    elif ptype == 'cam_f':
+                        cam_deltas.setdefault(pid, {})['f'] = val
+                    elif ptype == 'cam_k1':
+                        cam_deltas.setdefault(pid, {})['k1'] = val
+                    elif ptype == 'cam_k2':
+                        cam_deltas.setdefault(pid, {})['k2'] = val
+                    elif ptype == 'win_t':
+                        plane_deltas.setdefault(pid, {})['t'] = val
+                    elif ptype == 'plane_d':
+                        plane_deltas.setdefault(pid, {})['d'] = val
+                    elif ptype == 'plane_a':
+                        plane_deltas.setdefault(pid, {})['a'] = val
+                    elif ptype == 'plane_b':
+                        plane_deltas.setdefault(pid, {})['b'] = val
+
+                if cam_deltas:
+                    self.reporter.detail("  Camera Δ:")
+                    for cid in sorted(cam_deltas.keys()):
+                        cd = cam_deltas[cid]
+                        parts = []
+                        if 'r' in cd:
+                            rot_deg = np.linalg.norm(cd['r']) * 180.0 / np.pi
+                            parts.append(f"Δr={rot_deg:.3f}deg")
+                        if 't' in cd:
+                            trans = np.linalg.norm(cd['t'])
+                            parts.append(f"Δt={trans:.3f}mm")
+                        if 'f' in cd:
+                            parts.append(f"Δf={cd['f']:.4f}")
+                        if 'k1' in cd:
+                            parts.append(f"Δk1={cd['k1']:.6f}")
+                        if 'k2' in cd:
+                            parts.append(f"Δk2={cd['k2']:.6f}")
+                        if parts:
+                            self.reporter.detail(f"    Cam {cid}: " + ", ".join(parts))
+
+                if plane_deltas:
+                    self.reporter.detail("  Window Δ:")
+                    for wid in sorted(plane_deltas.keys()):
+                        pd = plane_deltas[wid]
+                        parts = []
+                        if 'd' in pd:
+                            parts.append(f"Δd={pd['d']:.4f}mm")
+                        if 'a' in pd:
+                            parts.append(f"Δa={pd['a'] * 180.0 / np.pi:.4f}deg")
+                        if 'b' in pd:
+                            parts.append(f"Δb={pd['b'] * 180.0 / np.pi:.4f}deg")
+                        if 't' in pd:
+                            parts.append(f"Δt={pd['t']:.4f}mm")
+                        if parts:
+                            self.reporter.detail(f"    Win {wid}: " + ", ".join(parts))
 
         # Print Barrier Stats
         if cfg.verbosity >= 1 and hasattr(self, '_last_barrier_stats') and self._last_barrier_stats:
@@ -1462,13 +1580,13 @@ class RefractiveBAOptimizer:
             # [NEW] Re-detect before final joint (optional)
             if not self.config.skip_weak_round3:
                 self._detect_weak_windows()
-            # Bounds: 20 deg, 50 mm d, 10 mm tvec
+            # Bounds: 20 deg, 50 mm d, 10 deg plane_ang, 50 mm tvec
             limit_rvec = np.radians(20.0)
             limit_plane_d = 50.0
-            limit_plane_ang = np.radians(20.0)
-            limit_tvec = 10.0
+            limit_plane_ang = np.radians(10.0)
+            limit_tvec = 50.0
             
-            print(f"  Bounds: rvec < 20deg, plane_d < 50mm, plane_ang < 20deg, tvec < 10mm")
+            print("  Bounds: rvec < 20deg, plane_d < 50mm, plane_ang < 10deg, tvec < 50mm")
             
             self._optimize_generic(
                 mode='final_joint', 
@@ -1488,13 +1606,13 @@ class RefractiveBAOptimizer:
         # --- Round 4: Joint + Intrinsics + Thickness ---
         if stage >= 4:
             self.reporter.section("Round 4: Joint Optimization + Intrinsics/Thickness")
-            limit_rvec = np.radians(10.0)
-            limit_plane_d = 5.0
-            limit_plane_ang = np.radians(2.5)
-            limit_tvec = 20.0
+            limit_rvec = np.radians(20.0)
+            limit_plane_d = 10.0
+            limit_plane_ang = np.radians(5.0)
+            limit_tvec = 50.0
 
             print(
-                f"  Bounds: rvec < 10deg, plane_d < 5mm, plane_ang < 2.5deg, tvec < 20mm, "
+                f"  Bounds: rvec < 20deg, plane_d < 10mm, plane_ang < 5deg, tvec < 50mm, "
                 f"f/thickness within {self.config.bounds_f_pct*100:.1f}%/{self.config.bounds_thick_pct*100:.1f}%"
             )
 

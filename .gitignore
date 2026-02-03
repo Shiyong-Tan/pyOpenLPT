@@ -39,3 +39,9 @@ update_openlpt.command
 
 # Temporary repair scripts
 repair_environment.bat
+
+# Local OpenCode config
+opencode.jsonc
+
+# OpenCode directory
+.opencode/

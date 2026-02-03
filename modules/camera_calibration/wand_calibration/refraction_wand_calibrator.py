@@ -56,8 +56,7 @@ def _rc_print(*args, **kwargs):
     file = kwargs.pop("file", None)
     msg = sep.join(str(a) for a in args)
     msg = _normalize_message(msg)
-    prefix = "[RefractiveCalib] "
-    builtins.print(prefix + msg, sep="", end=end, file=file, **kwargs)
+    builtins.print(msg, sep="", end=end, file=file, **kwargs)
 
 
 print = _rc_print
@@ -66,24 +65,24 @@ print = _rc_print
 class RefractiveCalibReporter:
     def section(self, title: str, width: int = 60):
         line = "=" * width
-        builtins.print(f"[RefractiveCalib] {line}")
-        builtins.print(f"[RefractiveCalib] {title}")
-        builtins.print(f"[RefractiveCalib] {line}")
+        builtins.print(line)
+        builtins.print(_normalize_message(title))
+        builtins.print(line)
 
     def header(self, title: str):
-        builtins.print(f"[RefractiveCalib] {_normalize_message(title)}")
+        builtins.print(_normalize_message(title))
 
     def info(self, message: str):
-        builtins.print(f"[RefractiveCalib] {_normalize_message(message)}")
+        builtins.print(_normalize_message(message))
 
     def warn(self, message: str):
-        builtins.print(f"[RefractiveCalib] {_normalize_message(message)}")
+        builtins.print(_normalize_message(message))
 
     def error(self, message: str):
-        builtins.print(f"[RefractiveCalib] {_normalize_message(message)}")
+        builtins.print(_normalize_message(message))
 
     def detail(self, message: str):
-        builtins.print(f"[RefractiveCalib] {_normalize_message(message)}")
+        builtins.print(_normalize_message(message))
 
 
 class BootstrapCacheStore:
@@ -2297,8 +2296,11 @@ class RefractiveWandCalibrator:
             progress_callback=progress_callback
         )
 
-        # Try to load cache
-        loaded_cache = ba_optimizer.try_load_cache(out_path)
+        use_ba_cache = False
+        loaded_cache = False
+        if use_ba_cache:
+            # Try to load cache
+            loaded_cache = ba_optimizer.try_load_cache(out_path)
         
         if loaded_cache:
             # Cache loaded successfully, extract updated state
@@ -2471,12 +2473,17 @@ class RefractiveWandCalibrator:
         
         # Log summary per camera (Using All-Points stats per user request)
         print(f"[per_frame_errors] Computed errors for {total_frames} frames.")
+        per_camera_mean = {}
         for cid in sorted(cam_all_points_errs.keys()):
             errs = cam_all_points_errs[cid]
             if errs:
                 mean_err = np.mean(errs)
                 std_err = np.std(errs)
                 max_err = np.max(errs)
+                per_camera_mean[cid] = float(mean_err)
                 print(f"  Cam {cid}: Mean={mean_err:.3f} px, Std={std_err:.3f} px, Max={max_err:.3f} px ({len(errs)} samples)")
+
+        if per_camera_mean:
+            dataset['per_camera_mean_proj_err'] = per_camera_mean
 
 
