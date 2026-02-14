@@ -649,7 +649,16 @@ class PlaneInitializer:
 
 class CamFileExporter:
     @staticmethod
-    def export_camfile_with_refraction(base, out_dir, cam_params, window_media, cam_to_window, window_planes=None):
+    def export_camfile_with_refraction(
+        base,
+        out_dir,
+        cam_params,
+        window_media,
+        cam_to_window,
+        window_planes=None,
+        proj_err_stats=None,
+        tri_err_stats=None,
+    ):
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
 
@@ -746,58 +755,57 @@ class CamFileExporter:
             w_str = ",".join([f"{w:.4f}" for w in w_array])
 
             with open(file_path, 'w') as f_out:
+                proj_mean, proj_std = 0.0, 0.0
+                tri_mean, tri_std = 0.0, 0.0
+                if proj_err_stats and cid in proj_err_stats:
+                    proj_mean, proj_std = proj_err_stats[cid]
+                if tri_err_stats and cid in tri_err_stats:
+                    tri_mean, tri_std = tri_err_stats[cid]
+
+                proj_err_line = f"{float(proj_mean):.8g},{float(proj_std):.8g}"
+                tri_err_line = f"{float(tri_mean):.8g},{float(tri_std):.8g}"
+
+                f_out.write("# Camera Model: (PINHOLE/POLYNOMIAL/PINPLATE)\n")
                 f_out.write("PINPLATE\n")
-                f_out.write("# (unused) error placeholders\n")
-                f_out.write("0.0 0.0\n")
-                f_out.write("\n")
-                f_out.write("# Image Size: (n_row,n_col) as ONE token\n")
+                f_out.write("# Camera Calibration Error:\n")
+                f_out.write(f"{proj_err_line}\n")
+                f_out.write("# Pose Calibration Error:\n")
+                f_out.write(f"{tri_err_line}\n")
+                f_out.write("# Image Size: (n_row,n_col)\n")
                 f_out.write(f"{img_size_str}\n")
-                f_out.write("\n")
-                f_out.write("# Camera Matrix K (3x3)\n")
+                f_out.write("# Camera Matrix:\n")
                 f_out.write(f"{f:.8g} 0 {cx:.8g}\n")
                 f_out.write(f"0 {f:.8g} {cy:.8g}\n")
                 f_out.write("0 0 1\n")
-                f_out.write("\n")
-                f_out.write("# Distortion coefficients (ONE token, comma-separated)\n")
+                f_out.write("# Distortion Coefficients:\n")
                 f_out.write(f"{dist_coeff_str}\n")
-                f_out.write("\n")
-                f_out.write("# Rotation vector (unused placeholder, ONE token)\n")
+                f_out.write("# Rotation Vector:\n")
                 f_out.write(f"{rvec_placeholder}\n")
-                f_out.write("\n")
-                f_out.write("# Rotation Matrix R (world->camera)\n")
+                f_out.write("# Rotation Matrix:\n")
                 for row in R:
                     f_out.write(f"{row[0]:.8g} {row[1]:.8g} {row[2]:.8g}\n")
-                f_out.write("\n")
-                f_out.write("# Inverse Rotation Matrix R_inv\n")
+                f_out.write("# Inverse of Rotation Matrix:\n")
                 for row in R_inv:
                     f_out.write(f"{row[0]:.8g} {row[1]:.8g} {row[2]:.8g}\n")
-                f_out.write("\n")
-                f_out.write("# Translation Vector T (world->camera)\n")
+                f_out.write("# Translation Vector:\n")
                 f_out.write(f"{t_vec[0]:.8g} {t_vec[1]:.8g} {t_vec[2]:.8g}\n")
-                f_out.write("\n")
-                f_out.write("# Inverse Translation Vector (-R_inv*T) = camera center in world\n")
+                f_out.write("# Inverse of Translation Vector:\n")
                 f_out.write(f"{t_vec_inv[0]:.8g} {t_vec_inv[1]:.8g} {t_vec_inv[2]:.8g}\n")
-                f_out.write("\n")
                 f_out.write("# Refractive plane reference point plane.pt (Farthest Interface)\n")
                 f_out.write(f"{plane_pt_export[0]:.8g} {plane_pt_export[1]:.8g} {plane_pt_export[2]:.8g}\n")
-                f_out.write("\n")
                 f_out.write("# Refractive plane normal plane.norm_vector (camera->object direction)\n")
                 f_out.write(f"{plane_norm[0]:.8g} {plane_norm[1]:.8g} {plane_norm[2]:.8g}\n")
-                f_out.write("\n")
                 f_out.write("# refract_array (ONE token, comma-separated, farthest->nearest: obj->win->air)\n")
                 f_out.write(f"# n_plate = {n_plate}\n")
                 f_out.write(f"{refract_str}\n")
-                f_out.write("\n")
                 f_out.write("# w_array (ONE token, comma-separated, plate thicknesses in mm)\n")
                 f_out.write(f"{w_str}\n")
-                f_out.write("\n")
                 f_out.write("# proj_tol\n")
                 f_out.write("1e-6\n")
                 f_out.write("# proj_nmax\n")
                 f_out.write("50\n")
                 f_out.write("# lr (learning rate)\n")
                 f_out.write("0.1\n")
-                f_out.write("\n")
                 f_out.write("# --- BEGIN_REFRACTION_META ---\n")
                 f_out.write(f"# VERSION=2\n")
                 f_out.write(f"# CAM_ID={cid}\n")
@@ -1113,7 +1121,16 @@ class RefractiveWandCalibrator:
         print("")
         return r_small, r_large
 
-    def export_camfile_with_refraction(self, out_dir, cam_params, window_media, cam_to_window, window_planes=None):
+    def export_camfile_with_refraction(
+        self,
+        out_dir,
+        cam_params,
+        window_media,
+        cam_to_window,
+        window_planes=None,
+        proj_err_stats=None,
+        tri_err_stats=None,
+    ):
         """
         Export PINPLATE camFiles per camera in a directory.
         Strictly follows Camera::loadParameters (PINPLATE branch) from Camera.cpp.
@@ -1130,6 +1147,8 @@ class RefractiveWandCalibrator:
             window_media=window_media,
             cam_to_window=cam_to_window,
             window_planes=window_planes,
+            proj_err_stats=proj_err_stats,
+            tri_err_stats=tri_err_stats,
         )
 
 
@@ -1769,6 +1788,15 @@ class RefractiveWandCalibrator:
             }
         }
 
+        per_camera_tri_err_stats = {}
+        for cid, vals in per_cam_r_ray.items():
+            if vals:
+                arr = np.asarray(vals, dtype=float)
+                per_camera_tri_err_stats[cid] = (float(np.mean(arr)), float(np.std(arr)))
+
+        if per_camera_tri_err_stats:
+            dataset['per_camera_tri_err_stats'] = per_camera_tri_err_stats
+
         with open(report_path, 'w') as f_json:
             json.dump(safe_json(report), f_json, indent=2)
 
@@ -1937,9 +1965,23 @@ class RefractiveWandCalibrator:
             except Exception as e:
                 print(f"[Verification] Close-loop check failed: {e}")
 
-        self.calculate_per_frame_errors_refractive(
+        proj_err_stats = self.calculate_per_frame_errors_refractive(
             dataset, tri_data, v_cams_cpp, wand_len_target
         )
+
+        if stored_dir:
+            try:
+                self.export_camfile_with_refraction(
+                    stored_dir,
+                    cam_params,
+                    window_media,
+                    cam_to_window,
+                    self.window_planes,
+                    proj_err_stats=proj_err_stats,
+                    tri_err_stats=dataset.get('per_camera_tri_err_stats', {}),
+                )
+            except Exception as e:
+                print(f"[Refractive][CAMFILE] Warning: failed to write final error stats: {e}")
 
         return True, cam_params, report, dataset
 
@@ -2203,7 +2245,7 @@ class RefractiveWandCalibrator:
             if self.window_planes is None:
                 print("[BOOT] Plane initialization failed.")
                 if progress_callback: progress_callback("Plane initialization failed.", 0, 0, 0)
-                return None, False
+                return False, None, None, dataset
                 
             # [DEBUG] Inspect window_planes keys
             print(f"[BOOT] Initialized window_planes keys: {list(self.window_planes.keys())}")
@@ -2455,11 +2497,11 @@ class RefractiveWandCalibrator:
         """
         if lpt is None:
             print("[per_frame_errors] pyopenlpt not available, skipping.")
-            return
+            return {}
         
         if not dataset or not tri_data or not cams_cpp:
             print("[per_frame_errors] Missing required data, skipping.")
-            return
+            return {}
         
         print("\n[per_frame_errors] Calculating reprojection errors for all frames...")
         
@@ -2549,6 +2591,7 @@ class RefractiveWandCalibrator:
         # Log summary per camera (Using All-Points stats per user request)
         print(f"[per_frame_errors] Computed errors for {total_frames} frames.")
         per_camera_mean = {}
+        per_camera_stats = {}
         for cid in sorted(cam_all_points_errs.keys()):
             errs = cam_all_points_errs[cid]
             if errs:
@@ -2556,9 +2599,14 @@ class RefractiveWandCalibrator:
                 std_err = np.std(errs)
                 max_err = np.max(errs)
                 per_camera_mean[cid] = float(mean_err)
+                per_camera_stats[cid] = (float(mean_err), float(std_err))
                 print(f"  Cam {cid}: Mean={mean_err:.3f} px, Std={std_err:.3f} px, Max={max_err:.3f} px ({len(errs)} samples)")
 
         if per_camera_mean:
             dataset['per_camera_mean_proj_err'] = per_camera_mean
+        if per_camera_stats:
+            dataset['per_camera_proj_err_stats'] = per_camera_stats
+
+        return per_camera_stats
 
 

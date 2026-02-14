@@ -25,7 +25,7 @@ bool Object3D::isReconstructable(
         y = _obj2d_list[i]->_pt_center[1];
 
         if (x < 0 || x >= camera_models[i]->getNCol() ||
-            y < 0 || y >= camera_models[i]->getNCol())
+            y < 0 || y >= camera_models[i]->getNRow())
         {
             n_outrange ++;
             if (n_cam - n_outrange < 2)
@@ -543,7 +543,7 @@ bool checkRadiusConsistency(const Pt3D&                          X,
             Rmax = std::max(Rmax, Ri);
             ++n_ok;
 
-            // --- Build dynamic threshold contributions (PINHOLE only for now) ---
+            // --- Build dynamic threshold contributions ---
             if (cam->type() == CameraType::Pinhole) {
                 double fx = 0.0, fy = 0.0;
                 Pt3D C;
@@ -575,6 +575,46 @@ bool checkRadiusConsistency(const Pt3D&                          X,
                             eps_has_data = true;
                         }
                     }
+                }
+            } else if (cam->type() == CameraType::RefractionPinhole) {
+                // Refraction model uses local linearization in calRadiusFromOneCam.
+                // Estimate dR/dr numerically with pixel perturbation step tol_2d_px.
+                double eps_r = 0.0;
+                if (tol_2d_px > 0.0 && r_px > 0.0) {
+                    const double dr = tol_2d_px;
+                    const double r_plus = r_px + dr;
+                    const double r_minus = std::max(1e-9, r_px - dr);
+
+                    const double R_plus = calRadiusFromOneCam(*cam, X, r_plus);
+                    const double R_minus = calRadiusFromOneCam(*cam, X, r_minus);
+
+                    if (std::isfinite(R_plus) && std::isfinite(R_minus) && r_plus > r_minus) {
+                        const double dRdr = (R_plus - R_minus) / (r_plus - r_minus);
+                        if (std::isfinite(dRdr)) {
+                            eps_r = std::abs(dRdr) * tol_2d_px / Ri;
+                        }
+                    } else {
+                        // Fallback to local proportional model: R ~ r.
+                        eps_r = tol_2d_px / r_px;
+                    }
+                }
+
+                double eps_d = 0.0;
+                if (tol_3d > 0.0) {
+                    double fx = 0.0, fy = 0.0;
+                    Pt3D C;
+                    if (extractPinholeData(*cam, fx, fy, C)) {
+                        const double d_i = (X - C).norm();
+                        if (std::isfinite(d_i) && d_i > 0.0) {
+                            eps_d = tol_3d / d_i;
+                        }
+                    }
+                }
+
+                const double eps_i = std::hypot(eps_r, eps_d);
+                if (std::isfinite(eps_i)) {
+                    eps_max = std::max(eps_max, eps_i);
+                    eps_has_data = true;
                 }
             }
         }

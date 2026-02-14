@@ -883,7 +883,7 @@ int RefractionPinholeCamera::getNCol() const { return _param.n_col; }
 Status RefractionPinholeCamera::saveParameters(const std::string& file_name) const {
     try {
         std::ofstream outfile(file_name.c_str(), std::ios::out);
-        outfile << "# Camera Model: (PINHOLE/POLYNOMIAL)" << std::endl;
+        outfile << "# Camera Model: (PINHOLE/POLYNOMIAL/PINPLATE)" << std::endl;
         outfile << "PINPLATE" << std::endl;
         outfile << "# Camera Calibration Error: \nNone\n# Pose Calibration Error: \nNone"
                         << std::endl;
@@ -1407,9 +1407,18 @@ StatusOr<std::shared_ptr<Camera>> CameraFactory::loadFromFile(
 
         if (type_name == "PINPLATE") {
             auto cam = std::make_shared<RefractionPinholeCamera>();
-            std::string useless;
-            file_content >> useless;
-            file_content >> useless;
+            // Read and ignore calibration-error tokens to keep parsing aligned with
+            // PINHOLE-style header:
+            //   # Camera Calibration Error:
+            //   <mean,std>
+            //   # Pose Calibration Error:
+            //   <mean,std>
+            // Legacy pinplate files that used placeholder numeric tokens remain
+            // compatible because they still provide two tokens here.
+            std::string calib_err_token;
+            std::string pose_err_token;
+            file_content >> calib_err_token;
+            file_content >> pose_err_token;
 
             std::string img_size_str;
             file_content >> img_size_str;
@@ -1425,7 +1434,8 @@ StatusOr<std::shared_ptr<Camera>> CameraFactory::loadFromFile(
             file_content >> dist_coeff_str;
             loadDistCoeff(dist_coeff_str, cam->param());
 
-            file_content >> useless; // rvec, ignored for compatibility
+            std::string rvec_token;
+            file_content >> rvec_token; // rvec, ignored for compatibility
             cam->param().r_mtx = Matrix<double>(3, 3, file_content);
             cam->param().r_mtx_inv = Matrix<double>(3, 3, file_content);
             cam->param().t_vec = Pt3D(file_content);

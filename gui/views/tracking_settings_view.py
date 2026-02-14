@@ -647,13 +647,11 @@ class TrackingSettingsView(QWidget):
         if " (" in cam_dir:
             cam_dir = cam_dir.split(" (")[0]
             
-        if not self.calibration_view or not hasattr(self.calibration_view, 'wand_calibrator'):
+        if not self.calibration_view:
             return
-            
-        calibrator = self.calibration_view.wand_calibrator
-        if not calibrator.final_params or calibrator.points_3d is None:
-            return # No calibration data or 3D points
-            
+
+        calib_view = self.calibration_view
+
         # Create directory if it doesn't exist
         if not os.path.exists(cam_dir):
             try:
@@ -661,6 +659,26 @@ class TrackingSettingsView(QWidget):
             except OSError as e:
                 print(f"[TrackingSettings] Error creating {cam_dir}: {e}")
                 return
+
+        is_dir_empty = not os.listdir(cam_dir)
+
+        # Refractive export path (PINPLATE)
+        has_refr_result = bool(getattr(calib_view, '_refr_has_result', False))
+        refr_dirty = bool(getattr(calib_view, '_refr_params_dirty', False))
+        if has_refr_result and (refr_dirty or is_dir_empty):
+            if hasattr(calib_view, 'export_refractive_camfiles_to_dir'):
+                ok = calib_view.export_refractive_camfiles_to_dir(cam_dir)
+                if ok:
+                    n_cam = len(getattr(calib_view, '_refr_final_cam_params', {}) or {})
+                    print(f"[TrackingSettings] Auto-saved {n_cam} refractive camera params to {cam_dir}")
+                    return
+
+        if not hasattr(calib_view, 'wand_calibrator'):
+            return
+             
+        calibrator = calib_view.wand_calibrator
+        if not calibrator.final_params or calibrator.points_3d is None:
+            return # No calibration data or 3D points
         
         # Save each camera directly into cam_dir
         saved_count = 0
@@ -837,20 +855,24 @@ class TrackingSettingsView(QWidget):
             
         # 1. Check if we have live calibration data to sync
         has_live_data = False
-        if self.calibration_view and hasattr(self.calibration_view, 'wand_calibrator'):
-            calibrator = self.calibration_view.wand_calibrator
-            if calibrator and calibrator.final_params:
+        if self.calibration_view:
+            calibrator = self.calibration_view.wand_calibrator if hasattr(self.calibration_view, 'wand_calibrator') else None
+            has_pin_live = bool(calibrator and calibrator.final_params)
+            has_refr_live = bool(getattr(self.calibration_view, '_refr_has_result', False))
+            if has_pin_live or has_refr_live:
                 # If we have live data, we should probably update the files to ensure they are in sync
                 
                 # Check if sync is actually needed:
                 # 1. New results available (dirty flag)
                 # 2. OR Destination folder is missing/empty
                 is_dir_empty = not os.path.exists(cam_dir) or not os.listdir(cam_dir)
-                needs_sync = getattr(calibrator, 'params_dirty', False) or is_dir_empty
+                pin_dirty = bool(getattr(calibrator, 'params_dirty', False)) if has_pin_live else False
+                refr_dirty = bool(getattr(self.calibration_view, '_refr_params_dirty', False)) if has_refr_live else False
+                needs_sync = pin_dirty or refr_dirty or is_dir_empty
                 
                 if needs_sync:
                     # Check if heavy calculation is needed (not in cache)
-                    needs_calc = not (hasattr(calibrator, 'per_frame_errors') and calibrator.per_frame_errors)
+                    needs_calc = bool(has_pin_live and pin_dirty and not (hasattr(calibrator, 'per_frame_errors') and calibrator.per_frame_errors))
                     
                     if needs_calc:
                         from PySide6.QtWidgets import QProgressDialog, QApplication
@@ -892,12 +914,32 @@ class TrackingSettingsView(QWidget):
             
         cams_data = []
         for cf in self.detected_cam_files:
-            data = self._parse_cam_file(os.path.join(cam_dir, cf))
+            cam_file_path = os.path.join(cam_dir, cf)
+            data = self._parse_cam_file(cam_file_path)
             if data:
+                data['cam_file_path'] = cam_file_path
                 cams_data.append(data)
         
         if cams_data:
+            self._estimate_ipr_tolerance_from_cam_errors(cams_data)
             self._estimate_volume_from_cameras(cams_data)
+
+    def _estimate_ipr_tolerance_from_cam_errors(self, cams_data):
+        """Update IPR tolerances from camera reprojection/triangulation statistics."""
+        proj_stats = [c['proj_err'] for c in cams_data if 'proj_err' in c]
+        tri_stats = [c['tri_err'] for c in cams_data if 'tri_err' in c]
+
+        if proj_stats:
+            means_2d = [s[0] for s in proj_stats]
+            stds_2d = [s[1] for s in proj_stats]
+            tol_2d = np.mean(means_2d) + 3 * np.mean(stds_2d)
+            self.ipr_2d_tol.setValue(round(tol_2d, 4))
+
+        if tri_stats:
+            means_3d = [s[0] for s in tri_stats]
+            stds_3d = [s[1] for s in tri_stats]
+            self.tri_err_3sigma_mm = np.mean(means_3d) + 3 * np.mean(stds_3d)
+            self._update_3d_tolerance_voxel()
 
     def _show_cam_params_warning(self):
         """Show warning if camera parameters are missing."""
@@ -915,6 +957,12 @@ class TrackingSettingsView(QWidget):
         """Parse camera parameter file (Internal Python Implementation)."""
         data = {}
         try:
+            def _split_num_tokens(s):
+                return [tok for tok in s.replace(',', ' ').split() if tok]
+
+            def _parse_num_list(s):
+                return [float(x) for x in _split_num_tokens(s)]
+
             with open(file_path, 'r') as f:
                 lines = f.readlines()
                 
@@ -944,44 +992,48 @@ class TrackingSettingsView(QWidget):
             
             if "Image Size" in data:
                 # row, col
-                parts = data['Image Size'][0].split(",")
-                params['h'] = int(parts[0])
-                params['w'] = int(parts[1])
+                parts = _split_num_tokens(data['Image Size'][0])
+                if len(parts) >= 2:
+                    params['h'] = int(float(parts[0]))
+                    params['w'] = int(float(parts[1]))
                 
             if "Inverse of Rotation Matrix" in data:
                 R_inv = []
                 for row in data["Inverse of Rotation Matrix"]:
-                    R_inv.append([float(x) for x in row.split(",")])
+                    vals = _parse_num_list(row)
+                    if len(vals) >= 3:
+                        R_inv.append(vals[:3])
                 params['R_inv'] = np.array(R_inv)
                 
             if "Inverse of Translation Vector" in data:
-                t_inv = [float(x) for x in data["Inverse of Translation Vector"][0].split(",")]
+                t_inv = _parse_num_list(data["Inverse of Translation Vector"][0])
                 params['t_inv'] = np.array(t_inv) # Camera center in world space
                 
             if "Camera Matrix" in data:
                 K = []
                 for row in data["Camera Matrix"]:
-                    K.append([float(x) for x in row.split(",")])
+                    vals = _parse_num_list(row)
+                    if len(vals) >= 3:
+                        K.append(vals[:3])
                 params['K'] = np.array(K)
                 
             if "Rotation Vector" in data:
-                rvec = [float(x) for x in data["Rotation Vector"][0].split(",")]
+                rvec = _parse_num_list(data["Rotation Vector"][0])
                 params['rvec'] = np.array(rvec)
                 
             if "Translation Vector" in data:
-                tvec = [float(x) for x in data["Translation Vector"][0].split(",")]
+                tvec = _parse_num_list(data["Translation Vector"][0])
                 params['tvec'] = np.array(tvec)
                 
             if "Distortion Coefficients" in data:
                 # Handle comma separated list
-                raw_dist = data["Distortion Coefficients"][0].split(",")
-                params['dist'] = np.array([float(x) for x in raw_dist if x.strip()])
+                params['dist'] = np.array(_parse_num_list(data["Distortion Coefficients"][0]))
 
             if "Camera Calibration Error" in data:
                  val = data["Camera Calibration Error"][0]
                  if val != "None":
                      try:
-                         parts = [float(x) for x in val.split(",") if x.strip()]
+                         parts = _parse_num_list(val)
                          if len(parts) == 2:
                              params['proj_err'] = (parts[0], parts[1]) # (mean, std)
                          elif len(parts) == 1:
@@ -992,7 +1044,7 @@ class TrackingSettingsView(QWidget):
                  val = data["Pose Calibration Error"][0]
                  if val != "None":
                      try:
-                         parts = [float(x) for x in val.split(",") if x.strip()]
+                         parts = _parse_num_list(val)
                          if len(parts) == 2:
                              params['tri_err'] = (parts[0], parts[1]) # (mean, std)
                          elif len(parts) == 1:
@@ -1057,24 +1109,6 @@ class TrackingSettingsView(QWidget):
             # Update Voxel Size: (maxX - minX) / 1000
             voxel_size = (x_max - x_min) / 1000.0
             self.voxel_spin.setValue(voxel_size)
-
-        # 5. Adaptive IPR Tolerances (Mean + 3*Std across all cameras)
-        proj_stats = [c['proj_err'] for c in cams_data if 'proj_err' in c]
-        tri_stats = [c['tri_err'] for c in cams_data if 'tri_err' in c]
-        
-        if proj_stats:
-            # Calculate aggregate 3-sigma across all cameras
-            # Using average of means and average of stds as a robust estimation
-            means_2d = [s[0] for s in proj_stats]
-            stds_2d = [s[1] for s in proj_stats]
-            tol_2d = np.mean(means_2d) + 3 * np.mean(stds_2d)
-            self.ipr_2d_tol.setValue(round(tol_2d, 4))
-            
-        if tri_stats:
-            means_3d = [s[0] for s in tri_stats]
-            stds_3d = [s[1] for s in tri_stats]
-            self.tri_err_3sigma_mm = np.mean(means_3d) + 3 * np.mean(stds_3d)
-            self._update_3d_tolerance_voxel()
 
     def _on_voxel_scale_changed(self):
         """Update 3D tolerance in voxels if scale changes."""
@@ -1173,25 +1207,77 @@ class TrackingSettingsView(QWidget):
             return None, None
 
         visible_all = np.ones(len(pts_w), dtype=bool)
+        pinplate_cam_cache = {}
+        lpt_mod = None
+        lpt_import_failed = False
 
         for cam in cams:
-            if not all(k in cam for k in ['K', 'rvec', 'tvec', 'h', 'w']):
-                continue
-                
-            K = cam['K']
-            dist = cam.get('dist', np.zeros(5))
-            rvec = cam['rvec']
-            tvec = cam['tvec']
-            H, W = cam['h'], cam['w']
+            model = str(cam.get('model', '')).strip().upper()
+            H = cam.get('h')
+            W = cam.get('w')
 
-            img_pts, _ = cv2.projectPoints(pts_w, rvec, tvec, K, dist)
-            uv = img_pts.reshape(-1, 2)
+            ok = None
 
-            R, _ = cv2.Rodrigues(rvec)
-            pts_c = (R @ pts_w.T + tvec.reshape(3,1)).T
-            Zc = pts_c[:, 2]
+            if model == 'PINPLATE' and H is not None and W is not None and 'cam_file_path' in cam:
+                if lpt_mod is None and not lpt_import_failed:
+                    try:
+                        import pyopenlpt as lpt_mod
+                    except Exception:
+                        lpt_import_failed = True
 
-            ok = (Zc > 0) & (uv[:,0] >= 0) & (uv[:,0] < W) & (uv[:,1] >= 0) & (uv[:,1] < H)
+                if lpt_mod is not None:
+                    cam_path = cam['cam_file_path']
+                    cam_obj = pinplate_cam_cache.get(cam_path)
+                    if cam_obj is None:
+                        try:
+                            cam_obj = lpt_mod.Camera(cam_path)
+                            pinplate_cam_cache[cam_path] = cam_obj
+                        except Exception:
+                            cam_obj = None
+
+                    if cam_obj is not None:
+                        try:
+                            pts_world = [
+                                lpt_mod.Pt3D(float(p[0]), float(p[1]), float(p[2]))
+                                for p in pts_w
+                            ]
+                            try:
+                                proj_status = cam_obj.projectBatchStatus(pts_world, False)
+                            except TypeError:
+                                proj_status = cam_obj.projectBatchStatus(pts_world)
+
+                            ok_local = np.zeros(len(pts_w), dtype=bool)
+                            for idx, st in enumerate(proj_status):
+                                if not st or not st[0]:
+                                    continue
+                                uv = st[1]
+                                u = float(uv[0])
+                                v = float(uv[1])
+                                if 0 <= u < W and 0 <= v < H:
+                                    ok_local[idx] = True
+                            ok = ok_local
+                        except Exception:
+                            ok = None
+
+            if ok is None:
+                if not all(k in cam for k in ['K', 'rvec', 'tvec', 'h', 'w']):
+                    continue
+
+                K = cam['K']
+                dist = cam.get('dist', np.zeros(5))
+                rvec = cam['rvec']
+                tvec = cam['tvec']
+                H, W = cam['h'], cam['w']
+
+                img_pts, _ = cv2.projectPoints(pts_w, rvec, tvec, K, dist)
+                uv = img_pts.reshape(-1, 2)
+
+                R, _ = cv2.Rodrigues(rvec)
+                pts_c = (R @ pts_w.T + tvec.reshape(3,1)).T
+                Zc = pts_c[:, 2]
+
+                ok = (Zc > 0) & (uv[:,0] >= 0) & (uv[:,0] < W) & (uv[:,1] >= 0) & (uv[:,1] < H)
+
             visible_all &= ok
             if not np.any(visible_all):
                 return None, None

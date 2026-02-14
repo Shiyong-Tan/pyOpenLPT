@@ -156,7 +156,7 @@ public:
     CameraType type() const override { return CameraType::Pinhole; }
     /** @brief Project one world point to distorted image coordinate. */
     StatusOr<Pt2D> project(const Pt3D& pt_world,
-                                                  bool is_print_detail = false) const override;
+                           bool is_print_detail = false) const override;
     /** @brief Back-project one distorted image point to world-space line. */
     StatusOr<Line3D> lineOfSight(const Pt2D& pt_img_dist) const override;
     /** @brief Image height in pixels. */
@@ -209,7 +209,7 @@ public:
     CameraType type() const override { return CameraType::RefractionPinhole; }
     /** @brief Project one world point with refractive correction to image coordinate. */
     StatusOr<Pt2D> project(const Pt3D& pt_world,
-                                                  bool is_print_detail = false) const override;
+                           bool is_print_detail = false) const override;
     /** @brief Back-project one distorted image point through refractive stack. */
     StatusOr<Line3D> lineOfSight(const Pt2D& pt_img_dist) const override;
     /** @brief Image height in pixels. */

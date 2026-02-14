@@ -1464,6 +1464,14 @@ class CameraCalibrationView(QWidget):
         self.plate_images = [] # List of absolute paths
         self.wand_images = {}  # Dict {cam_idx: [paths]}
         self.wand_calibrator = WandCalibrator() # Init calibrator
+        self._refr_has_result = False
+        self._refr_params_dirty = False
+        self._refr_final_cam_params = None
+        self._refr_window_planes = None
+        self._refr_cam_to_window = None
+        self._refr_window_media = None
+        self._refr_proj_err_stats = {}
+        self._refr_tri_err_stats = {}
         self.plate_cam_labels = {} # Map {cam_idx: ZoomableImageLabel}
         self.plate_3d_viewer = Calibration3DViewer() # Init 3D viewer for plate
         self.all_camera_params = {} # Accumulate calibrated camera params {cam_idx: {...}}
@@ -5320,6 +5328,9 @@ class CameraCalibrationView(QWidget):
                     'thickness': self.media2_thick.value()
                 }
 
+            self._refr_cam_to_window = dict(cam_to_window)
+            self._refr_window_media = {wid: dict(media) for wid, media in window_media.items()}
+
             # 2. Output Path (camFile directory)
             parent_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Save Refraction camFile")
             if not parent_dir:
@@ -5331,11 +5342,7 @@ class CameraCalibrationView(QWidget):
             out_folder_name = "camFile"
             out_path = os.path.join(parent_dir, out_folder_name)
 
-            # 3. Initialize and Calibrate
-            from .wand_calibration.refraction_wand_calibrator import RefractiveWandCalibrator
-            ref_cal = RefractiveWandCalibrator(self.wand_calibrator)
-            ref_cal.base.dist_coeff_num = dist_coeff_num # Pass dist_coeff_num
-            ref_cal.base.wand_length = wand_len
+            # 3. Initialize worker inputs
             # Extract initial focal from Detection Table (per-camera inputs)
             focals = []
             for row in range(self.wand_cam_table.rowCount()):
@@ -5365,8 +5372,6 @@ class CameraCalibrationView(QWidget):
             else:
                 initial_focal = 5000.0 # Default
                 print(f"[Refractive] Warning: No valid focal length in UI table. Defaulting to {initial_focal} px")
-            
-            ref_cal.base.initial_focal = initial_focal
             
             # === CHECK FOR EXISTING CACHE ===
             cache_path = os.path.join(parent_dir, "bundle_cache.json")
@@ -5440,8 +5445,8 @@ class CameraCalibrationView(QWidget):
             self._create_refractive_calibration_dialog()
             
             # Disable start button
-            if hasattr(self, 'run_refr_btn'):
-                self.run_refr_btn.setEnabled(False)
+            if hasattr(self, 'btn_calibrate_wand'):
+                self.btn_calibrate_wand.setEnabled(False)
             
             # Determine image size (fallback to default)
             c_img_size = getattr(self.wand_calibrator, 'image_size', (0,0))
@@ -5500,8 +5505,8 @@ class CameraCalibrationView(QWidget):
             print(f"[Refractive] Setup Error:\n{traceback.format_exc()}")
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Setup Error", f"Failed to start calibration:\n{str(e)}")
-            if hasattr(self, 'run_refr_btn'):
-                self.run_refr_btn.setEnabled(True)
+            if hasattr(self, 'btn_calibrate_wand'):
+                self.btn_calibrate_wand.setEnabled(True)
 
 
     def _on_window_count_changed(self):
@@ -5647,10 +5652,17 @@ class CameraCalibrationView(QWidget):
              self._refr_calib_dialog.close()
              
         # Re-enable button
-        if hasattr(self, 'run_refr_btn'):
-            self.run_refr_btn.setEnabled(True)
+        if hasattr(self, 'btn_calibrate_wand'):
+            self.btn_calibrate_wand.setEnabled(True)
             
         if success and cam_params:
+            self._refr_has_result = True
+            self._refr_params_dirty = True
+            self._refr_final_cam_params = cam_params
+            self._refr_window_planes = report.get('window_planes', {}) if isinstance(report, dict) else {}
+            self._refr_proj_err_stats = dataset.get('per_camera_proj_err_stats', {}) if isinstance(dataset, dict) else {}
+            self._refr_tri_err_stats = dataset.get('per_camera_tri_err_stats', {}) if isinstance(dataset, dict) else {}
+
             msg_lines = [
                 "Refractive Calibration Completed.",
                 "Report saved to output folder."
@@ -5724,6 +5736,32 @@ class CameraCalibrationView(QWidget):
                 print(f"[Refractive] Error table population failed: {e}")
         else:
             QMessageBox.warning(self, "Result", "Calibration finished but no params returned.")
+
+    def export_refractive_camfiles_to_dir(self, out_dir):
+        """Export latest refractive calibration result into target camFile directory."""
+        if not out_dir:
+            return False
+        if not self._refr_has_result or not self._refr_final_cam_params:
+            return False
+        if not self._refr_cam_to_window or not self._refr_window_media:
+            return False
+
+        try:
+            exporter = RefractiveWandCalibrator(self.wand_calibrator)
+            exporter.export_camfile_with_refraction(
+                out_dir=out_dir,
+                cam_params=self._refr_final_cam_params,
+                window_media=self._refr_window_media,
+                cam_to_window=self._refr_cam_to_window,
+                window_planes=self._refr_window_planes,
+                proj_err_stats=self._refr_proj_err_stats,
+                tri_err_stats=self._refr_tri_err_stats,
+            )
+            self._refr_params_dirty = False
+            return True
+        except Exception as e:
+            print(f"[Refractive] Export to project camFile failed: {e}")
+            return False
             
     @Slot(str)
     def _on_refractive_error(self, traceback_str):
@@ -5734,8 +5772,8 @@ class CameraCalibrationView(QWidget):
         if hasattr(self, '_refr_calib_dialog') and self._refr_calib_dialog:
              self._refr_calib_dialog.close()
              
-        if hasattr(self, 'run_refr_btn'):
-            self.run_refr_btn.setEnabled(True)
+        if hasattr(self, 'btn_calibrate_wand'):
+            self.btn_calibrate_wand.setEnabled(True)
             
         print(f"[Refractive] Worker Error:\n{traceback_str}")
         QMessageBox.critical(self, "Calibration Error", f"Worker thread failed:\n{traceback_str}")

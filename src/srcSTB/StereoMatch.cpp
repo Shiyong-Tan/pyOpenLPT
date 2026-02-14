@@ -609,8 +609,8 @@ bool StereoMatch::checkMatch(const std::vector<int> &candidate_ids,
     if (!std::isfinite(best_err_c) || best_err_c > tol_3d_mm)
       return false; // if the best is larger than tol_3d_mm, reject this
                     // candidate
-    if (best_err_c > out_e_check)
-      out_e_check = best_err_c; // E_check = 各相机 best 的最大
+    if (!std::isfinite(out_e_check) || best_err_c > out_e_check)
+      out_e_check = best_err_c; // E_check = max(best_err_c) over check cameras
   }
 
   // ---- 6) All check cameras have ≥1 supporting point ----
@@ -1065,12 +1065,20 @@ std::vector<std::unique_ptr<Object3D>> StereoMatch::triangulateMatch(
 // ---- helper: make a 2D line on camera 'cam_id' from a 3D LOS ----
 inline bool StereoMatch::makeLine2DFromLOS3D(int cam_id, const Line3D &los,
                                               Line2D &out_line) const {
-  auto a_status = _cam_list[cam_id]->project(los.pt);
+  // TODO(refraction): This workaround avoids projecting los.pt (interface point)
+  // to reduce boundary degeneracy in refractive projection. It does NOT address
+  // physical invalid branches (e.g., TIR/parallel geometry) and should be
+  // replaced by a robust failure-aware LOS-to-2D construction.
+  Pt3D p_a{los.pt[0] + los.unit_vector[0], los.pt[1] + los.unit_vector[1],
+           los.pt[2] + los.unit_vector[2]};
+  Pt3D p_b{los.pt[0] + 2.0 * los.unit_vector[0],
+           los.pt[1] + 2.0 * los.unit_vector[1],
+           los.pt[2] + 2.0 * los.unit_vector[2]};
+
+  auto a_status = _cam_list[cam_id]->project(p_a);
   if (!a_status)
     return false;
-  auto b_status = _cam_list[cam_id]->project(
-      Pt3D{los.pt[0] + los.unit_vector[0], los.pt[1] + los.unit_vector[1],
-           los.pt[2] + los.unit_vector[2]});
+  auto b_status = _cam_list[cam_id]->project(p_b);
   if (!b_status)
     return false;
 
