@@ -353,6 +353,18 @@ double dist (Pt3D const& pt, Plane3D const& plane)
     return std::fabs(distance);
 }
 
+double pointPlaneSignedDistance(Pt3D const& pt, Plane3D const& plane)
+{
+    Pt3D diff = pt - plane.pt;
+    return dot(diff, plane.norm_vector);
+}
+
+Pt3D projectPointToPlaneAlongNormal(Pt3D const& pt, Plane3D const& plane)
+{
+    double signed_dist = pointPlaneSignedDistance(pt, plane);
+    return pt - plane.norm_vector * signed_dist;
+}
+
 // Triangulation
 void triangulation(Pt3D& pt_world, double& error,
                    std::vector<Line3D> const& line_of_sight_list)

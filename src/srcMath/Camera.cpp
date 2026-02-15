@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -92,6 +93,103 @@ Status mapExceptionToStatus(const std::exception& e, const char* where) {
     }
     return STATUS_ERR_CTX(ErrorCode::GeometryFailure, where, msg);
 }
+
+void logRefractionProjectFailure(const char* reason,
+                                 const Pt3D& pt_world,
+                                 double residual = -1.0,
+                                 int iter = -1) {
+    // Print first failures densely, then sample periodically to avoid flooding.
+    static int fail_count = 0;
+    fail_count++;
+    if (fail_count > 100 && (fail_count % 200) != 0) {
+        return;
+    }
+
+    std::cerr << "[REFR-PROJ-FAIL] reason=" << reason
+              << " pt=(" << pt_world[0] << "," << pt_world[1] << "," << pt_world[2] << ")";
+    if (residual >= 0.0) {
+        std::cerr << " residual=" << residual;
+    }
+    if (iter >= 0) {
+        std::cerr << " iter=" << iter;
+    }
+    std::cerr << std::endl;
+}
+
+namespace {
+namespace refraction_snell1d {
+
+// Compute projected in-plane length at layer k from first-segment length L1.
+// Input: L1/H1 at first segment, target segment thickness Hk, refractive indices n1/nk.
+// Output: Lk projected length in target segment; false when geometry is not physically valid.
+bool calProjLen(double L1, double H1, double Hk,
+                double n1, double nk, double& Lk) {
+    const double ratio = n1 / nk;
+    const double den = H1 * H1 + (1.0 - ratio * ratio) * L1 * L1;
+    if (den <= 0.0) {
+        return false;
+    }
+    Lk = L1 / std::sqrt(den) * ratio * Hk;
+    return std::isfinite(Lk);
+}
+
+// Compute d(Lk)/d(L1) for one segment under parallel-plate Snell geometry.
+// Input: same parameters as calProjLen.
+// Output: derivative value dLk_dL1; false when denominator is invalid.
+bool calProjLenGrad(double L1, double H1, double Hk,
+                    double n1, double nk,
+                    double& dLk_dL1) {
+    const double ratio = n1 / nk;
+    const double H1_2 = H1 * H1;
+    const double den = H1_2 + (1.0 - ratio * ratio) * L1 * L1;
+    if (den <= 0.0) {
+        return false;
+    }
+    dLk_dL1 = ratio * Hk * H1_2 / (std::sqrt(den) * den);
+    return std::isfinite(dLk_dL1);
+}
+
+// Accumulate total projected length across all segments given L1.
+// Input: segment thickness list H_list and refractive-index list n_list.
+// Output: L_tot; false if any segment becomes invalid.
+bool calLtot(double L1,
+             const std::vector<double>& H_list,
+             const std::vector<double>& n_list,
+             double& L_tot) {
+    L_tot = L1;
+    for (size_t i = 0; i + 1 < H_list.size(); ++i) {
+        double Lk = 0.0;
+        if (!calProjLen(L1, H_list[0], H_list[i + 1],
+                        n_list[0], n_list[i + 1], Lk)) {
+            return false;
+        }
+        L_tot += Lk;
+    }
+    return std::isfinite(L_tot);
+}
+
+// Accumulate gradient d(L_tot)/d(L1) across all segments.
+// Input: same H_list/n_list as total length function.
+// Output: dL_tot_dL1; false if any segment gradient is invalid.
+bool calLtotGrad(double L1,
+                 const std::vector<double>& H_list,
+                 const std::vector<double>& n_list,
+                 double& dL_tot_dL1) {
+    dL_tot_dL1 = 1.0;
+    for (size_t i = 0; i + 1 < H_list.size(); ++i) {
+        double dLk = 0.0;
+        if (!calProjLenGrad(L1, H_list[0], H_list[i + 1],
+                            n_list[0], n_list[i + 1],
+                            dLk)) {
+            return false;
+        }
+        dL_tot_dL1 += dLk;
+    }
+    return std::isfinite(dL_tot_dL1);
+}
+
+} // namespace refraction_snell1d
+} // namespace
 
 // Shared pinhole projection helper.
 // Input: world point + pinhole parameters.
@@ -423,12 +521,16 @@ Status PinholeCamera::commitUpdate() {
     return Status::OK();
 }
 
+namespace {
+
+namespace refraction_common {
+
 // Build orthonormal in-plane basis from plane normal.
 // Input: plane normal and point.
 // Output: u_axis and v_axis lying on plane.
-void RefractionPinholeCamera::buildPlaneOrthonormalBasis(Pt3D& u_axis,
-                                                         Pt3D& v_axis,
-                                                         const Plane3D& plane) {
+void buildPlaneOrthonormalBasis(Pt3D& u_axis,
+                                Pt3D& v_axis,
+                                const Plane3D& plane) {
     if (std::abs(plane.norm_vector[2]) < 0.9) {
         u_axis = myMATH::cross(plane.norm_vector, {0, 0, 1});
     } else {
@@ -442,8 +544,7 @@ void RefractionPinholeCamera::buildPlaneOrthonormalBasis(Pt3D& u_axis,
 // Build all refractive interface planes and in-plane basis.
 // Input: farthest refractive plane, widths and plate count.
 // Output: plane_array/u_axis/v_axis ready for tracing.
-void RefractionPinholeCamera::buildRefractionPlaneStackAndBasis(
-    PinPlateParam& pin) {
+void buildRefractionPlaneStackAndBasis(PinPlateParam& pin) {
     // Main flow:
     // 1) Build refractive interface planes from farthest to nearest.
     // 2) Build a 2D coordinate basis on the farthest reference plane.
@@ -460,33 +561,13 @@ void RefractionPinholeCamera::buildRefractionPlaneStackAndBasis(
     buildPlaneOrthonormalBasis(pin.u_axis, pin.v_axis, pin.plane);
 }
 
-// Project a 3D point to 2D coordinates on a plane basis.
-void RefractionPinholeCamera::projectToPlaneBasis(std::vector<double>& coords,
-                                                  const Pt3D& pt,
-                                                  const Plane3D& plane,
-                                                  const Pt3D& u_axis,
-                                                  const Pt3D& v_axis) {
-    Pt3D diff = {pt[0] - plane.pt[0], pt[1] - plane.pt[1], pt[2] - plane.pt[2]};
-    coords[0] = myMATH::dot(diff, u_axis);
-    coords[1] = myMATH::dot(diff, v_axis);
-}
-
-// Reconstruct a 3D point from 2D plane basis coordinates.
-void RefractionPinholeCamera::reconstructFromPlaneBasis(
-    Pt3D& result, const Pt3D& origin, const Pt3D& u_axis, const Pt3D& v_axis,
-    const std::vector<double>& coords) {
-    for (int i = 0; i < 3; i++) {
-        result[i] = origin[i] + coords[0] * u_axis[i] + coords[1] * v_axis[i];
-    }
-}
-
 // Refract a direction vector across one interface.
 // Input: current direction, interface normal, n_in/n_out ratio.
 // Output: updated refracted direction, false if total internal reflection.
-bool RefractionPinholeCamera::refractDirection(Pt3D& dir_refract,
-                                               const Pt3D& normal,
-                                               double refract_ratio,
-                                               bool is_forward) {
+bool refractDirection(Pt3D& dir_refract,
+                      const Pt3D& normal,
+                      double refract_ratio,
+                      bool is_forward) {
     double cos_1 = std::clamp(myMATH::dot(dir_refract, normal), -1.0, 1.0);
     double cos_2 = 1.0 - refract_ratio * refract_ratio * (1.0 - cos_1 * cos_1);
     if (cos_2 <= 0) {
@@ -512,14 +593,50 @@ bool RefractionPinholeCamera::refractDirection(Pt3D& dir_refract,
     return true;
 }
 
+} // namespace refraction_common
+
+namespace refraction_lm {
+
+// Project a 3D point to 2D coordinates on a plane basis.
+// Input: point and plane basis.
+// Output: 2D coordinates in (u,v) basis.
+void projectToPlaneBasis(std::vector<double>& coords,
+                         const Pt3D& pt,
+                         const Plane3D& plane,
+                         const Pt3D& u_axis,
+                         const Pt3D& v_axis) {
+    Pt3D diff = {pt[0] - plane.pt[0], pt[1] - plane.pt[1], pt[2] - plane.pt[2]};
+    coords[0] = myMATH::dot(diff, u_axis);
+    coords[1] = myMATH::dot(diff, v_axis);
+}
+
+// Reconstruct a 3D point from 2D plane basis coordinates.
+// Input: basis origin/axes and 2D coordinates.
+// Output: 3D point on that plane.
+void reconstructFromPlaneBasis(
+    Pt3D& result, const Pt3D& origin, const Pt3D& u_axis, const Pt3D& v_axis,
+    const std::vector<double>& coords) {
+    for (int i = 0; i < 3; i++) {
+        result[i] = origin[i] + coords[0] * u_axis[i] + coords[1] * v_axis[i];
+    }
+}
+
 // Forward trace from world point to camera side through plate stack.
 // Input: world point + entry point at farthest interface.
 // Output: exit point/direction at nearest interface and final medium.
-bool RefractionPinholeCamera::traceRayToCam(Pt3D& pt_exit,
-                                            Pt3D& exit_direction,
-                                            const Pt3D& pt_world,
-                                            const Pt3D& pt_entry,
-                                            const PinPlateParam& pin) {
+// Return false on TIR / parallel crossing / invalid interface intersection.
+bool traceRayToCam(Pt3D& pt_exit,
+                   Pt3D& exit_direction,
+                   const Pt3D& pt_world,
+                   const Pt3D& pt_entry,
+                   const PinPlateParam& pin,
+                   const char** out_fail_code = nullptr) {
+    auto setFailCode = [&](const char* code) {
+        if (out_fail_code) {
+            *out_fail_code = code;
+        }
+    };
+
     Line3D line;
     line.pt = pt_world;
     line.unit_vector = myMATH::createUnitVector(pt_world, pt_entry);
@@ -530,11 +647,14 @@ bool RefractionPinholeCamera::traceRayToCam(Pt3D& pt_exit,
         const Plane3D& plane_next = pin.plane_array[plane_id];
         double refract_ratio = pin.refract_array[plane_id - 1] / pin.refract_array[plane_id];
 
-        if (!refractDirection(line.unit_vector, plane_curr.norm_vector, refract_ratio, true)) {
+        if (!refraction_common::refractDirection(line.unit_vector, plane_curr.norm_vector,
+                                                 refract_ratio, true)) {
+            setFailCode("sample_total_internal_reflection");
             return false;
         }
         line.pt = pt_cross;
         if (myMATH::crossPoint(pt_cross, line, plane_next)) {
+            setFailCode("sample_parallel_to_interface");
             return false;
         }
     }
@@ -542,20 +662,48 @@ bool RefractionPinholeCamera::traceRayToCam(Pt3D& pt_exit,
     pt_exit = pt_cross;
     exit_direction = line.unit_vector;
     double refract_ratio = pin.refract_array[pin.n_plate] / pin.refract_array[pin.n_plate + 1];
-    return refractDirection(exit_direction, pin.plane_array[pin.n_plate].norm_vector,
-                                        refract_ratio, true);
+    if (!refraction_common::refractDirection(
+            exit_direction, pin.plane_array[pin.n_plate].norm_vector,
+            refract_ratio, true)) {
+        setFailCode("sample_total_internal_reflection");
+        return false;
+    }
+
+    if (out_fail_code) {
+        *out_fail_code = nullptr;
+    }
+    return true;
 }
 
 // Refractive projection solver (LM + line search).
 // Input: world point and full pinplate parameters.
 // Output: (failure_flag, refracted_point_on_farthest_plane, residual, iterations).
 std::tuple<bool, Pt3D, double, int>
-RefractionPinholeCamera::solveProjectionByRefractionLM(
-    Pt3D const& pt_world, const PinPlateParam& pin) {
+solveProjectionByRefractionLMImpl(Pt3D const& pt_world,
+                                  const PinPlateParam& pin) {
     std::tuple<bool, Pt3D, double, int> result = {false, {0, 0, 0}, -1, 0};
     const int proj_nmax = pin.proj_nmax;
     const double proj_tol = pin.proj_tol;
     const double eps = 1e-5;
+
+    auto logLmFail = [&](const char* code, int iter, double residual = std::numeric_limits<double>::quiet_NaN()) {
+        static int fail_count = 0;
+        fail_count++;
+        if (fail_count > 100 && (fail_count % 200) != 0) {
+            return;
+        }
+
+        std::ostringstream oss;
+        oss << "\t\t[REFR-LM-FAIL] "
+            << std::left << std::setw(58) << (std::string("code=") + code)
+            << " iter=" << std::right << std::setw(4) << iter
+            << " pt=(" << std::fixed << std::setprecision(4)
+            << pt_world[0] << "," << pt_world[1] << "," << pt_world[2] << ")";
+        if (std::isfinite(residual)) {
+            oss << " res=" << std::scientific << std::setprecision(3) << residual;
+        }
+        std::cerr << oss.str() << std::endl;
+    };
 
     // Radius guard is enabled when total internal reflection can occur.
     bool is_check_radius = false;
@@ -574,6 +722,7 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
     Pt3D pt_init;
     if (myMATH::crossPoint(pt_init, line, pin.plane)) {
         std::get<0>(result) = true;
+        logLmFail("entry_plane_intersection_failed", 0);
         return result;
     }
 
@@ -586,8 +735,10 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
                 pt_init[i] = pt_world[i] + (pt_init[i] - pt_world[i]) * scale;
             }
             Pt3D pt_exit_test, dir_test;
-            if (!traceRayToCam(pt_exit_test, dir_test, pt_world, pt_init, pin)) {
+            const char* trace_fail_code = nullptr;
+            if (!traceRayToCam(pt_exit_test, dir_test, pt_world, pt_init, pin, &trace_fail_code)) {
                 std::get<0>(result) = true;
+                logLmFail(trace_fail_code ? trace_fail_code : "initial_ray_trace_failed", 0);
                 return result;
             }
         }
@@ -643,14 +794,17 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
             if (radius2_current >= radius_max2) {
                 std::get<0>(result) = true;
                 std::get<3>(result) = iter + 1;
+                logLmFail("entry_point_outside_valid_radius", iter + 1);
                 return result;
             }
         }
 
         // Forward trace through interfaces ordered from farthest to nearest.
-        if (!traceRayToCam(pt_exit, exit_direction, pt_world, pt_current, pin)) {
+        const char* trace_fail_code = nullptr;
+        if (!traceRayToCam(pt_exit, exit_direction, pt_world, pt_current, pin, &trace_fail_code)) {
             std::get<0>(result) = true;
             std::get<3>(result) = iter + 1;
+            logLmFail(trace_fail_code ? trace_fail_code : "ray_trace_failed_at_current_step", iter + 1);
             return result;
         }
 
@@ -692,13 +846,16 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
                 if (radius2 >= radius_max2) {
                     std::get<0>(result) = true;
                     std::get<3>(result) = iter + 1;
+                    logLmFail("jacobian_sample_outside_valid_radius", iter + 1);
                     return result;
                 }
             }
 
-            if (!traceRayToCam(pt_exit, exit_direction, pt_world, pt_current, pin)) {
+            trace_fail_code = nullptr;
+            if (!traceRayToCam(pt_exit, exit_direction, pt_world, pt_current, pin, &trace_fail_code)) {
                 std::get<0>(result) = true;
                 std::get<3>(result) = iter + 1;
+                logLmFail(trace_fail_code ? trace_fail_code : "ray_trace_failed_at_jacobian_sample", iter + 1);
                 return result;
             }
 
@@ -730,6 +887,8 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
             if (lambda >= lambda_max) {
                 std::get<0>(result) = true;
                 std::get<3>(result) = iter + 1;
+                logLmFail("lm_damping_upper_limit_reached@linear_system_ill_conditioned",
+                          iter + 1, residual);
                 return result;
             }
             continue;
@@ -742,6 +901,7 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
         // Line-search the LM step in case of radius or residual barrier violations.
         double alpha = 1.0;
         bool step_accepted = false;
+        bool line_search_trace_failed = false;
         const int max_line_search = 10;
         for (int ls = 0; ls < max_line_search; ls++) {
             delta_y_perturb[0] = delta_y[0] + alpha * dx[0];
@@ -760,7 +920,9 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
                 }
             }
 
-            if (traceRayToCam(pt_exit, exit_direction, pt_world, pt_current, pin)) {
+            const char* ls_trace_fail_code = nullptr;
+            if (traceRayToCam(pt_exit, exit_direction, pt_world, pt_current, pin,
+                              &ls_trace_fail_code)) {
                 vec_to_pinhole = pin.t_vec_inv - pt_exit;
                 double proj_along_ray_ls = myMATH::dot(vec_to_pinhole, exit_direction);
                 residual_vec = vec_to_pinhole - exit_direction * proj_along_ray_ls;
@@ -781,6 +943,8 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
                     lambda = std::max(lambda * 0.1, lambda_min);
                     break;
                 }
+            } else {
+                line_search_trace_failed = true;
             }
             alpha *= 0.5;
         }
@@ -791,6 +955,13 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
             if (lambda >= lambda_max) {
                 std::get<0>(result) = true;
                 std::get<3>(result) = iter + 1;
+                if (line_search_trace_failed) {
+                    logLmFail("lm_damping_upper_limit_reached@line_search_sample_trace_failed",
+                              iter + 1, residual);
+                } else {
+                    logLmFail("lm_damping_upper_limit_reached@line_search_no_descent_step",
+                              iter + 1, residual);
+                }
                 return result;
             }
         }
@@ -799,7 +970,245 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
     std::get<1>(result) = pt_exit;
     std::get<2>(result) = residual_vec.norm();
     std::get<3>(result) = proj_nmax;
+    std::get<0>(result) = true;
+    logLmFail("lm_max_iterations_reached", proj_nmax, std::get<2>(result));
     return result;
+}
+
+} // namespace refraction_lm
+
+namespace refraction_snell1d {
+
+// Refractive projection solver for parallel-plate stacks using 1D Snell
+// path-length optimization.
+// Input: world point and full pinplate parameters.
+// Output: (failure_flag, refracted_point_on_farthest_plane, residual, iterations).
+std::tuple<bool, Pt3D, double, int>
+solveProjectionBySnell1DImpl(const Pt3D& pt_world,
+                             const PinPlateParam& pin) {
+    std::tuple<bool, Pt3D, double, int> result = {false, {0, 0, 0}, -1, 0};
+
+    // Centralized failure logger for this solver. Keep formatting consistent
+    // with LM diagnostics and throttle repeated messages in long runs.
+    auto logSnellFail = [&](const char* code, int iter,
+                            double residual = std::numeric_limits<double>::quiet_NaN()) {
+        static int fail_count = 0;
+        fail_count++;
+        if (fail_count > 100 && (fail_count % 200) != 0) {
+            return;
+        }
+
+        std::ostringstream oss;
+        oss << "\t\t[REFR-SNELL1D-FAIL] "
+            << std::left << std::setw(52) << (std::string("code=") + code)
+            << " iter=" << std::right << std::setw(4) << iter
+            << " pt=(" << std::fixed << std::setprecision(4)
+            << pt_world[0] << "," << pt_world[1] << "," << pt_world[2] << ")";
+        if (std::isfinite(residual)) {
+            oss << " res=" << std::scientific << std::setprecision(3) << residual;
+        }
+        std::cerr << oss.str() << std::endl;
+    };
+
+    // Step 0: validate refractive stack layout.
+    // For n plates, refract_array must contain [n1, n_plate..., n_last],
+    // so size must be n_plate + 2 and at least 3 (two outer media + one layer).
+    if (pin.refract_array.size() != pin.w_array.size() + 2 || pin.refract_array.size() < 3) {
+        std::get<0>(result) = true;
+        logSnellFail("snell1d_invalid_geometry", 0);
+        return result;
+    }
+
+    // Step 1: reduce 3D geometry to a 1D in-plane length problem.
+    // We project world point and pinhole center to the farthest interface plane,
+    // then solve only the in-plane path length that satisfies Snell across layers.
+    const Plane3D& plane_far = pin.plane;
+    const Pt3D pt_world_proj = myMATH::projectPointToPlaneAlongNormal(pt_world, plane_far);
+    const Pt3D pt_pinhole_proj = myMATH::projectPointToPlaneAlongNormal(pin.t_vec_inv, plane_far);
+
+    const double H1 = myMATH::dist(pt_world, pt_world_proj);
+    const double thickness_tot = std::accumulate(pin.w_array.begin(), pin.w_array.end(), 0.0);
+    const double Hn = myMATH::dist(pin.t_vec_inv, pt_pinhole_proj) - thickness_tot;
+    const double L_tot = myMATH::dist(pt_world_proj, pt_pinhole_proj);
+
+    // Degenerate geometry guard.
+    if (!std::isfinite(H1) || !std::isfinite(Hn) || H1 <= SMALLNUMBER ||
+        Hn <= SMALLNUMBER || !std::isfinite(L_tot)) {
+        std::get<0>(result) = true;
+        logSnellFail("snell1d_invalid_geometry", 0);
+        return result;
+    }
+
+    std::vector<double> H_list(pin.n_plate + 2, 0.0);
+    H_list[0] = H1;
+    H_list[pin.n_plate + 1] = Hn;
+    for (int i = 1; i <= pin.n_plate; ++i) {
+        H_list[i] = pin.w_array[i - 1];
+    }
+
+    // Step 2: compute feasible open interval for first-segment projected length L1.
+    // Critical bounds come from all layers where n0/nk > 1, i.e. TIR can occur.
+    // Use an open upper bound (< critical) so solver never evaluates singular points.
+    const double H_tot = std::accumulate(H_list.begin(), H_list.end(), 0.0);
+    constexpr double kOpenBoundEps = 1e-8;
+    double L1_crit = std::numeric_limits<double>::infinity();
+    for (size_t i = 1; i < pin.refract_array.size(); ++i) {
+        const double ratio = pin.refract_array.front() / pin.refract_array[i];
+        if (ratio > 1.0) {
+            const double tmp = ratio * ratio - 1.0;
+            if (tmp <= 0.0) {
+                std::get<0>(result) = true;
+                logSnellFail("snell1d_invalid_geometry", 0);
+                return result;
+            }
+            L1_crit = std::min(L1_crit, H1 / std::sqrt(tmp));
+        }
+    }
+    double L1_max = L_tot;
+    if (std::isfinite(L1_crit)) {
+        L1_max = std::min(L1_max, L1_crit * (1.0 - kOpenBoundEps));
+    }
+    if (!std::isfinite(L1_max) || L1_max <= 0.0) {
+        std::get<0>(result) = true;
+        logSnellFail("snell1d_invalid_geometry", 0);
+        return result;
+    }
+
+    // Evaluate total projected length. At boundary singularities return +inf as a
+    // feasibility signal for bracket construction (not as a converged solution).
+    auto evalTotalLength = [&](double L1, double& Lcur) {
+        if (!calLtot(L1, H_list, pin.refract_array, Lcur)) {
+            Lcur = std::numeric_limits<double>::infinity();
+            return false;
+        }
+        return true;
+    };
+
+    // Early feasibility check: if max reachable projected length is still smaller
+    // than required L_tot, no physical solution exists for this point.
+    double L_max = 0.0;
+    evalTotalLength(L1_max, L_max);
+    if (!std::isfinite(L_max)) {
+        L_max = std::numeric_limits<double>::infinity();
+    }
+    if (L_max + pin.proj_tol < L_tot) {
+        std::get<0>(result) = true;
+        logSnellFail("snell1d_unreachable_total_length", 0);
+        return result;
+    }
+
+    const int proj_nmax = pin.proj_nmax;
+    const double proj_tol = pin.proj_tol;
+
+    // Step 3: solve scalar equation f(L1) = L_tot - L_tot_cur(L1) = 0.
+    // Use safeguarded Newton updates inside a bracket [L_lo, L_hi], and fall
+    // back to bisection when Newton leaves feasible domain or hits singularities.
+    double L_lo = 0.0;
+    double L_hi = L1_max;
+    double L1 = (H_tot > SMALLNUMBER) ? (L_hi * H1 / H_tot) : 0.0;
+    L1 = std::clamp(L1, L_lo, L_hi);
+
+    double residue = std::numeric_limits<double>::infinity();
+    int iter = 0;
+    bool converged = false;
+    for (; iter < proj_nmax; ++iter) {
+        double L_tot_cur = 0.0;
+        const bool eval_ok = evalTotalLength(L1, L_tot_cur);
+        if (!eval_ok || !std::isfinite(L_tot_cur)) {
+            L_hi = std::max(L_lo, L1);
+            L1 = 0.5 * (L_lo + L_hi);
+            continue;
+        }
+
+        // Residual is positive when current path is too short.
+        residue = L_tot - L_tot_cur;
+        if (std::abs(residue) < proj_tol) {
+            converged = true;
+            break;
+        }
+
+        if (residue > 0.0) {
+            L_lo = std::max(L_lo, L1);
+        } else {
+            L_hi = std::min(L_hi, L1);
+        }
+        if (L_hi - L_lo <= proj_tol * 1e-6) {
+            L1 = 0.5 * (L_lo + L_hi);
+            converged = true;
+            break;
+        }
+
+        double dL_tot_dL1 = 0.0;
+        bool grad_ok = calLtotGrad(
+            L1, H_list, pin.refract_array, dL_tot_dL1);
+        double L1_new = std::numeric_limits<double>::quiet_NaN();
+        if (grad_ok && std::isfinite(dL_tot_dL1) && std::abs(dL_tot_dL1) > proj_tol * 1e-5) {
+            L1_new = L1 + residue / dL_tot_dL1;
+        }
+        if (!std::isfinite(L1_new) || L1_new <= L_lo || L1_new >= L_hi) {
+            L1_new = 0.5 * (L_lo + L_hi);
+        }
+        L1 = L1_new;
+    }
+
+    if (!converged) {
+        std::get<0>(result) = true;
+        std::get<2>(result) = residue;
+        std::get<3>(result) = proj_nmax;
+        logSnellFail("snell1d_max_iterations_reached", proj_nmax, residue);
+        return result;
+    }
+
+    // Refresh residual at final iterate for reporting consistency.
+    {
+        double L_tot_final = 0.0;
+        if (calLtot(L1, H_list, pin.refract_array, L_tot_final)
+            && std::isfinite(L_tot_final)) {
+            residue = L_tot - L_tot_final;
+        }
+    }
+
+    // Step 4: lift the solved 1D length back to 3D exit point on farthest plate.
+    double L_shift = 0.0;
+    if (!calProjLen(L1, H1, Hn, pin.refract_array.front(),
+                    pin.refract_array.back(), L_shift)) {
+        std::get<0>(result) = true;
+        std::get<3>(result) = iter + 1;
+        logSnellFail("snell1d_total_internal_reflection", iter + 1, residue);
+        return result;
+    }
+
+    Pt3D pt_exit = pt_pinhole_proj;
+    if (L_tot > SMALLNUMBER) {
+        const Pt3D in_plane_dir = myMATH::createUnitVector(pt_world_proj, pt_pinhole_proj);
+        pt_exit -= in_plane_dir * L_shift;
+    }
+    pt_exit -= plane_far.norm_vector * thickness_tot;
+
+    std::get<0>(result) = false;
+    std::get<1>(result) = pt_exit;
+    std::get<2>(result) = std::abs(residue);
+    std::get<3>(result) = iter + 1;
+
+    // Success: caller will continue with pinhole projection/distortion.
+    return result;
+}
+
+} // namespace refraction_snell1d
+
+} // namespace
+
+std::tuple<bool, Pt3D, double, int>
+RefractionPinholeCamera::solveProjectionByRefractionLM(
+    const Pt3D& pt_world, const PinPlateParam& pin) {
+    return refraction_lm::solveProjectionByRefractionLMImpl(pt_world, pin);
+}
+
+std::tuple<bool, Pt3D, double, int>
+RefractionPinholeCamera::solveProjectionBySnell1D(
+    const Pt3D& pt_world, const PinPlateParam& pin) {
+    return refraction_snell1d::solveProjectionBySnell1DImpl(
+        pt_world, pin);
 }
 
 
@@ -809,13 +1218,22 @@ RefractionPinholeCamera::solveProjectionByRefractionLM(
 StatusOr<Pt2D> RefractionPinholeCamera::project(const Pt3D& pt_world,
                                                 bool is_print_detail) const {
     try {
-        // Step 1: Solve for the effective refracted point on the farthest interface.
-        std::tuple<bool, Pt3D, double, int> result = solveProjectionByRefractionLM(pt_world, _param);
-        if (is_print_detail) {
-            std::cout << "RefractionPinholeCamera::project result (is_parallel,error^2): "
-                                << std::get<0>(result) << "," << std::get<2>(result) << std::endl;
+        // Step 1: Prefer the dedicated 1D Snell solver for parallel-plate stacks.
+        std::tuple<bool, Pt3D, double, int> result =
+            solveProjectionBySnell1D(pt_world, _param);
+        const bool snell_failed = std::get<0>(result);
+        if (snell_failed) {
+            // Step 2: Fallback to LM solver for robustness.
+            result = solveProjectionByRefractionLM(pt_world, _param);
         }
-        // Step 2: Return sentinel for invalid geometry branch.
+
+        if (is_print_detail) {
+            std::cout << "RefractionPinholeCamera::project result (snell_failed,is_failed,error): "
+                      << snell_failed << "," << std::get<0>(result) << ","
+                      << std::get<2>(result) << std::endl;
+        }
+
+        // Step 3: Return sentinel for invalid geometry branch.
         if (std::get<0>(result)) {
           // Refraction solve failed.
           // Return a sentinel image point (very large negative values) so
@@ -823,12 +1241,14 @@ StatusOr<Pt2D> RefractionPinholeCamera::project(const Pt3D& pt_world,
             double value = std::numeric_limits<double>::lowest();
             return normalizeProjectResult(Pt2D(value, value));
         }
-        // Step 3: Apply pinhole projection and distortion from refracted point.
+
+        // Step 4: Apply pinhole projection and distortion from refracted point.
         return normalizeProjectResult(RefractionPinholeCamera::distort(
             RefractionPinholeCamera::worldToUndistImg(std::get<1>(result),
                                                       _param),
             _param));
     } catch (const std::exception& e) {
+        logRefractionProjectFailure(e.what(), pt_world);
         Status st = mapExceptionToStatus(e, "RefractionPinholeCamera::project");
         return STATUS_OR_ERR_CTX(Pt2D, st.err.code, st.err.message, st.err.context);
     }
@@ -860,7 +1280,8 @@ StatusOr<Line3D> RefractionPinholeCamera::lineOfSight(const Pt2D& pt_img_dist) c
 
             double refract_ratio =
                     _param.refract_array[plane_id + 1] / _param.refract_array[plane_id];
-            bool success = refractDirection(line.unit_vector, plane.norm_vector, refract_ratio, false);
+            bool success = refraction_common::refractDirection(
+                line.unit_vector, plane.norm_vector, refract_ratio, false);
             if (!success) {
                 throw std::runtime_error("total internal reflection");
             }
@@ -1047,7 +1468,7 @@ Status RefractionPinholeCamera::setSolverOptions(double proj_tol, int proj_nmax,
 }
 
 Status RefractionPinholeCamera::commitUpdate() {
-    buildRefractionPlaneStackAndBasis(_param);
+    refraction_common::buildRefractionPlaneStackAndBasis(_param);
     return Status::OK();
 }
 

@@ -12,6 +12,18 @@
 
 #define CORR_INIT -100
 
+namespace {
+inline bool isInvalidProjectedCenter(const Pt2D &center) {
+  constexpr double kProjectFailSentinel = -1e9;
+  const double x = center[0];
+  const double y = center[1];
+  if (!std::isfinite(x) || !std::isfinite(y)) {
+    return true;
+  }
+  return (x <= kProjectFailSentinel || y <= kProjectFailSentinel);
+}
+} // namespace
+
 // ---------------------------------------------------
 Shake::Shake(const std::vector<std::shared_ptr<Camera>> &camera_models,
              const ObjectConfig &obj_cfg)
@@ -1001,6 +1013,9 @@ TracerShakeStrategy::calShakeResidue(const Object3D &obj_candidate,
     Object2D *obj2d = obj_candidate._obj2d_list[cam].get();
     auto *tr = static_cast<Tracer2D *>(obj2d);
     Pt2D obj2d_center = tr->_pt_center;
+    if (isInvalidProjectedCenter(obj2d_center)) {
+      continue;
+    }
     double r_px = tr->_r_px;
     int pred_row_min = std::floor(obj2d_center[1] - r_px),
         pred_row_max = std::ceil(obj2d_center[1] + r_px + 1);
@@ -1245,6 +1260,9 @@ BubbleShakeStrategy::calShakeResidue(const Object3D &obj_candidate,
     const auto *bb2d = static_cast<const Bubble2D *>(obj2d);
     double xc = bb2d->_pt_center[0], yc = bb2d->_pt_center[1];
     double r_px = bb2d->_r_px;
+    if (isInvalidProjectedCenter(bb2d->_pt_center)) {
+      continue;
+    }
     const PixelRange &range_corrmap = roi_info[cam]._ROI_range;
 
     // the candidate bubble can be partly within the augmented image
@@ -1322,6 +1340,9 @@ bool BubbleShakeStrategy::additionalObjectCheck(
 
     Object2D *obj2d = obj._obj2d_list[cam].get();
     const auto *bb2d = static_cast<const Bubble2D *>(obj2d);
+    if (isInvalidProjectedCenter(bb2d->_pt_center)) {
+      return false;
+    }
     double xc = bb2d->_pt_center[0], yc = bb2d->_pt_center[1];
     double r_px = bb2d->_r_px;
     const PixelRange &range_corrmap = roi_info[cam]._ROI_range;

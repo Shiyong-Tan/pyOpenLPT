@@ -270,63 +270,6 @@ public:
 
 private:
     /**
-      * @brief Build orthonormal in-plane basis from refractive plane normal.
-      * @param u_axis Output first basis axis.
-      * @param v_axis Output second basis axis.
-      * @param plane Input plane.
-      */
-    static void buildPlaneOrthonormalBasis(Pt3D& u_axis, Pt3D& v_axis,
-                                           const Plane3D& plane);
-    /**
-      * @brief Build refractive plane stack and basis buffers.
-      * @param pin Refractive parameter container to update.
-      */
-    static void buildRefractionPlaneStackAndBasis(PinPlateParam& pin);
-    /**
-      * @brief Project 3D point to 2D coordinates under plane basis.
-      * @param coords Output 2D coordinates.
-      * @param pt Input 3D point.
-      * @param plane Basis anchor plane.
-      * @param u_axis Basis axis u.
-      * @param v_axis Basis axis v.
-      */
-    static void projectToPlaneBasis(std::vector<double>& coords, const Pt3D& pt,
-                                    const Plane3D& plane, const Pt3D& u_axis,
-                                    const Pt3D& v_axis);
-    /**
-      * @brief Reconstruct 3D point from plane-basis coordinates.
-      * @param result Output 3D point.
-      * @param origin Plane origin.
-      * @param u_axis Basis axis u.
-      * @param v_axis Basis axis v.
-      * @param coords Input 2D basis coordinates.
-      */
-    static void reconstructFromPlaneBasis(Pt3D& result, const Pt3D& origin,
-                                          const Pt3D& u_axis, const Pt3D& v_axis,
-                                          const std::vector<double>& coords);
-    /**
-      * @brief Refract direction across one interface.
-      * @param dir_refract Input/output direction vector.
-      * @param normal Interface normal.
-      * @param refract_ratio Refractive index ratio n_in/n_out.
-      * @param is_forward True for farthest->nearest propagation.
-      * @return False if total internal reflection occurs.
-      */
-    static bool refractDirection(Pt3D& dir_refract, const Pt3D& normal,
-                                 double refract_ratio, bool is_forward);
-    /**
-      * @brief Trace one ray through refractive interfaces toward camera side.
-      * @param pt_exit Output exit point at nearest interface.
-      * @param exit_direction Output direction after exiting stack.
-      * @param pt_world Input world point.
-      * @param pt_entry Input entry point on farthest interface.
-      * @param pin Refractive parameter container.
-      * @return False if tracing fails or total internal reflection occurs.
-      */
-    static bool traceRayToCam(Pt3D& pt_exit, Pt3D& exit_direction,
-                              const Pt3D& pt_world, const Pt3D& pt_entry,
-                              const PinPlateParam& pin);
-    /**
       * @brief Solve refractive projection with LM + line-search.
       * @param pt_world Input world point.
       * @param pin Refractive parameter container.
@@ -334,6 +277,14 @@ private:
       */
     static std::tuple<bool, Pt3D, double, int>
     solveProjectionByRefractionLM(const Pt3D& pt_world, const PinPlateParam& pin);
+    /**
+      * @brief Solve refractive projection using 1D Snell-length optimization.
+      * @param pt_world Input world point.
+      * @param pin Refractive parameter container.
+      * @return (failed, refracted_point, residual, iterations).
+      */
+    static std::tuple<bool, Pt3D, double, int>
+    solveProjectionBySnell1D(const Pt3D& pt_world, const PinPlateParam& pin);
 
     PinPlateParam _param;
 };
