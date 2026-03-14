@@ -450,7 +450,7 @@ class RefractionPlateCalibrator:
                     
                     # Smooth barrier using softplus: tau * log1p(exp(gap/tau))
                     tau = max(self.cfg.tau, 1e-9)
-                    gap_smooth = tau * np.log1p(np.exp(gap / tau))
+                    gap_smooth = tau * np.logaddexp(0.0, gap / tau)
                     
                     c_gate = self.cfg.alpha_side_gate
                     r_fix_const = np.sqrt(2.0 * c_gate)
