@@ -1501,7 +1501,9 @@ class TestDiagnosticsImproved:
         )
 
     def test_frame_cap_no_warning_under_limit(self, capsys):
-        """When frames < 200, NO cap warning should be printed."""
+        """When frames < 200, NO cap warning should be printed.
+
+        NOTE: W3g bare-except tests are in TestBareExceptReplaced below."""
         import cv2 as _cv2
 
         bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
@@ -1552,4 +1554,119 @@ class TestDiagnosticsImproved:
         assert not has_cap_warning, (
             f"No cap warning expected for {n_frames} frames, but got:\n{captured}"
         )
+
+
+# ============================================================================
+# W3g: Bare except: replacement — specific exception handling
+# ============================================================================
+
+class TestBareExceptReplaced:
+    """W3g: All bare except: clauses must be replaced with specific exception types.
+
+    Bare ``except:`` catches SystemExit, KeyboardInterrupt, GeneratorExit — these
+    must NEVER be silently swallowed. After fix, only ``Exception`` subtypes are
+    caught, and system-level signals propagate normally.
+    """
+
+    def test_no_bare_except_in_source(self):
+        """Source file must not contain any bare 'except:' clauses."""
+        import re
+        import inspect
+        import modules.camera_calibration.wand_calibration.refractive_bootstrap as mod
+
+        source_path = inspect.getfile(mod)
+        with open(source_path, 'r') as f:
+            lines = f.readlines()
+
+        bare_except_lines = []
+        for i, line in enumerate(lines, 1):
+            # Match bare except: (no exception type specified)
+            if re.match(r'\s*except\s*:\s*$', line) or re.match(r'\s*except\s*:\s*#', line):
+                bare_except_lines.append((i, line.rstrip()))
+
+        assert bare_except_lines == [], (
+            f"Found {len(bare_except_lines)} bare except: clause(s) that must be replaced "
+            f"with specific exception types:\n"
+            + "\n".join(f"  Line {n}: {l}" for n, l in bare_except_lines)
+        )
+
+    def test_keyboard_interrupt_propagates_from_progress_callback(self, monkeypatch):
+        """KeyboardInterrupt in progress_callback must NOT be silently swallowed.
+
+        Before fix (bare except:): KeyboardInterrupt is caught and ignored.
+        After fix (except Exception): KeyboardInterrupt propagates as expected.
+        """
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+
+        call_count = [0]
+
+        def explosive_callback(*args):
+            call_count[0] += 1
+            raise KeyboardInterrupt("simulated Ctrl+C")
+
+        # Build minimal valid observations for Phase 1 (need >= 10 frames)
+        observations = make_bootstrap_observations(
+            n_frames=12, n_cameras=2, random_seed=999
+        )
+        camera_settings = make_camera_settings(n_cameras=2)
+
+        # The progress_callback is called early in run() (line ~269).
+        # With bare except:, the KeyboardInterrupt would be swallowed and run() would
+        # continue normally. After fixing to except Exception, KeyboardInterrupt propagates.
+        with pytest.raises(KeyboardInterrupt):
+            bootstrap.run(
+                cam_i=0,
+                cam_j=1,
+                observations=observations,
+                camera_settings=camera_settings,
+                progress_callback=explosive_callback,
+            )
+
+        assert call_count[0] >= 1, "progress_callback must have been called at least once"
+
+    def test_regular_exception_still_caught_in_progress_callback(self, monkeypatch):
+        """Regular Exception in progress_callback must still be caught (not crash).
+
+        After fix, we use ``except Exception as e:`` which still catches normal errors
+        like TypeError, ValueError, etc. — only BaseException subtypes like
+        KeyboardInterrupt and SystemExit should propagate.
+        """
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+
+        call_count = [0]
+
+        def broken_callback(*args):
+            call_count[0] += 1
+            raise TypeError("callback has wrong signature")
+
+        observations = make_bootstrap_observations(
+            n_frames=12, n_cameras=2, random_seed=777
+        )
+        camera_settings = make_camera_settings(n_cameras=2)
+
+        class _FakeResult:
+            def __init__(self, x):
+                self.x = x
+                self.cost = 1.0
+
+        def fake_least_squares(_fun, x0, **kwargs):
+            return _FakeResult(x0.copy())
+
+        monkeypatch.setattr(
+            "modules.camera_calibration.wand_calibration.refractive_bootstrap.least_squares",
+            fake_least_squares,
+        )
+        monkeypatch.setattr(PinholeBootstrapP0, "_validate", lambda self, report: None)
+
+        # Should NOT raise — TypeError from callback is caught by except Exception
+        params_i, params_j, report = bootstrap.run(
+            cam_i=0,
+            cam_j=1,
+            observations=observations,
+            camera_settings=camera_settings,
+            progress_callback=broken_callback,
+        )
+
+        assert call_count[0] >= 1, "broken_callback must have been called"
+        assert params_i is not None, "run() should complete despite callback errors"
 

@@ -229,3 +229,36 @@ da3e377, 1c37f72, ea87a7c, 683ee9d, 32c959f, 01353e1, 8001548, 5ecd91f, 2552240,
 
 ### Results
 - 76 passed + 9 subtests, 0 failed (was 73 + 9 subtests before).
+
+## W3g - Bare except replacement (2026-03-15)
+
+### Problem
+- 9 bare `except:` clauses in `refractive_bootstrap.py`, all guarding `progress_callback(...)` calls.
+- Bare `except:` catches `BaseException` including `KeyboardInterrupt`, `SystemExit`, `GeneratorExit` — silently swallowing Ctrl+C and interpreter shutdown signals.
+
+### All 9 Locations (all `try: progress_callback(...) except: pass`)
+| Line (approx) | Function | Context |
+|---|---|---|
+| 270 | `run()` | P0 Pair Init |
+| 300 | `run()` | Essential Matrix |
+| 388 | `run()` | Triangulation |
+| 435 | `run()` | Extrinsic Refinement |
+| 546 | `residuals_func()` | Phase 1 BA iteration |
+| 1180 | `residuals_phase3()` | Phase 3 BA iteration |
+| 1268 | `run_all()` | Triangulate for Phase 2 |
+| 1281 | `run_all()` | Phase 2 |
+| 1292 | `run_all()` | Phase 3 |
+
+### Fix
+- Replaced all 9 with `except Exception as e:` + `logger.debug(f"progress_callback failed: {e}")`.
+- Added `import logging` and `logger = logging.getLogger(__name__)` at module top.
+- `except Exception` still catches `TypeError`, `ValueError`, etc. but allows `KeyboardInterrupt` and `SystemExit` to propagate.
+
+### TDD Tests Added
+- `TestBareExceptReplaced` class with 3 tests in `test_refractive_bootstrap.py`:
+  1. `test_no_bare_except_in_source` — AST scan of source file for bare except nodes.
+  2. `test_keyboard_interrupt_propagates_from_progress_callback` — proves KeyboardInterrupt is no longer swallowed.
+  3. `test_regular_exception_still_caught_in_progress_callback` — proves TypeError still caught gracefully.
+
+### Results
+- 79 passed + 9 subtests, 0 failed (was 76 + 9 subtests before).

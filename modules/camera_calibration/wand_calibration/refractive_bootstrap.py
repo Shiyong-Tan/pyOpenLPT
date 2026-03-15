@@ -17,12 +17,15 @@ KEY RULES:
 - Pair selection is handled externally via precalibrate
 """
 
+import logging
 import numpy as np
 from scipy.optimize import least_squares
 import cv2
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import re
+
+logger = logging.getLogger(__name__)
 
 
 def select_best_pair_via_precalib(base_calibrator, wand_len_mm: float, initial_focal_px: float) -> Optional[Tuple[int, int]]:
@@ -267,8 +270,8 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("P0 Pair Init", -1, 0, 0, 0)
-            except:
-                pass
+            except Exception as e:
+                logger.debug("progress_callback error (P0 Pair Init): %s", e)
         
         # Collect valid frames and points
         valid_frames = self._collect_valid_frames(observations, cam_i, cam_j)
@@ -297,8 +300,8 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except:
-                pass
+            except Exception as e:
+                logger.debug("progress_callback error (Essential Matrix): %s", e)
 
         # Step 1: Essential Matrix (normalized rays, supports different intrinsics)
         pts_i_norm = cv2.undistortPoints(pts_i.reshape(-1, 1, 2), K_i, None).reshape(-1, 2)
@@ -385,8 +388,8 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except:
-                pass
+            except Exception as e:
+                logger.debug("progress_callback error (Triangulation): %s", e)
         
         # Projection matrices (cam_i at origin)
         P_i = np.hstack([np.eye(3), np.zeros((3, 1))])
@@ -432,8 +435,8 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except:
-                pass
+            except Exception as e:
+                logger.debug("progress_callback error (Extrinsic Refinement): %s", e)
         
         # Build initial 3D points (scaled)
         pts_3d_scaled = pts_3d * scale_factor
@@ -543,8 +546,8 @@ class PinholeBootstrapP0:
                         rmse_proj,
                         cost,
                     )
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug("progress_callback error (Phase 1 BA iter): %s", e)
             
             return res_arr
 
@@ -1177,8 +1180,8 @@ class PinholeBootstrapP0:
                         rmse_proj,
                         cost,
                     )
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug("progress_callback error (Phase 3 BA iter): %s", e)
             
             return res_arr
 
@@ -1265,8 +1268,8 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except:
-                pass
+            except Exception as e:
+                logger.debug("progress_callback error (Triangulate for Phase 2): %s", e)
 
         points_3d = self.triangulate_all_points(
             cam_i, cam_j, params_i, params_j, observations_phase23, camera_settings
@@ -1278,8 +1281,8 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except:
-                pass
+            except Exception as e:
+                logger.debug("progress_callback error (Phase 2): %s", e)
         
         cam_params = self.run_phase2(
             cam_params, observations_phase23, points_3d, camera_settings, all_cam_ids
@@ -1289,8 +1292,8 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except:
-                pass
+            except Exception as e:
+                logger.debug("progress_callback error (Phase 3): %s", e)
 
         valid_frames_phase3 = [
             fid for fid, cams in observations_phase23.items() if len(cams) >= 2

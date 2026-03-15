@@ -1,0 +1,17 @@
+W3g Bare Except Replacement — Evidence Log
+============================================
+Date: 2026-03-15
+Task: Replace all bare except: clauses in refractive_bootstrap.py
+
+Changes:
+- 9 bare `except:` → `except Exception as e:` + logger.debug()
+- Added `import logging` + `logger = logging.getLogger(__name__)`
+- 3 TDD tests added in TestBareExceptReplaced class
+
+Test Run (79 passed, 9 subtests passed):
+=========================================
+modules/camera_calibration/wand_calibration/test_refractive_bootstrap.py::TestBareExceptReplaced::test_no_bare_except_in_source PASSED
+modules/camera_calibration/wand_calibration/test_refractive_bootstrap.py::TestBareExceptReplaced::test_keyboard_interrupt_propagates_from_progress_callback PASSED
+modules/camera_calibration/wand_calibration/test_refractive_bootstrap.py::TestBareExceptReplaced::test_regular_exception_still_caught_in_progress_callback PASSED
+
+Full suite: 79 passed, 9 subtests passed in 1.01s
