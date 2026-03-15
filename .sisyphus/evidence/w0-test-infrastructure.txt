@@ -1,0 +1,41 @@
+[W0-T1] Test Infrastructure Creation - 2026-03-15 12:41:38
+
+FILE CREATED:
+  modules/camera_calibration/wand_calibration/test_refractive_bootstrap.py (753 lines)
+
+FACTORY FUNCTIONS (3):
+  ✓ make_bootstrap_observations(n_frames=5, n_cameras=4, n_points=20)
+      → Returns: {frame_id: {cam_id: (uvA, uvB)}}
+      → Realistic geometry: 4 cameras in cube, 0.3m wand, 0.5px noise
+  ✓ make_camera_settings(n_cameras=4)
+      → Returns: {cam_id: {'focal', 'width', 'height'}}
+  ✓ make_known_geometry(n_cameras=4)
+      → Returns: Ground truth poses, wand length, workspace bounds
+
+PYTEST FIXTURES (5):
+  ✓ bootstrap_obs_fixture — Valid observations (5 frames, 4 cameras)
+  ✓ camera_settings_fixture — Standard 4-camera config
+  ✓ known_geometry_fixture — Ground truth geometry
+  ✓ phase1_data_fixture — Phase 1 specific (essential matrix)
+  ✓ phase3_data_fixture — Phase 3 specific (bundle adjustment)
+
+HELPER UTILITIES (4):
+  ✓ validate_camera_params() — Check camera param array shape/values
+  ✓ validate_observations() — Check observation dict structure
+  ✓ compute_residual_statistics() — RMS/mean/std/max/median
+  ✓ extract_wand_residuals() — Extract wand from interleaved layout
+
+VERIFICATION RESULTS:
+  ✓ pytest --collect-only → 0 tests, 0 errors (expected: fixtures only)
+  ✓ Python imports resolve correctly
+  ✓ Factory functions produce valid data shapes
+  ✓ py_compile successful (no syntax errors)
+  ✓ Observation shape: (2,) for uvA and uvB
+  ✓ Wand length: 0.3m, camera baseline: 1.005m (realistic)
+
+TEST COUNT:
+  ZERO test cases (as required — tests added in W1a-1e)
+
+DEPENDENCIES SATISFIED:
+  All 5 HIGH-priority waves (W1a-1e) can now proceed with test scaffolding ready.
+

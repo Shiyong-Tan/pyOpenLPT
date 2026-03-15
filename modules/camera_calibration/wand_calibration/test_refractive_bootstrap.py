@@ -1,0 +1,506 @@
+#!/usr/bin/env python
+"""
+Test Infrastructure for Refractive Bootstrap Bug Fixes
+=======================================================
+
+This module provides synthetic data factories and pytest fixtures to enable
+Test-Driven Development (TDD) for all 21 bootstrap bug fixes.
+
+DESIGN PRINCIPLES:
+- Synthetic data with REALISTIC parameters (actual camera/wand geometry)
+- NO actual test cases yet — fixtures/factories ONLY
+- All test cases will be written in W1a-W1e using RED-GREEN-REFACTOR
+- Supports 3 bootstrap phases: Phase 1 (essential matrix), Phase 2 (PnP), Phase 3 (BA)
+
+USAGE:
+    This is the PREREQUISITE for waves W1a-1e. The actual test cases will be
+    added as each bug is fixed. Currently this file contains:
+    - 3 synthetic data factory functions
+    - 5 pytest fixtures
+    - ZERO test cases (tests come later)
+
+Run:
+    conda run -n OpenLPT python -m pytest modules/camera_calibration/wand_calibration/test_refractive_bootstrap.py --collect-only -q
+"""
+
+from __future__ import annotations
+
+import pytest
+import numpy as np
+from typing import Dict, Tuple, List
+from dataclasses import dataclass
+
+# Import bootstrap classes (ensure these resolve correctly)
+# Note: If BootstrapObservations/FrameObservations don't exist as formal classes,
+# we'll use dict-based structures matching the actual bootstrap code's expectations
+
+
+# ============================================================================
+# SYNTHETIC DATA FACTORY FUNCTIONS
+# ============================================================================
+
+def make_bootstrap_observations(
+    n_frames: int = 5,
+    n_cameras: int = 4,
+    n_points: int = 20,
+    wand_length_m: float = 0.3,
+    workspace_size_m: float = 0.5,
+    projection_noise_px: float = 0.5,
+    point_radius_m: float = 0.005,
+    random_seed: int = 42
+) -> Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]]:
+    """
+    Create synthetic bootstrap observations with realistic geometry.
+    
+    Simulates a 4-camera system observing a wand moving through workspace.
+    Each frame contains observations from all cameras (2 wand endpoints visible).
+    
+    Args:
+        n_frames: Number of frames (default: 5)
+        n_cameras: Number of cameras (default: 4, arranged in cube)
+        n_points: Number of 3D points per frame (default: 20, scattered in workspace)
+        wand_length_m: Wand length in meters (default: 0.3m = 300mm)
+        workspace_size_m: Workspace cube size (default: 0.5m)
+        projection_noise_px: Gaussian projection noise std dev (default: 0.5px)
+        point_radius_m: Physical point radius (default: 0.005m = 5mm)
+        random_seed: Random seed for reproducibility (default: 42)
+        
+    Returns:
+        observations: {frame_id: {cam_id: (uvA, uvB)}} where
+            - uvA: (2,) array [u, v] for wand endpoint A in pixels
+            - uvB: (2,) array [u, v] for wand endpoint B in pixels
+            
+    Geometry:
+        - Cameras arranged in ~1m cube around origin (realistic lab setup)
+        - Wand endpoints separated by wand_length_m
+        - Each frame has different wand pose (rotation + translation)
+        - Projection uses pinhole camera model with realistic focal length
+        
+    Example:
+        >>> obs = make_bootstrap_observations(n_frames=3, n_cameras=2)
+        >>> obs[0][0]  # frame 0, camera 0
+        (array([512.3, 384.7]), array([612.1, 390.2]))  # uvA, uvB in pixels
+    """
+    rng = np.random.RandomState(random_seed)
+    
+    # Camera intrinsics (realistic values for 1024x1024 sensor)
+    focal_length_px = 9000.0  # ~9000 px focal length (common for calibration)
+    img_width_px = 1024
+    img_height_px = 1024
+    cx = img_width_px / 2.0
+    cy = img_height_px / 2.0
+    
+    # Camera extrinsics: arrange cameras in cube around origin
+    # Cameras at corners looking inward (realistic multi-camera setup)
+    camera_positions = []
+    camera_rotations = []
+    cube_radius = 0.5  # 0.5m from origin
+    
+    for i in range(n_cameras):
+        # Distribute cameras around a cube
+        angle_h = (i / n_cameras) * 2 * np.pi  # horizontal angle
+        angle_v = 0.0  # all at same height initially
+        
+        # Camera position on sphere/cube
+        x = cube_radius * np.cos(angle_h)
+        y = cube_radius * np.sin(angle_h)
+        z = 0.2 + (i % 2) * 0.1  # slight vertical offset
+        cam_pos = np.array([x, y, z])
+        camera_positions.append(cam_pos)
+        
+        # Camera rotation: look at origin
+        # Simple: align camera Z-axis to point toward origin
+        look_dir = -cam_pos / np.linalg.norm(cam_pos)
+        # Build rotation matrix (simplified - Z toward target)
+        up = np.array([0.0, 0.0, 1.0])
+        right = np.cross(up, look_dir)
+        if np.linalg.norm(right) < 1e-6:
+            right = np.array([1.0, 0.0, 0.0])
+        right = right / np.linalg.norm(right)
+        up_corrected = np.cross(look_dir, right)
+        R = np.column_stack([right, up_corrected, look_dir])
+        camera_rotations.append(R)
+    
+    # Generate observations for each frame
+    observations = {}
+    
+    for fid in range(n_frames):
+        observations[fid] = {}
+        
+        # Generate wand pose for this frame
+        # Wand center in workspace (uniformly distributed)
+        wand_center = rng.uniform(
+            -workspace_size_m / 4, workspace_size_m / 4, size=3
+        )
+        
+        # Wand orientation (random unit vector)
+        wand_dir = rng.randn(3)
+        wand_dir = wand_dir / np.linalg.norm(wand_dir)
+        
+        # Wand endpoints A and B
+        X_A = wand_center - (wand_length_m / 2.0) * wand_dir
+        X_B = wand_center + (wand_length_m / 2.0) * wand_dir
+        
+        # Project into each camera
+        for cam_id in range(n_cameras):
+            cam_pos = camera_positions[cam_id]
+            R_cam = camera_rotations[cam_id]
+            
+            # World to camera transformation
+            # X_cam = R_cam^T * (X_world - cam_pos)
+            X_A_cam = R_cam.T @ (X_A - cam_pos)
+            X_B_cam = R_cam.T @ (X_B - cam_pos)
+            
+            # Project to image plane (pinhole model)
+            # u = f * x/z + cx
+            # v = f * y/z + cy
+            if X_A_cam[2] > 0.01 and X_B_cam[2] > 0.01:  # In front of camera
+                uA = focal_length_px * X_A_cam[0] / X_A_cam[2] + cx
+                vA = focal_length_px * X_A_cam[1] / X_A_cam[2] + cy
+                
+                uB = focal_length_px * X_B_cam[0] / X_B_cam[2] + cx
+                vB = focal_length_px * X_B_cam[1] / X_B_cam[2] + cy
+                
+                # Add projection noise
+                uvA = np.array([uA, vA]) + rng.randn(2) * projection_noise_px
+                uvB = np.array([uB, vB]) + rng.randn(2) * projection_noise_px
+                
+                observations[fid][cam_id] = (uvA, uvB)
+    
+    return observations
+
+
+def make_camera_settings(
+    n_cameras: int = 4,
+    focal_px: float = 9000.0,
+    img_width: int = 1024,
+    img_height: int = 1024
+) -> Dict[int, dict]:
+    """
+    Create camera settings dictionary for bootstrap initialization.
+    
+    Args:
+        n_cameras: Number of cameras (default: 4)
+        focal_px: Focal length in pixels (default: 9000.0)
+        img_width: Image width in pixels (default: 1024)
+        img_height: Image height in pixels (default: 1024)
+        
+    Returns:
+        camera_settings: {cam_id: {'focal': float, 'width': int, 'height': int}}
+        
+    Example:
+        >>> settings = make_camera_settings(n_cameras=2)
+        >>> settings[0]
+        {'focal': 9000.0, 'width': 1024, 'height': 1024}
+    """
+    camera_settings = {}
+    for cam_id in range(n_cameras):
+        camera_settings[cam_id] = {
+            'focal': focal_px,
+            'width': img_width,
+            'height': img_height
+        }
+    return camera_settings
+
+
+def make_known_geometry(
+    n_cameras: int = 4,
+    wand_length_m: float = 0.3,
+    workspace_bounds_m: float = 0.5
+) -> dict:
+    """
+    Create ground truth geometry for validation tests.
+    
+    Contains known camera poses, wand length, and workspace bounds that can
+    be used to validate bootstrap output against expected values.
+    
+    Args:
+        n_cameras: Number of cameras (default: 4)
+        wand_length_m: Wand length in meters (default: 0.3m)
+        workspace_bounds_m: Workspace size (default: 0.5m cube)
+        
+    Returns:
+        geometry: dict with keys:
+            - 'wand_length_m': float
+            - 'workspace_bounds_m': float
+            - 'camera_positions': {cam_id: (3,) array}
+            - 'camera_rotations': {cam_id: (3,3) rotation matrix}
+            - 'expected_baseline_m': Expected baseline between cameras
+            
+    Example:
+        >>> geom = make_known_geometry(n_cameras=2)
+        >>> geom['wand_length_m']
+        0.3
+        >>> geom['camera_positions'][0].shape
+        (3,)
+    """
+    camera_positions = {}
+    camera_rotations = {}
+    cube_radius = 0.5  # meters
+    
+    for cam_id in range(n_cameras):
+        angle_h = (cam_id / n_cameras) * 2 * np.pi
+        x = cube_radius * np.cos(angle_h)
+        y = cube_radius * np.sin(angle_h)
+        z = 0.2 + (cam_id % 2) * 0.1
+        cam_pos = np.array([x, y, z])
+        camera_positions[cam_id] = cam_pos
+        
+        # Simple rotation: look at origin
+        look_dir = -cam_pos / np.linalg.norm(cam_pos)
+        up = np.array([0.0, 0.0, 1.0])
+        right = np.cross(up, look_dir)
+        if np.linalg.norm(right) < 1e-6:
+            right = np.array([1.0, 0.0, 0.0])
+        right = right / np.linalg.norm(right)
+        up_corrected = np.cross(look_dir, right)
+        R = np.column_stack([right, up_corrected, look_dir])
+        camera_rotations[cam_id] = R
+    
+    # Expected baseline (distance between first two cameras)
+    if n_cameras >= 2:
+        baseline = np.linalg.norm(camera_positions[1] - camera_positions[0])
+    else:
+        baseline = 0.0
+    
+    return {
+        'wand_length_m': wand_length_m,
+        'workspace_bounds_m': workspace_bounds_m,
+        'camera_positions': camera_positions,
+        'camera_rotations': camera_rotations,
+        'expected_baseline_m': baseline,
+    }
+
+
+# ============================================================================
+# PYTEST FIXTURES
+# ============================================================================
+
+@pytest.fixture
+def bootstrap_obs_fixture():
+    """
+    Fixture: Valid bootstrap observations for 5 frames, 4 cameras.
+    
+    Returns observations dict matching bootstrap expectations:
+        {frame_id: {cam_id: (uvA, uvB)}}
+        
+    Use this for general bootstrap tests requiring valid input data.
+    """
+    return make_bootstrap_observations(
+        n_frames=5,
+        n_cameras=4,
+        n_points=20,
+        random_seed=42
+    )
+
+
+@pytest.fixture
+def camera_settings_fixture():
+    """
+    Fixture: Standard 4-camera configuration with realistic intrinsics.
+    
+    Returns camera_settings dict:
+        {cam_id: {'focal': float, 'width': int, 'height': int}}
+        
+    Use this for bootstrap initialization and camera setup tests.
+    """
+    return make_camera_settings(n_cameras=4)
+
+
+@pytest.fixture
+def known_geometry_fixture():
+    """
+    Fixture: Ground truth geometry for validation.
+    
+    Returns geometry dict with known camera poses and wand parameters.
+    Use this for tests that need to validate bootstrap output against
+    expected values.
+    """
+    return make_known_geometry(n_cameras=4)
+
+
+@pytest.fixture
+def phase1_data_fixture():
+    """
+    Fixture: Phase 1 specific data (essential matrix estimation).
+    
+    Phase 1 uses camera pair (cam_i, cam_j) with 8-Point Algorithm.
+    Returns dict with:
+        - 'observations': synthetic observations
+        - 'camera_settings': camera intrinsics
+        - 'cam_i': int (camera 0, fixed at origin)
+        - 'cam_j': int (camera 1, estimated pose)
+        - 'expected_n_frames': int (minimum frames needed)
+        
+    Use this for Phase 1 tests (essential matrix, recover pose, gauge freedom).
+    """
+    obs = make_bootstrap_observations(n_frames=10, n_cameras=4, random_seed=100)
+    settings = make_camera_settings(n_cameras=4)
+    
+    return {
+        'observations': obs,
+        'camera_settings': settings,
+        'cam_i': 0,  # Fixed camera
+        'cam_j': 1,  # Estimated camera
+        'expected_n_frames': 10,
+        'min_frames_required': 10,  # 8-Point needs >= 8 correspondences
+    }
+
+
+@pytest.fixture
+def phase3_data_fixture():
+    """
+    Fixture: Phase 3 specific data (bundle adjustment).
+    
+    Phase 3 optimizes all camera extrinsics with first camera frozen.
+    Returns dict with:
+        - 'observations': synthetic observations (all cameras)
+        - 'camera_settings': camera intrinsics (all cameras)
+        - 'n_cameras': int
+        - 'n_frames': int
+        - 'wand_length_m': float
+        - 'frozen_cam_id': int (camera 0 frozen for gauge)
+        
+    Use this for Phase 3 tests (bundle adjustment, gauge freedom, residual layout).
+    """
+    n_frames = 15
+    n_cameras = 4
+    obs = make_bootstrap_observations(
+        n_frames=n_frames,
+        n_cameras=n_cameras,
+        random_seed=200
+    )
+    settings = make_camera_settings(n_cameras=n_cameras)
+    
+    return {
+        'observations': obs,
+        'camera_settings': settings,
+        'n_cameras': n_cameras,
+        'n_frames': n_frames,
+        'wand_length_m': 0.3,
+        'frozen_cam_id': 0,  # First camera frozen in Phase 3
+    }
+
+
+# ============================================================================
+# HELPER UTILITIES (for future test development)
+# ============================================================================
+
+def validate_camera_params(params: np.ndarray, label: str = "camera_params") -> None:
+    """
+    Validate camera parameter array shape and finite values.
+    
+    Expected layout: [rvec(3), tvec(3)] for bootstrap (6 params total).
+    
+    Args:
+        params: Camera parameter array
+        label: Descriptive label for error messages
+        
+    Raises:
+        AssertionError: If params invalid
+    """
+    assert params is not None, f"{label}: params is None"
+    assert isinstance(params, np.ndarray), f"{label}: params not ndarray"
+    assert params.shape == (6,), f"{label}: expected shape (6,), got {params.shape}"
+    assert np.all(np.isfinite(params)), f"{label}: contains non-finite values"
+
+
+def validate_observations(
+    observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
+    min_frames: int = 1,
+    min_cameras: int = 2
+) -> None:
+    """
+    Validate observations dictionary structure and content.
+    
+    Args:
+        observations: Bootstrap observations dict
+        min_frames: Minimum required frames
+        min_cameras: Minimum required cameras per frame
+        
+    Raises:
+        AssertionError: If observations invalid
+    """
+    assert observations is not None, "observations is None"
+    assert isinstance(observations, dict), "observations not dict"
+    assert len(observations) >= min_frames, \
+        f"Insufficient frames: {len(observations)} < {min_frames}"
+    
+    for fid, frame_data in observations.items():
+        assert isinstance(frame_data, dict), f"Frame {fid} data not dict"
+        assert len(frame_data) >= min_cameras, \
+            f"Frame {fid}: insufficient cameras {len(frame_data)} < {min_cameras}"
+        
+        for cam_id, (uvA, uvB) in frame_data.items():
+            assert uvA.shape == (2,), f"Frame {fid} cam {cam_id}: uvA shape {uvA.shape}"
+            assert uvB.shape == (2,), f"Frame {fid} cam {cam_id}: uvB shape {uvB.shape}"
+            assert np.all(np.isfinite(uvA)), f"Frame {fid} cam {cam_id}: uvA non-finite"
+            assert np.all(np.isfinite(uvB)), f"Frame {fid} cam {cam_id}: uvB non-finite"
+
+
+def compute_residual_statistics(residuals: np.ndarray) -> dict:
+    """
+    Compute RMS and other statistics from residual array.
+    
+    This will be used in W1a to test RMS computation bug (residual slicing).
+    
+    Args:
+        residuals: Flat residual array from optimizer
+        
+    Returns:
+        stats: dict with 'rms', 'mean', 'std', 'max', 'median'
+    """
+    assert residuals is not None and len(residuals) > 0, "Empty residuals"
+    
+    return {
+        'rms': float(np.sqrt(np.mean(residuals**2))),
+        'mean': float(np.mean(residuals)),
+        'std': float(np.std(residuals)),
+        'max': float(np.max(np.abs(residuals))),
+        'median': float(np.median(np.abs(residuals))),
+    }
+
+
+def extract_wand_residuals(
+    residuals: np.ndarray,
+    n_frames: int,
+    n_cameras: int
+) -> np.ndarray:
+    """
+    Extract wand constraint residuals from interleaved layout.
+    
+    This will be tested in W1a (residual slicing bug).
+    
+    Bootstrap residual layout (per frame, interleaved):
+        [wand_0, reproj_0_camA, reproj_0_camB, ..., wand_1, reproj_1_camA, ...]
+        
+    Args:
+        residuals: Flat residual array
+        n_frames: Number of frames
+        n_cameras: Number of cameras per frame
+        
+    Returns:
+        wand_residuals: (n_frames,) array of wand constraint residuals
+    """
+    residuals_per_frame = 1 + 2 * n_cameras  # 1 wand + 2*n_cameras reprojection
+    expected_len = n_frames * residuals_per_frame
+    assert len(residuals) == expected_len, \
+        f"Residual length mismatch: {len(residuals)} != {expected_len}"
+    
+    # Extract every (1 + 2*n_cameras)-th element (wand residual at start of each block)
+    wand_residuals = residuals[::residuals_per_frame]
+    return wand_residuals
+
+
+# ============================================================================
+# NO TEST CASES YET
+# ============================================================================
+# Test cases will be added in W1a-1e when bugs are fixed using RED-GREEN-REFACTOR:
+#
+# W1a: Test RMS residual slicing (residual layout interleaved per frame)
+# W1b: Test homogeneous coordinate division in triangulation
+# W1c: Test Phase 1 gauge freedom (cam_i frozen at origin)
+# W1d: Test Phase 3 gauge freedom (first camera frozen)
+# W1e: Test wand constraint Jacobian sign consistency
+#
+# Each wave will add ~3-5 test functions to this file.
