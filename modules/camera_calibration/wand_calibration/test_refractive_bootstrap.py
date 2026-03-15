@@ -1252,3 +1252,75 @@ class TestPhase3HuberLoss:
             f"Huber should strongly downweight large residuals: rho={rho_large}, z={z_large}"
         )
 
+
+# ============================================================================
+# W3e: Cheirality Check — _project returns NaN for behind-camera points
+# ============================================================================
+
+class TestCheiralityCheck:
+    """Verify that _project returns NaN (not [1e6, 1e6]) for behind-camera points."""
+
+    @staticmethod
+    def _make_simple_camera():
+        """Create a simple identity camera setup (R=I, t=0, standard K)."""
+        K = np.array([
+            [800.0, 0.0, 320.0],
+            [0.0, 800.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        R = np.eye(3, dtype=np.float64)
+        t = np.zeros((3, 1), dtype=np.float64)
+        return K, R, t
+
+    def test_behind_camera_returns_nan(self):
+        """A 3D point with negative Z in camera coords must project to [NaN, NaN].
+
+        This replaces the old sentinel [1e6, 1e6] with an explicit NaN signal.
+        """
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+        K, R, t = self._make_simple_camera()
+
+        # Point behind camera: Z < 0 in camera frame
+        pt_behind = np.array([0.0, 0.0, -5.0], dtype=np.float64)
+        result = bootstrap._project(pt_behind, R, t, K)
+
+        assert result.shape == (2,), f"Expected shape (2,), got {result.shape}"
+        assert np.isnan(result[0]), (
+            f"Expected NaN for behind-camera x, got {result[0]}"
+        )
+        assert np.isnan(result[1]), (
+            f"Expected NaN for behind-camera y, got {result[1]}"
+        )
+        # Must NOT be the old sentinel [1e6, 1e6]
+        assert not np.isclose(result[0], 1e6), "Old sentinel 1e6 must not be returned"
+
+    def test_on_camera_plane_returns_nan(self):
+        """A 3D point with Z == 0 (exactly on camera plane) must also return NaN."""
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+        K, R, t = self._make_simple_camera()
+
+        pt_on_plane = np.array([1.0, 2.0, 0.0], dtype=np.float64)
+        result = bootstrap._project(pt_on_plane, R, t, K)
+
+        assert np.isnan(result).all(), (
+            f"Z=0 point should produce NaN projection, got {result}"
+        )
+
+    def test_in_front_camera_returns_finite(self):
+        """A 3D point in front of camera (Z > 0) must return finite 2D coordinates."""
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+        K, R, t = self._make_simple_camera()
+
+        # Point in front of camera
+        pt_front = np.array([0.1, 0.2, 5.0], dtype=np.float64)
+        result = bootstrap._project(pt_front, R, t, K)
+
+        assert result.shape == (2,), f"Expected shape (2,), got {result.shape}"
+        assert np.all(np.isfinite(result)), (
+            f"In-front-of-camera point should give finite projection, got {result}"
+        )
+        # Verify the actual projection math: K @ [x/z, y/z, 1]
+        expected_x = 800.0 * (0.1 / 5.0) + 320.0
+        expected_y = 800.0 * (0.2 / 5.0) + 240.0
+        np.testing.assert_allclose(result, [expected_x, expected_y], atol=1e-10)
+

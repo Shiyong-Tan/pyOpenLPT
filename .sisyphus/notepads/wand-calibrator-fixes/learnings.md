@@ -175,3 +175,30 @@ da3e377, 1c37f72, ea87a7c, 683ee9d, 32c959f, 01353e1, 8001548, 5ecd91f, 2552240,
 
 ### Results
 - 70 passed + 9 subtests, 0 failed (was 68 + 9 subtests before).
+
+## W3e - Cheirality guard (2026-03-15)
+
+### Problem
+- `_project()` at line 602 returned `np.array([1e6, 1e6])` for behind-camera points (z <= 0).
+- This magic sentinel polluted residual vectors with ~1e6 values instead of explicit NaN signaling.
+- No caller-side sentinel checks existed (no `>= 1e6` or `>= 1e5` patterns found).
+
+### Fix
+- `_project()`: Changed `return np.array([1e6, 1e6])` to `return np.array([np.nan, np.nan])`.
+- Phase 2 BA residuals (lines 509-525): Added `np.isnan(proj[0])` check, zero residual for NaN.
+- Phase 3 BA residuals (lines 1133-1146): Same NaN guard pattern.
+- Diagnostics (lines 688-694): Skip NaN projections from reproj_errors list.
+
+### Key Insight
+- NaN in residual vectors breaks `least_squares`. Cannot simply return NaN without guarding callers.
+- For residual functions: NaN projections produce zero residuals (skip observation gracefully).
+- For diagnostics: NaN projections are excluded from error statistics.
+- Sparsity matrix expects fixed residual count per frame, so `continue` is not possible in residuals.
+
+### Test Pattern
+- `TestCheiralityCheck` class with 3 tests: behind-camera NaN, on-plane NaN, in-front finite.
+- Direct unit test of `_project()` method with identity camera setup (R=I, t=0, K with f=800).
+- Verifies exact projection math for in-front points.
+
+### Results
+- 73 passed + 9 subtests, 0 failed (was 70 + 9 subtests before).

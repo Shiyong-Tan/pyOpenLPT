@@ -505,11 +505,11 @@ class PinholeBootstrapP0:
                 sq_err_len += d_len * d_len
                 n_len += 1
                 
-                # Reprojections with frozen K
+                # Reprojections with frozen K (cheirality: NaN → zero residual)
                 proj_Ai = self._project(ptA, R_i, t_i, K_i)
                 proj_Bi = self._project(ptB, R_i, t_i, K_i)
-                diff_Ai = (proj_Ai - uvA_i)
-                diff_Bi = (proj_Bi - uvB_i)
+                diff_Ai = np.zeros(2) if np.isnan(proj_Ai[0]) else (proj_Ai - uvA_i)
+                diff_Bi = np.zeros(2) if np.isnan(proj_Bi[0]) else (proj_Bi - uvB_i)
                 res.extend(diff_Ai.tolist())
                 res.extend(diff_Bi.tolist())
                 sq_err_proj += float(np.sum(diff_Ai**2) + np.sum(diff_Bi**2))
@@ -517,8 +517,8 @@ class PinholeBootstrapP0:
 
                 proj_Aj = self._project(ptA, R_j, t_j, K_j)
                 proj_Bj = self._project(ptB, R_j, t_j, K_j)
-                diff_Aj = (proj_Aj - uvA_j)
-                diff_Bj = (proj_Bj - uvB_j)
+                diff_Aj = np.zeros(2) if np.isnan(proj_Aj[0]) else (proj_Aj - uvA_j)
+                diff_Bj = np.zeros(2) if np.isnan(proj_Bj[0]) else (proj_Bj - uvB_j)
                 res.extend(diff_Aj.tolist())
                 res.extend(diff_Bj.tolist())
                 sq_err_proj += float(np.sum(diff_Aj**2) + np.sum(diff_Bj**2))
@@ -599,7 +599,7 @@ class PinholeBootstrapP0:
         pt_cam = R @ pt3d.reshape(3, 1) + t
         pt_cam = pt_cam.flatten()
         if pt_cam[2] <= 0:
-            return np.array([1e6, 1e6])  # Behind camera
+            return np.array([np.nan, np.nan])  # Cheirality: behind camera
         pt_norm = pt_cam[:2] / pt_cam[2]
         pt_px = K[:2, :2] @ pt_norm + K[:2, 2]
         return pt_px
@@ -684,12 +684,14 @@ class PinholeBootstrapP0:
             
             wand_lengths.append(np.linalg.norm(ptB - ptA))
             
-            # Reprojection error
+            # Reprojection error (skip behind-camera NaN projections)
             proj_Ai = self._project(ptA, R_i, t_i, K_i)
             proj_Aj = self._project(ptA, R_j, t_j, K_j)
             
-            reproj_errors.append(np.linalg.norm(proj_Ai - uvA_i))
-            reproj_errors.append(np.linalg.norm(proj_Aj - uvA_j))
+            if not np.isnan(proj_Ai[0]):
+                reproj_errors.append(np.linalg.norm(proj_Ai - uvA_i))
+            if not np.isnan(proj_Aj[0]):
+                reproj_errors.append(np.linalg.norm(proj_Aj - uvA_j))
         
         return {
             'baseline_mm': np.linalg.norm(params_j[3:6]),
@@ -1129,16 +1131,16 @@ class PinholeBootstrapP0:
                     R_cam, t_cam = cams[cid]
                     uvA, uvB = observations[fid][cid]
                     
-                    # Project ptA
+                    # Project ptA (cheirality: NaN → zero residual)
                     proj_A = self._project(ptA, R_cam, t_cam, K_by_cam[cid])
-                    diffA = proj_A - uvA
+                    diffA = np.zeros(2) if np.isnan(proj_A[0]) else (proj_A - uvA)
                     res.extend(diffA.tolist())
                     sq_err_proj += float(np.sum(diffA**2))
                     n_proj += 2
                     
-                    # Project ptB
+                    # Project ptB (cheirality: NaN → zero residual)
                     proj_B = self._project(ptB, R_cam, t_cam, K_by_cam[cid])
-                    diffB = proj_B - uvB
+                    diffB = np.zeros(2) if np.isnan(proj_B[0]) else (proj_B - uvB)
                     res.extend(diffB.tolist())
                     sq_err_proj += float(np.sum(diffB**2))
                     n_proj += 2
