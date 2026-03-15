@@ -493,16 +493,56 @@ double calRadiusFromCams(
 
     if (Rs.empty()) return NaN;
 
-    // Robust aggregation: median of R_i
-    const size_t n   = Rs.size();
-    const size_t mid = n / 2;
-    std::nth_element(Rs.begin(), Rs.begin() + mid, Rs.end());
-    double median = Rs[mid];
-    if ((n % 2) == 0) {
-        const auto max_lhs = std::max_element(Rs.begin(), Rs.begin() + mid);
-        median = 0.5 * (median + *max_lhs);
+    // Robust aggregation using IQR-based filtering
+    const size_t n = Rs.size();
+    
+    if (n == 1) {
+        return Rs[0];
     }
-
+    
+    // Sort to compute quartiles
+    std::sort(Rs.begin(), Rs.end());
+    
+    // Calculate Q1 (25th percentile) and Q3 (75th percentile)
+    const size_t q1_idx = n / 4;
+    const size_t q3_idx = (3 * n) / 4;
+    const double Q1 = Rs[q1_idx];
+    const double Q3 = Rs[q3_idx];
+    
+    // Calculate IQR
+    const double IQR = Q3 - Q1;
+    
+    // Calculate bounds
+    const double lower_bound = Q1 - 1.5 * IQR;
+    const double upper_bound = Q3 + 1.5 * IQR;
+    
+    // Filter values within bounds
+    std::vector<double> filtered;
+    filtered.reserve(n);
+    for (const double R : Rs) {
+        if (R >= lower_bound && R <= upper_bound) {
+            filtered.push_back(R);
+        }
+    }
+    
+    // If all values were filtered out, fall back to median of original data
+    if (filtered.empty()) {
+        const size_t mid = n / 2;
+        double median = Rs[mid];
+        if ((n % 2) == 0 && mid > 0) {
+            median = 0.5 * (Rs[mid - 1] + Rs[mid]);
+        }
+        return median;
+    }
+    
+    // Return median of filtered values
+    const size_t nf = filtered.size();
+    const size_t mid = nf / 2;
+    double median = filtered[mid];
+    if ((nf % 2) == 0 && mid > 0) {
+        median = 0.5 * (filtered[mid - 1] + filtered[mid]);
+    }
+    
     return median;
 }
 
