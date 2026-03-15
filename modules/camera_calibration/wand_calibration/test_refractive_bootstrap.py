@@ -891,3 +891,200 @@ class TestBarrierConfig:
             assert 'beta_dir_scale' in phase_cfg
             assert 'tau' in phase_cfg
             assert 'soft_on' in phase_cfg
+
+
+class TestBarrierResiduals:
+    @staticmethod
+    def _smooth_barrier_residuals(
+        sX: float,
+        margin_mm: float,
+        r_val: float,
+        tau: float,
+        alpha_side_gate: float,
+        beta_side_dir: float,
+    ) -> np.ndarray:
+        """Mirror wand BA barrier: 2 residual slots per barrier point."""
+        gap = (margin_mm + r_val) - sX
+        tau_eff = max(tau, 1e-12)
+        gap_smooth = tau_eff * np.logaddexp(0.0, gap / tau_eff)
+        r_fix_const = np.sqrt(2.0 * alpha_side_gate)
+        r_grad_const = np.sqrt(2.0 * beta_side_dir)
+        return np.array([
+            r_fix_const * (1.0 - np.exp(-gap_smooth / tau_eff)),
+            r_grad_const * gap_smooth,
+        ], dtype=np.float64)
+
+    def test_feasible_gap_residuals_near_zero(self):
+        """Feasible side (gap < 0) should produce near-zero smooth barrier residuals."""
+        res = self._smooth_barrier_residuals(
+            sX=1.0,
+            margin_mm=0.05,
+            r_val=0.0,
+            tau=0.01,
+            alpha_side_gate=10.0,
+            beta_side_dir=1e4,
+        )
+
+        assert res.shape == (2,)
+        assert np.all(np.isfinite(res))
+        assert np.all(res >= 0.0)
+        assert np.all(res < 1e-8)
+
+    def test_violating_gap_positive_and_smooth_near_zero(self):
+        """Violating side (gap > 0) should be positive with smooth no-kink behavior."""
+        margin_mm = 0.05
+        tau = 0.01
+        alpha = 10.0
+        beta = 1e4
+
+        # Violating case: preserve point-radius term in gap=(margin+r)-sX.
+        sX = 0.0
+        res_small_r = self._smooth_barrier_residuals(
+            sX=sX,
+            margin_mm=margin_mm,
+            r_val=0.0,
+            tau=tau,
+            alpha_side_gate=alpha,
+            beta_side_dir=beta,
+        )
+        res_big_r = self._smooth_barrier_residuals(
+            sX=sX,
+            margin_mm=margin_mm,
+            r_val=0.3,
+            tau=tau,
+            alpha_side_gate=alpha,
+            beta_side_dir=beta,
+        )
+
+        assert res_small_r.shape == (2,)
+        assert np.all(res_small_r > 0.0)
+        assert np.all(res_big_r > res_small_r), "Larger point radius must increase barrier residuals"
+
+        # Smoothness check around gap=0 (no hard kink in value/slope).
+        eps = 1e-6
+        res_left = self._smooth_barrier_residuals(
+            sX=margin_mm + eps,
+            margin_mm=margin_mm,
+            r_val=0.0,
+            tau=tau,
+            alpha_side_gate=alpha,
+            beta_side_dir=beta,
+        )
+        res_zero = self._smooth_barrier_residuals(
+            sX=margin_mm,
+            margin_mm=margin_mm,
+            r_val=0.0,
+            tau=tau,
+            alpha_side_gate=alpha,
+            beta_side_dir=beta,
+        )
+        res_right = self._smooth_barrier_residuals(
+            sX=margin_mm - eps,
+            margin_mm=margin_mm,
+            r_val=0.0,
+            tau=tau,
+            alpha_side_gate=alpha,
+            beta_side_dir=beta,
+        )
+
+        d_left = (res_zero - res_left) / eps
+        d_right = (res_right - res_zero) / eps
+        assert np.all(np.isfinite(d_left)) and np.all(np.isfinite(d_right))
+        assert np.max(np.abs(d_left - d_right)) < 1e-2
+
+
+class TestPinholeBootstrapP0ConfigValidation:
+    """W3a: Validate PinholeBootstrapP0Config.__post_init__ rejects invalid configs."""
+    
+    def test_valid_config_accepted(self):
+        """Valid config with all positive finite values should be accepted."""
+        config = PinholeBootstrapP0Config(
+            wand_length_mm=10.0,
+            ui_focal_px=9000.0,
+            ftol=1e-6,
+            xtol=1e-6,
+        )
+        assert config.wand_length_mm == 10.0
+        assert config.ui_focal_px == 9000.0
+        assert config.ftol == 1e-6
+        assert config.xtol == 1e-6
+    
+    def test_negative_wand_length_rejected(self):
+        """Negative wand_length_mm should raise ValueError."""
+        with pytest.raises(ValueError, match="wand_length_mm must be > 0"):
+            PinholeBootstrapP0Config(wand_length_mm=-1.0)
+    
+    def test_zero_wand_length_rejected(self):
+        """Zero wand_length_mm should raise ValueError."""
+        with pytest.raises(ValueError, match="wand_length_mm must be > 0"):
+            PinholeBootstrapP0Config(wand_length_mm=0.0)
+    
+    def test_negative_ui_focal_rejected(self):
+        """Negative ui_focal_px should raise ValueError."""
+        with pytest.raises(ValueError, match="ui_focal_px must be > 0"):
+            PinholeBootstrapP0Config(ui_focal_px=-9000.0)
+    
+    def test_zero_ui_focal_rejected(self):
+        """Zero ui_focal_px should raise ValueError."""
+        with pytest.raises(ValueError, match="ui_focal_px must be > 0"):
+            PinholeBootstrapP0Config(ui_focal_px=0.0)
+    
+    def test_negative_ftol_rejected(self):
+        """Negative ftol should raise ValueError."""
+        with pytest.raises(ValueError, match="ftol must be > 0"):
+            PinholeBootstrapP0Config(ftol=-1e-6)
+    
+    def test_zero_ftol_rejected(self):
+        """Zero ftol should raise ValueError."""
+        with pytest.raises(ValueError, match="ftol must be > 0"):
+            PinholeBootstrapP0Config(ftol=0.0)
+    
+    def test_negative_xtol_rejected(self):
+        """Negative xtol should raise ValueError."""
+        with pytest.raises(ValueError, match="xtol must be > 0"):
+            PinholeBootstrapP0Config(xtol=-1e-6)
+    
+    def test_zero_xtol_rejected(self):
+        """Zero xtol should raise ValueError."""
+        with pytest.raises(ValueError, match="xtol must be > 0"):
+            PinholeBootstrapP0Config(xtol=0.0)
+    
+    def test_nan_wand_length_rejected(self):
+        """NaN wand_length_mm should raise ValueError."""
+        with pytest.raises(ValueError, match="wand_length_mm must be finite"):
+            PinholeBootstrapP0Config(wand_length_mm=float('nan'))
+    
+    def test_inf_wand_length_rejected(self):
+        """Inf wand_length_mm should raise ValueError."""
+        with pytest.raises(ValueError, match="wand_length_mm must be finite"):
+            PinholeBootstrapP0Config(wand_length_mm=float('inf'))
+    
+    def test_nan_ui_focal_rejected(self):
+        """NaN ui_focal_px should raise ValueError."""
+        with pytest.raises(ValueError, match="ui_focal_px must be finite"):
+            PinholeBootstrapP0Config(ui_focal_px=float('nan'))
+    
+    def test_inf_ui_focal_rejected(self):
+        """Inf ui_focal_px should raise ValueError."""
+        with pytest.raises(ValueError, match="ui_focal_px must be finite"):
+            PinholeBootstrapP0Config(ui_focal_px=float('inf'))
+    
+    def test_nan_ftol_rejected(self):
+        """NaN ftol should raise ValueError."""
+        with pytest.raises(ValueError, match="ftol must be finite"):
+            PinholeBootstrapP0Config(ftol=float('nan'))
+    
+    def test_inf_ftol_rejected(self):
+        """Inf ftol should raise ValueError."""
+        with pytest.raises(ValueError, match="ftol must be finite"):
+            PinholeBootstrapP0Config(ftol=float('inf'))
+    
+    def test_nan_xtol_rejected(self):
+        """NaN xtol should raise ValueError."""
+        with pytest.raises(ValueError, match="xtol must be finite"):
+            PinholeBootstrapP0Config(xtol=float('nan'))
+    
+    def test_inf_xtol_rejected(self):
+        """Inf xtol should raise ValueError."""
+        with pytest.raises(ValueError, match="xtol must be finite"):
+            PinholeBootstrapP0Config(xtol=float('inf'))

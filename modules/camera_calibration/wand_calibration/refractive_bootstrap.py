@@ -167,6 +167,27 @@ class PinholeBootstrapP0Config:
     ui_focal_px: float = 9000.0  # UI-provided focal length (FROZEN)
     ftol: float = 1e-6
     xtol: float = 1e-6
+    
+    def __post_init__(self):
+        """Validate configuration fields."""
+        if self.wand_length_mm <= 0:
+            raise ValueError(f"wand_length_mm must be > 0, got {self.wand_length_mm}")
+        if self.ui_focal_px <= 0:
+            raise ValueError(f"ui_focal_px must be > 0, got {self.ui_focal_px}")
+        if self.ftol <= 0:
+            raise ValueError(f"ftol must be > 0, got {self.ftol}")
+        if self.xtol <= 0:
+            raise ValueError(f"xtol must be > 0, got {self.xtol}")
+        
+        # Check for NaN/inf in all float fields
+        if not np.isfinite(self.wand_length_mm):
+            raise ValueError(f"wand_length_mm must be finite, got {self.wand_length_mm}")
+        if not np.isfinite(self.ui_focal_px):
+            raise ValueError(f"ui_focal_px must be finite, got {self.ui_focal_px}")
+        if not np.isfinite(self.ftol):
+            raise ValueError(f"ftol must be finite, got {self.ftol}")
+        if not np.isfinite(self.xtol):
+            raise ValueError(f"xtol must be finite, got {self.xtol}")
 
 
 class PinholeBootstrapP0:
