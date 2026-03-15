@@ -617,3 +617,37 @@ def test_homogeneous_division_guarded(monkeypatch):
     assert np.all(np.isfinite(XB_edge))
     assert np.isnan(XA_edge).all(), "Near-zero homogeneous w should map to NaN sentinel"
     assert not np.isinf(XA_edge).any(), "Guard must avoid inf from homogeneous divide"
+
+
+class TestPhase1Gauge:
+    def test_phase1_cam_i_frozen(self, phase1_data_fixture, monkeypatch):
+        """After Phase 1 BA, cam_i must remain exactly [0,0,0,0,0,0]."""
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+
+        class _FakeResult:
+            def __init__(self, x):
+                self.x = x
+                self.cost = float(np.sum(x**2))
+
+        def fake_least_squares(_fun, x0, **_kwargs):
+            x = x0.copy()
+            # Force first 6 optimized parameters to be non-zero.
+            # If cam_i is still inside the state vector, this leaks into output.
+            x[:6] = np.array([0.1, -0.2, 0.3, 1.0, -2.0, 3.0], dtype=np.float64)
+            return _FakeResult(x)
+
+        # Keep this test focused on gauge anchoring behavior.
+        monkeypatch.setattr(
+            "modules.camera_calibration.wand_calibration.refractive_bootstrap.least_squares",
+            fake_least_squares,
+        )
+        monkeypatch.setattr(PinholeBootstrapP0, "_validate", lambda self, report: None)
+
+        params_i_opt, _params_j_opt, _report = bootstrap.run(
+            cam_i=phase1_data_fixture['cam_i'],
+            cam_j=phase1_data_fixture['cam_j'],
+            observations=phase1_data_fixture['observations'],
+            camera_settings=phase1_data_fixture['camera_settings'],
+        )
+
+        assert np.allclose(params_i_opt, np.zeros(6), atol=1e-10)

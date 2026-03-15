@@ -344,8 +344,7 @@ class PinholeBootstrapP0:
         # Convert R to rvec
         rvec_j, _ = cv2.Rodrigues(R_rel)
         
-        # Build params arrays (both cameras, like original Phase 1)
-        params_i = np.zeros(6)  # cam_i at origin initially
+        # Build params array for cam_j (cam_i is frozen at origin)
         params_j = np.concatenate([rvec_j.flatten(), t_scaled.flatten()])
         
         print(f"\n[P0] Step 3: Extrinsic Refinement (frozen intrinsics)...")
@@ -359,17 +358,17 @@ class PinholeBootstrapP0:
         pts_3d_scaled = pts_3d * scale_factor
         n_pts = len(pts_3d_scaled)
         
-        # State vector: [cam_i(6), cam_j(6), pts_3d(N*3)]
-        x0 = np.concatenate([params_i, params_j, pts_3d_scaled.flatten()])
+        # State vector: [cam_j(6), pts_3d(N*3)]  (cam_i frozen at origin)
+        x0 = np.concatenate([params_j, pts_3d_scaled.flatten()])
         
         from scipy.sparse import lil_matrix
         
         # Residuals: for each frame: wand(1) + reproj(8) = 9
         n_frames = len(valid_frames)
         n_res = n_frames * 9
-        n_cams = 2
+        n_cams = 1
         n_cam_params = 6
-        pt_start = n_cams * n_cam_params  # = 12
+        pt_start = n_cams * n_cam_params  # = 6
         n_params = pt_start + n_pts * 3
         
         A_sparsity = lil_matrix((n_res, n_params), dtype=int)
@@ -383,24 +382,23 @@ class PinholeBootstrapP0:
             A_sparsity[base_res, idx_ptA:idx_ptA+3] = 1
             A_sparsity[base_res, idx_ptB:idx_ptB+3] = 1
             
-            # Reproj cam_i ptA/ptB
-            A_sparsity[base_res+1:base_res+3, 0:6] = 1
+            # Reproj cam_i ptA/ptB — cam_i is frozen (no state cols)
             A_sparsity[base_res+1:base_res+3, idx_ptA:idx_ptA+3] = 1
-            A_sparsity[base_res+3:base_res+5, 0:6] = 1
             A_sparsity[base_res+3:base_res+5, idx_ptB:idx_ptB+3] = 1
             
             # Reproj cam_j ptA/ptB
-            A_sparsity[base_res+5:base_res+7, 6:12] = 1
+            A_sparsity[base_res+5:base_res+7, 0:6] = 1
             A_sparsity[base_res+5:base_res+7, idx_ptA:idx_ptA+3] = 1
-            A_sparsity[base_res+7:base_res+9, 6:12] = 1
+            A_sparsity[base_res+7:base_res+9, 0:6] = 1
             A_sparsity[base_res+7:base_res+9, idx_ptB:idx_ptB+3] = 1
         
         # Residuals function (frozen intrinsics)
         self._res_call_count = 0 
         def residuals_func(x):
-            p_i = x[:6]
-            p_j = x[6:12]
-            pts = x[12:].reshape(-1, 3)
+            # cam_i is frozen at origin
+            p_i = np.zeros(6)
+            p_j = x[:6]
+            pts = x[6:].reshape(-1, 3)
             
             R_i, _ = cv2.Rodrigues(p_i[:3])
             t_i = p_i[3:6].reshape(3, 1)
@@ -483,12 +481,12 @@ class PinholeBootstrapP0:
         )
 
         
-        params_i_opt = result.x[:6]
-        params_j_opt = result.x[6:12]
-        pts_3d_opt = result.x[12:].reshape(-1, 3)
+        params_i_opt = np.zeros(6)  # frozen
+        params_j_opt = result.x[:6]
+        pts_3d_opt = result.x[6:].reshape(-1, 3)
         
         print(f"  BA cost: {result.cost:.2e}")
-        print(f"  cam_i moved: |t| = {np.linalg.norm(params_i_opt[3:6]):.4f} mm")
+        print(f"  cam_i: frozen at origin [0,0,0,0,0,0]")
         
         # Compute diagnostics
         report = self._compute_diagnostics(
@@ -502,8 +500,7 @@ class PinholeBootstrapP0:
         self._validate(report)
         
         print(f"\n[P0] Phase 1 Complete:")
-        print(f"  cam_{cam_i} rvec: [{params_i_opt[0]:.4f}, {params_i_opt[1]:.4f}, {params_i_opt[2]:.4f}]")
-        print(f"  cam_{cam_i} tvec: [{params_i_opt[3]:.2f}, {params_i_opt[4]:.2f}, {params_i_opt[5]:.2f}]")
+        print(f"  cam_{cam_i}: frozen at origin [0,0,0,0,0,0]")
         print(f"  cam_{cam_j} rvec: [{params_j_opt[0]:.4f}, {params_j_opt[1]:.4f}, {params_j_opt[2]:.4f}]")
         print(f"  cam_{cam_j} tvec: [{params_j_opt[3]:.2f}, {params_j_opt[4]:.2f}, {params_j_opt[5]:.2f}]")
         print(f"  Baseline: {report['baseline_mm']:.2f} mm")
