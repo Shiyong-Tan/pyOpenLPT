@@ -886,6 +886,25 @@ class TestBarrierTuning(unittest.TestCase):
         self.assertTrue(sch['early']['soft_on'], "Early stage should use soft barrier")
         self.assertFalse(sch['final']['soft_on'], "Final stage should not use soft barrier")
 
+    def test_barrier_schedule_wiring(self):
+        """Verify barrier schedule is wired and applied per stage in wand calibration BA."""
+        from modules.camera_calibration.wand_calibration.refraction_calibration_BA import RefractiveBAConfig
+        
+        cfg = RefractiveBAConfig()
+        sch = cfg.barrier_schedule
+        
+        # Verify early stage values
+        self.assertEqual(sch['early']['tau'], 0.1)
+        self.assertTrue(sch['early']['soft_on'])
+        
+        # Verify mid stage values
+        self.assertEqual(sch['mid']['tau'], 0.03)
+        self.assertTrue(sch['mid']['soft_on'])
+        
+        # Verify final stage values
+        self.assertEqual(sch['final']['tau'], 0.005)
+        self.assertFalse(sch['final']['soft_on'])
+
 
 class TestAdaptiveSigma(unittest.TestCase):
     """P3: Verify adaptive sigma recomputation at round boundaries."""
