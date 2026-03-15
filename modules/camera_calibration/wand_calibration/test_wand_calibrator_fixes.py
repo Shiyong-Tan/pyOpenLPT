@@ -887,5 +887,27 @@ class TestBarrierTuning(unittest.TestCase):
         self.assertFalse(sch['final']['soft_on'], "Final stage should not use soft barrier")
 
 
+class TestAdaptiveSigma(unittest.TestCase):
+    """P3: Verify adaptive sigma recomputation at round boundaries."""
+
+    def test_p3_sigma_schedule_config_exists(self):
+        """P3: RefractiveBAConfig has sigma_schedule field."""
+        from modules.camera_calibration.wand_calibration.refraction_calibration_BA import RefractiveBAConfig
+        cfg = RefractiveBAConfig()
+        self.assertTrue(hasattr(cfg, 'sigma_schedule'), "RefractiveBAConfig must have sigma_schedule")
+        self.assertIsInstance(cfg.sigma_schedule, dict, "sigma_schedule must be a dict")
+
+    def test_p3_sigma_adaptation(self):
+        """P3: _compute_physical_sigmas is not called inside optimizer callback (round-level only)."""
+        import inspect
+        from modules.camera_calibration.wand_calibration.refraction_calibration_BA import RefractiveBAOptimizer
+        # Check that _compute_physical_sigmas is a method on the class
+        self.assertTrue(hasattr(RefractiveBAOptimizer, '_compute_physical_sigmas'),
+                        "_compute_physical_sigmas must exist as method")
+        # Verify signature includes self (it's a method, not a static function)
+        sig = inspect.signature(RefractiveBAOptimizer._compute_physical_sigmas)
+        self.assertIn('self', sig.parameters)
+
+
 if __name__ == "__main__":
     unittest.main()

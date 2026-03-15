@@ -215,6 +215,7 @@ class RefractiveBAConfig:
         'mid': {'gate_scale': 0.3, 'beta_dir_scale': 0.3, 'tau': 0.03, 'soft_on': True},
         'final': {'gate_scale': 1.0, 'beta_dir_scale': 1.0, 'tau': 0.005, 'soft_on': False},
     })
+    sigma_schedule: Dict[str, float] = field(default_factory=dict)
 
     # Bounds for Round 4 refinement
     bounds_thick_pct: float = 0.05
