@@ -829,12 +829,16 @@ class PinholeBootstrapP0:
         
         all_cam_ids = sorted(cam_params.keys())
         n_cams = len(all_cam_ids)
-        cam_id_to_idx = {cid: i for i, cid in enumerate(all_cam_ids)}
+        first_cam_id = all_cam_ids[0]
+        free_cam_ids = all_cam_ids[1:]
+        n_free_cams = len(free_cam_ids)
+        free_cam_id_to_idx = {cid: i for i, cid in enumerate(free_cam_ids)}
         
         print(f"\n{'='*60}")
         print(f"[P0 Phase 3] Global BA with frozen intrinsics")
         print(f"{'='*60}")
         print(f"  Cameras: {all_cam_ids}")
+        print(f"  Gauge anchor: cam_{first_cam_id} fixed at [0,0,0,0,0,0]")
         print("  Frozen intrinsics: per-camera table values")
         
         # Collect valid frames (seen by at least 2 calibrated cameras)
@@ -894,14 +898,15 @@ class PinholeBootstrapP0:
         
         print(f"  Initial points: {n_pts}")
         
-        # Build state vector: [all_cams(n_cams*6), pts_3d(n_pts*3)]
+        # Build state vector: [free_cams(n_free_cams*6), pts_3d(n_pts*3)]
         n_cam_params = 6  # Only extrinsics
-        pt_start = n_cams * n_cam_params
+        pt_start = n_free_cams * n_cam_params
         
         x0 = np.zeros(pt_start + n_pts * 3)
         
-        for cid, params in cam_params.items():
-            idx = cam_id_to_idx[cid]
+        for cid in free_cam_ids:
+            idx = free_cam_id_to_idx[cid]
+            params = cam_params[cid]
             x0[idx * n_cam_params:(idx + 1) * n_cam_params] = params[:6]
         
         x0[pt_start:] = pts_3d_init.flatten()
@@ -930,7 +935,15 @@ class PinholeBootstrapP0:
             
             # Reprojection for each camera
             for cid in cams_in_frame:
-                cam_idx = cam_id_to_idx[cid]
+                if cid == first_cam_id:
+                    # Frozen camera contributes residual rows with point-only Jacobian terms.
+                    A_sparsity[ridx:ridx+2, idx_ptA:idx_ptA+3] = 1
+                    ridx += 2
+                    A_sparsity[ridx:ridx+2, idx_ptB:idx_ptB+3] = 1
+                    ridx += 2
+                    continue
+
+                cam_idx = free_cam_id_to_idx[cid]
                 cam_start = cam_idx * n_cam_params
                 
                 # ptA projection (2 residuals)
@@ -949,9 +962,11 @@ class PinholeBootstrapP0:
         self._phase3_res_count = 0
         def residuals_phase3(x):
             # Extract camera params
-            cams = {}
-            for cid in all_cam_ids:
-                idx = cam_id_to_idx[cid]
+            cams = {
+                first_cam_id: (np.eye(3), np.zeros((3, 1), dtype=np.float64))
+            }
+            for cid in free_cam_ids:
+                idx = free_cam_id_to_idx[cid]
                 p = x[idx * n_cam_params:(idx + 1) * n_cam_params]
                 R, _ = cv2.Rodrigues(p[:3])
                 t = p[3:6].reshape(3, 1)
@@ -981,18 +996,18 @@ class PinholeBootstrapP0:
                 
                 # Reprojection for each camera
                 for cid in cams_in_frame:
-                    R, t = cams[cid]
+                    R_cam, t_cam = cams[cid]
                     uvA, uvB = observations[fid][cid]
                     
                     # Project ptA
-                    proj_A = self._project(ptA, R, t, K_by_cam[cid])
+                    proj_A = self._project(ptA, R_cam, t_cam, K_by_cam[cid])
                     diffA = proj_A - uvA
                     res.extend(diffA.tolist())
                     sq_err_proj += float(np.sum(diffA**2))
                     n_proj += 2
                     
                     # Project ptB
-                    proj_B = self._project(ptB, R, t, K_by_cam[cid])
+                    proj_B = self._project(ptB, R_cam, t_cam, K_by_cam[cid])
                     diffB = proj_B - uvB
                     res.extend(diffB.tolist())
                     sq_err_proj += float(np.sum(diffB**2))
@@ -1038,9 +1053,11 @@ class PinholeBootstrapP0:
         print(f"  Phase 3 cost: {result.cost:.2e}")
         
         # Extract optimized params
-        cam_params_opt = {}
-        for cid in all_cam_ids:
-            idx = cam_id_to_idx[cid]
+        cam_params_opt = {
+            first_cam_id: np.zeros(6, dtype=np.float64)
+        }
+        for cid in free_cam_ids:
+            idx = free_cam_id_to_idx[cid]
             cam_params_opt[cid] = result.x[idx * n_cam_params:(idx + 1) * n_cam_params]
         
         # Compute final RMS using wand residuals from interleaved frame blocks

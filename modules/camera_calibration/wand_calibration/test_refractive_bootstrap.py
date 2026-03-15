@@ -651,3 +651,66 @@ class TestPhase1Gauge:
         )
 
         assert np.allclose(params_i_opt, np.zeros(6), atol=1e-10)
+
+
+class TestPhase3Gauge:
+    def test_phase3_first_camera_frozen(self, monkeypatch):
+        """After Phase 3 BA, first camera must remain exactly [0,0,0,0,0,0]."""
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+
+        cam_ids = [0, 1, 2]
+        n_frames = 12
+        observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]] = {}
+        for fid in range(n_frames):
+            observations[fid] = {}
+            for cid in cam_ids:
+                u_base = 300.0 + 4.0 * fid + 12.0 * cid
+                v_base = 260.0 + 3.0 * fid - 7.0 * cid
+                observations[fid][cid] = (
+                    np.array([u_base, v_base], dtype=np.float64),
+                    np.array([u_base + 15.0, v_base + 8.0], dtype=np.float64),
+                )
+
+        camera_settings = make_camera_settings(n_cameras=len(cam_ids))
+
+        cam_params = {
+            0: np.zeros(6, dtype=np.float64),
+            1: np.array([0.0, 0.02, -0.01, 120.0, 5.0, 10.0], dtype=np.float64),
+            2: np.array([0.01, -0.03, 0.02, -90.0, 15.0, 20.0], dtype=np.float64),
+        }
+        first_cam_id = min(cam_params.keys())
+
+        class _FakeResult:
+            def __init__(self, x):
+                self.x = x
+                self.cost = float(np.sum(x**2))
+
+        def fake_least_squares(_fun, x0, **_kwargs):
+            x = x0.copy()
+            # Force first camera slot in state vector to non-zero.
+            # Before W1d fix this leaks into cam_0 output; after fix cam_0 is frozen.
+            x[:6] = np.array([0.25, -0.5, 0.75, 5.0, -6.0, 7.0], dtype=np.float64)
+            if x.size >= 12:
+                x[6:12] = np.array([-0.15, 0.2, -0.35, -3.0, 4.0, -5.0], dtype=np.float64)
+            return _FakeResult(x)
+
+        monkeypatch.setattr(
+            "modules.camera_calibration.wand_calibration.refractive_bootstrap.least_squares",
+            fake_least_squares,
+        )
+
+        cam_params_opt = bootstrap.run_phase3(
+            cam_params=cam_params,
+            observations=observations,
+            camera_settings=camera_settings,
+        )
+
+        assert np.allclose(cam_params_opt[first_cam_id], np.zeros(6), atol=1e-10)
+
+        other_cam_ids = [cid for cid in sorted(cam_params_opt.keys()) if cid != first_cam_id]
+        assert other_cam_ids, "Expected at least one non-frozen camera"
+        for cid in other_cam_ids:
+            validate_camera_params(cam_params_opt[cid], label=f"cam_{cid}")
+        assert any(
+            np.linalg.norm(cam_params_opt[cid]) > 1e-12 for cid in other_cam_ids
+        ), "Other cameras should remain optimizable (non-zero extrinsics)"
