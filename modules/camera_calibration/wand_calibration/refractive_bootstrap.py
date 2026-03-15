@@ -315,7 +315,12 @@ class PinholeBootstrapP0:
         
         # Triangulate all points
         pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i_norm.T, pts_j_norm.T)
-        pts_3d = (pts_4d_hom[:3] / pts_4d_hom[3]).T  # (N, 3)
+        # Guard homogeneous division: near-zero or invalid w indicates point at infinity/unstable geometry.
+        w_hom = pts_4d_hom[3]
+        pts_3d = np.full((pts_4d_hom.shape[1], 3), np.nan, dtype=np.float64)
+        valid_w = w_hom > 1e-8
+        if np.any(valid_w):
+            pts_3d[valid_w] = (pts_4d_hom[:3, valid_w] / w_hom[valid_w]).T  # (N, 3)
         
         # Compute wand lengths
         wand_lengths = []
@@ -590,8 +595,11 @@ class PinholeBootstrapP0:
             pts_4d_B = cv2.triangulatePoints(P_i, P_j, 
                                              uvB_i.reshape(2, 1), uvB_j.reshape(2, 1))
             
-            ptA = (pts_4d_A[:3] / pts_4d_A[3]).flatten()
-            ptB = (pts_4d_B[:3] / pts_4d_B[3]).flatten()
+            # Guard homogeneous division: near-zero or invalid w indicates point at infinity/unstable geometry.
+            w_A = float(pts_4d_A[3, 0])
+            w_B = float(pts_4d_B[3, 0])
+            ptA = (pts_4d_A[:3] / w_A).flatten() if w_A > 1e-8 else np.full(3, np.nan, dtype=np.float64)
+            ptB = (pts_4d_B[:3] / w_B).flatten() if w_B > 1e-8 else np.full(3, np.nan, dtype=np.float64)
             
             wand_lengths.append(np.linalg.norm(ptB - ptA))
             
@@ -796,8 +804,11 @@ class PinholeBootstrapP0:
             pts_4d_B = cv2.triangulatePoints(P_i, P_j, 
                                              uvB_i.reshape(2, 1), uvB_j.reshape(2, 1))
             
-            XA = (pts_4d_A[:3] / pts_4d_A[3]).flatten()
-            XB = (pts_4d_B[:3] / pts_4d_B[3]).flatten()
+            # Guard homogeneous division: near-zero or invalid w indicates point at infinity/unstable geometry.
+            w_A = float(pts_4d_A[3, 0])
+            w_B = float(pts_4d_B[3, 0])
+            XA = (pts_4d_A[:3] / w_A).flatten() if w_A > 1e-8 else np.full(3, np.nan, dtype=np.float64)
+            XB = (pts_4d_B[:3] / w_B).flatten() if w_B > 1e-8 else np.full(3, np.nan, dtype=np.float64)
             
             points_3d[fid] = (XA, XB)
         
@@ -870,8 +881,11 @@ class PinholeBootstrapP0:
             pts_4d_A = cv2.triangulatePoints(P1, P2, uvA_1.reshape(2, 1), uvA_2.reshape(2, 1))
             pts_4d_B = cv2.triangulatePoints(P1, P2, uvB_1.reshape(2, 1), uvB_2.reshape(2, 1))
             
-            ptA = (pts_4d_A[:3] / pts_4d_A[3]).flatten()
-            ptB = (pts_4d_B[:3] / pts_4d_B[3]).flatten()
+            # Guard homogeneous division: near-zero or invalid w indicates point at infinity/unstable geometry.
+            w_A = float(pts_4d_A[3, 0])
+            w_B = float(pts_4d_B[3, 0])
+            ptA = (pts_4d_A[:3] / w_A).flatten() if w_A > 1e-8 else np.full(3, np.nan, dtype=np.float64)
+            ptB = (pts_4d_B[:3] / w_B).flatten() if w_B > 1e-8 else np.full(3, np.nan, dtype=np.float64)
             
             pts_3d_init.append(ptA)
             pts_3d_init.append(ptB)

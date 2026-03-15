@@ -131,9 +131,9 @@ conda run -n OpenLPT python -m pytest \
    - Parallel: YES (independent of 1b)
    - Commit: `"fix: correct Phase 3 RMS residual slicing to separate wand from reproj"`
 
-- [ ] **W1b**: Fix homogeneous division unguarded (4 locations: 305, 580-581, 786-787, 860-861)
-  - Parallel: YES (independent of 1a)
-  - Commit: `"fix: guard homogeneous division in triangulation against w≈0"`
+- [x] **W1b**: Fix homogeneous division unguarded (4 locations: 305, 580-581, 786-787, 860-861)
+   - Parallel: YES (independent of 1a)
+   - Commit: `"fix: guard homogeneous division in triangulation against w≈0"`
 
 - [ ] **W1c**: Fix Phase 1 gauge freedom (exclude cam_i from state vector)
   - Parallel: NO (blocks 1d, 1e)

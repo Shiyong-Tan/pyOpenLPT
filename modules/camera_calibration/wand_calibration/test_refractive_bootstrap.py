@@ -30,7 +30,10 @@ import numpy as np
 from typing import Dict, Tuple, List
 from dataclasses import dataclass
 
-from modules.camera_calibration.wand_calibration.refractive_bootstrap import PinholeBootstrapP0
+from modules.camera_calibration.wand_calibration.refractive_bootstrap import (
+    PinholeBootstrapP0,
+    PinholeBootstrapP0Config,
+)
 
 # Import bootstrap classes (ensure these resolve correctly)
 # Note: If BootstrapObservations/FrameObservations don't exist as formal classes,
@@ -544,3 +547,73 @@ def test_phase3_rms_residual_slicing(phase3_data_fixture):
     assert np.isclose(fixed_rms, expected_rms), (
         f"Fixed RMS mismatch: got {fixed_rms}, expected {expected_rms}"
     )
+
+
+def test_homogeneous_division_guarded(monkeypatch):
+    """W1b: Homogeneous division must guard near-zero w to avoid inf outputs."""
+    bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+
+    observations = {
+        0: {
+            0: (np.array([100.0, 120.0]), np.array([130.0, 150.0])),
+            1: (np.array([102.0, 122.0]), np.array([132.0, 152.0])),
+        }
+    }
+    camera_settings = make_camera_settings(n_cameras=2)
+    params_i = np.zeros(6, dtype=np.float64)
+    params_j = np.array([0.0, 0.0, 0.0, 120.0, 0.0, 0.0], dtype=np.float64)
+
+    # Scenario 1 (happy path): w > 1e-8 should produce correct Euclidean points.
+    happy_seq = [
+        np.array([[4.0], [8.0], [12.0], [2.0]], dtype=np.float64),
+        np.array([[5.0], [10.0], [15.0], [5.0]], dtype=np.float64),
+    ]
+
+    def fake_triangulate_happy(_P1, _P2, _uv1, _uv2):
+        return happy_seq.pop(0)
+
+    monkeypatch.setattr(
+        "modules.camera_calibration.wand_calibration.refractive_bootstrap.cv2.triangulatePoints",
+        fake_triangulate_happy,
+    )
+
+    points_happy = bootstrap.triangulate_all_points(
+        cam_i=0,
+        cam_j=1,
+        params_i=params_i,
+        params_j=params_j,
+        observations=observations,
+        camera_settings=camera_settings,
+    )
+
+    XA_happy, XB_happy = points_happy[0]
+    assert np.allclose(XA_happy, np.array([2.0, 4.0, 6.0]))
+    assert np.allclose(XB_happy, np.array([1.0, 2.0, 3.0]))
+
+    # Scenario 2 (edge): w ~= 0 must not produce inf and must be handled as NaN/sentinel.
+    edge_seq = [
+        np.array([[1.0], [2.0], [3.0], [0.0]], dtype=np.float64),
+        np.array([[6.0], [9.0], [12.0], [3.0]], dtype=np.float64),
+    ]
+
+    def fake_triangulate_edge(_P1, _P2, _uv1, _uv2):
+        return edge_seq.pop(0)
+
+    monkeypatch.setattr(
+        "modules.camera_calibration.wand_calibration.refractive_bootstrap.cv2.triangulatePoints",
+        fake_triangulate_edge,
+    )
+
+    points_edge = bootstrap.triangulate_all_points(
+        cam_i=0,
+        cam_j=1,
+        params_i=params_i,
+        params_j=params_j,
+        observations=observations,
+        camera_settings=camera_settings,
+    )
+
+    XA_edge, XB_edge = points_edge[0]
+    assert np.all(np.isfinite(XB_edge))
+    assert np.isnan(XA_edge).all(), "Near-zero homogeneous w should map to NaN sentinel"
+    assert not np.isinf(XA_edge).any(), "Guard must avoid inf from homogeneous divide"
