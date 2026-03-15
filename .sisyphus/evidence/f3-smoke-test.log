@@ -1,0 +1,8 @@
+[WARN] smoke test OK
+All modules import OK
+  RefractiveBAConfig.sigma_schedule     = {}
+  RefractiveBAConfig.tolerance_schedule = {'loop_planes': {'ftol': 0.0005, 'xtol': 1e-05, 'gtol': 1e-05}, 'loop_cams': {'ftol': 0.0005, 'xtol': 1e-05, 'gtol': 1e-05}, 'joint': {'ftol': 1e-05, 'xtol': 1e-05, 'gtol': 1e-05}, 'final_refined': {'ftol': 1e-05, 'xtol': 1e-05, 'gtol': 1e-05}}
+  reporter.warning() present: OK
+  RefractiveWandCalibrator importable: OK
+  PlaneInitializer importable: OK
+F3 SMOKE TEST: PASS

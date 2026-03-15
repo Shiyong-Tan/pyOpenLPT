@@ -1,0 +1,53 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.14, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\tan_s\miniconda3\envs\OpenLPT\python.exe
+cachedir: .pytest_cache
+rootdir: D:\0.Code\OpenLPTGUI\OpenLPT
+configfile: pyproject.toml
+collecting ... collected 42 items
+
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizerUnit::test_constructor_initializes_state PASSED [  2%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizerUnit::test_evaluate_residuals PASSED [  4%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizerUnit::test_synthetic_cloud_radii PASSED [  7%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestFactoryFunctions::test_make_cam_params PASSED [  9%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestFactoryFunctions::test_make_minimal_dataset PASSED [ 11%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestFactoryFunctions::test_make_window_media PASSED [ 14%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestFactoryFunctions::test_make_window_planes PASSED [ 16%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestValidateRadii::test_non_finite_raises PASSED [ 19%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestValidateRadii::test_non_positive_raises PASSED [ 21%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestValidateRadii::test_out_of_range_raises PASSED [ 23%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestValidateRadii::test_valid_radii PASSED [ 26%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestValidateRadii::test_wrong_order_raises PASSED [ 28%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestCheckOptimizationResult::test_status_0 PASSED [ 30%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestCheckOptimizationResult::test_status_ge_1 PASSED [ 33%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestCheckOptimizationResult::test_status_neg1 PASSED [ 35%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_all_positive_statuses_accepted 
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_all_positive_statuses_accepted PASSED [ 38%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_b3_bundle_status_0_warning PASSED [ 40%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_b3_bundle_status_1_accepted PASSED [ 42%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_b3_bundle_status_2_accepted PASSED [ 45%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_b3_bundle_status_3_accepted PASSED [ 47%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_b3_bundle_status_4_accepted PASSED [ 50%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_b3_bundle_status_minus1_error PASSED [ 52%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_b3_sequence_status_0_warning PASSED [ 54%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_b3_sequence_status_1_accepted PASSED [ 57%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_b3_sequence_status_minus1_error PASSED [ 59%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_status_0_not_raising PASSED [ 61%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_status_minus1_not_accepted 
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAOptimizationStatus::test_status_minus1_not_accepted PASSED [ 64%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestBuildOptimizerForTest::test_returns_optimizer PASSED [ 66%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRobustPlanePointInit::test_median_of_points PASSED [ 69%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRobustPlanePointInit::test_single_point PASSED [ 71%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestPlaneInitialization::test_p2_robust_median PASSED [ 73%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestPlaneInitialization::test_p2_single_point_still_works PASSED [ 76%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestWandCalibratorB5Fixes::test_b5_defaults_fallback PASSED [ 78%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveOptimizerB1Fixes::test_b1_baseline_geometric_consistency PASSED [ 80%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveOptimizerB1Fixes::test_b1_plane_point_uses_new_normal PASSED [ 83%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAStatusValidation::test_b3_check_optimization_result_contract PASSED [ 85%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestRefractiveBAStatusValidation::test_b3_status_validation_exists_in_source PASSED [ 88%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestBarrierTuning::test_p1_barrier_profile_applied PASSED [ 90%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestAdaptiveSigma::test_p3_sigma_adaptation PASSED [ 92%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestAdaptiveSigma::test_p3_sigma_schedule_config_exists PASSED [ 95%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestToleranceTuning::test_p4_per_stage_tolerance PASSED [ 97%]
+modules/camera_calibration/wand_calibration/test_wand_calibrator_fixes.py::TestToleranceTuning::test_p4_tolerance_schedule_config_exists PASSED [100%]
+
+==================== 42 passed, 9 subtests passed in 0.96s ====================

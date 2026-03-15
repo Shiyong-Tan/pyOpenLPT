@@ -500,7 +500,6 @@ class PlaneInitializer:
                 print(f"  plane_pt (median init) = {plane_pt.round(2)}")
                 print(f"  depth_med = {depth_med:.1f} mm, midpoint d0 = {d0_mm:.1f} mm")
                 print(f"  n_win (axis-parallel init) = {n_win.round(4)}")
-                print(f"  plane_pt (midpoint init) = {plane_pt.round(2)}")
 
             def compute_score(n_test):
                 cams_ok = 0
