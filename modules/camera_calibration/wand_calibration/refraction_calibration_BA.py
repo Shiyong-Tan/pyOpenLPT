@@ -211,9 +211,9 @@ class RefractiveBAConfig:
     beta_side_soft: float = 100.0   # Soft floor weight when gate is NOT active (defaults to ON)
     barrier_continuation_enabled: bool = True
     barrier_schedule: Dict[str, Dict[str, object]] = field(default_factory=lambda: {
-        'early': {'gate_scale': 0.1, 'beta_dir_scale': 0.1, 'tau': 0.05, 'soft_on': True},
-        'mid': {'gate_scale': 0.5, 'beta_dir_scale': 0.5, 'tau': 0.02, 'soft_on': True},
-        'final': {'gate_scale': 1.0, 'beta_dir_scale': 1.0, 'tau': 0.01, 'soft_on': False},
+        'early': {'gate_scale': 0.05, 'beta_dir_scale': 0.05, 'tau': 0.1, 'soft_on': True},
+        'mid': {'gate_scale': 0.3, 'beta_dir_scale': 0.3, 'tau': 0.03, 'soft_on': True},
+        'final': {'gate_scale': 1.0, 'beta_dir_scale': 1.0, 'tau': 0.005, 'soft_on': False},
     })
 
     # Bounds for Round 4 refinement
@@ -1987,6 +1987,14 @@ class RefractiveBAOptimizer:
             self.reporter.detail(f"  Termination: {reason} (nfev={nfev_str})")
             if message:
                 self.reporter.detail(f"  Message: {message}")
+            if status == -1:
+                raise RuntimeError(
+                    f"[BA bundle] least_squares failed (status=-1): {message}"
+                )
+            elif status == 0:
+                self.reporter.warning(
+                    f"[BA bundle] least_squares budget exhausted (status=0): {message}. Using partial result."
+                )
 
         planes_final, cams_final, media_final, points_final = self._unpack_bundle_params(res.x, base_layout, full_layout)
         _, S_rayF, S_lenF, _, _, S_projF, N_projF = self.evaluate_residuals(
@@ -2282,6 +2290,14 @@ class RefractiveBAOptimizer:
             self.reporter.detail(f"  Termination: {reason} (nfev={nfev_str})")
             if message:
                 self.reporter.detail(f"  Message: {message}")
+            if status == -1:
+                raise RuntimeError(
+                    f"[BA sequence] least_squares failed (status=-1): {message}"
+                )
+            elif status == 0:
+                self.reporter.warning(
+                    f"[BA sequence] least_squares budget exhausted (status=0): {message}. Using partial result."
+                )
 
             if layout and hasattr(res, 'x'):
                 cam_deltas = {}
