@@ -216,6 +216,12 @@ class RefractiveBAConfig:
         'final': {'gate_scale': 1.0, 'beta_dir_scale': 1.0, 'tau': 0.005, 'soft_on': False},
     })
     sigma_schedule: Dict[str, float] = field(default_factory=dict)
+    tolerance_schedule: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        'loop_planes': {'ftol': 5e-4, 'xtol': 1e-5, 'gtol': 1e-5},
+        'loop_cams': {'ftol': 5e-4, 'xtol': 1e-5, 'gtol': 1e-5},
+        'joint': {'ftol': 1e-5, 'xtol': 1e-5, 'gtol': 1e-5},
+        'final_refined': {'ftol': 1e-5, 'xtol': 1e-5, 'gtol': 1e-5},
+    })
 
     # Bounds for Round 4 refinement
     bounds_thick_pct: float = 0.05
@@ -2934,6 +2940,9 @@ class RefractiveBAOptimizer:
             self._compute_physical_sigmas()
             
             plane_d_bounds = self._build_step_a_plane_d_bounds(loop_iter)
+            loop_planes_tol = self.config.tolerance_schedule.get(
+                'loop_planes', {'ftol': 5e-4, 'xtol': 1e-5, 'gtol': 1e-5}
+            )
             
             self.reporter.header(f"Loop {loop_iter} - Step A: Optimize Planes (Bounds: +/- 2.5 deg)")
             self._print_plane_diagnostics(f"Pre-Loop {loop_iter} Planes")
@@ -2954,9 +2963,9 @@ class RefractiveBAOptimizer:
                 limit_plane_d_mm=b_plane_strict[1],
                 limit_plane_angle_rad=b_plane_strict[0],
                 plane_d_bounds=plane_d_bounds, # [NEW] Pass bounds
-                ftol=5e-4,
-                xtol=1e-5,
-                gtol=1e-5,
+                ftol=loop_planes_tol['ftol'],
+                xtol=loop_planes_tol['xtol'],
+                gtol=loop_planes_tol['gtol'],
                 loss=loss_plane
             )
             self._print_plane_diagnostics(f"Loop {loop_iter} Planes")
@@ -2992,6 +3001,9 @@ class RefractiveBAOptimizer:
             # Step B: Optimize Cameras (Fixed Planes) - Free Bounds
             self.reporter.header(f"Loop {loop_iter} - Step B: Optimize Cameras (Free Bounds)")
             b_cam_free = (np.deg2rad(180.0), 2000.0)
+            loop_cams_tol = self.config.tolerance_schedule.get(
+                'loop_cams', {'ftol': 5e-4, 'xtol': 1e-5, 'gtol': 1e-5}
+            )
             
             self._optimize_generic(
                 mode=f'loop_{loop_iter}_cams', 
@@ -3003,9 +3015,9 @@ class RefractiveBAOptimizer:
                 limit_trans_mm=b_cam_free[1],
                 limit_plane_d_mm=0.0,
                 limit_plane_angle_rad=0.0,
-                ftol=5e-4,
-                xtol=1e-5,
-                gtol=1e-5,
+                ftol=loop_cams_tol['ftol'],
+                xtol=loop_cams_tol['xtol'],
+                gtol=loop_cams_tol['gtol'],
                 loss=loss_cam
             )
             self._print_plane_diagnostics(f"Loop {loop_iter} Cams")
@@ -3030,6 +3042,9 @@ class RefractiveBAOptimizer:
             limit_tvec = 50.0
 
             print("  Bounds: rvec < 20deg, plane_d < 50mm, plane_ang < 10deg, tvec < 50mm")
+            joint_tol = self.config.tolerance_schedule.get(
+                'joint', {'ftol': 1e-5, 'xtol': 1e-5, 'gtol': 1e-5}
+            )
 
             joint_kwargs = dict(
                 mode='joint',
@@ -3041,9 +3056,9 @@ class RefractiveBAOptimizer:
                 limit_trans_mm=limit_tvec,
                 limit_plane_d_mm=limit_plane_d,
                 limit_plane_angle_rad=limit_plane_ang,
-                ftol=1e-5,
-                xtol=1e-5,
-                gtol=1e-5,
+                ftol=joint_tol['ftol'],
+                xtol=joint_tol['xtol'],
+                gtol=joint_tol['gtol'],
                 loss=self.config.loss_joint,
                 max_nfev=50,
             )
@@ -3077,6 +3092,10 @@ class RefractiveBAOptimizer:
             if enable_k1 or enable_k2:
                 print(f"  Distortion: optimize k1={enable_k1}, k2={enable_k2} (|k| <= {self.config.bounds_dist_abs:.3f})")
 
+            final_refined_tol = self.config.tolerance_schedule.get(
+                'final_refined', {'ftol': 1e-5, 'xtol': 1e-5, 'gtol': 1e-5}
+            )
+
             final_kwargs = dict(
                 mode='final_refined',
                 description="Optimizing plane and all camera parameters ...",
@@ -3091,9 +3110,9 @@ class RefractiveBAOptimizer:
                 limit_trans_mm=limit_tvec,
                 limit_plane_d_mm=limit_plane_d,
                 limit_plane_angle_rad=limit_plane_ang,
-                ftol=1e-5,
-                xtol=1e-5,
-                gtol=1e-5,
+                ftol=final_refined_tol['ftol'],
+                xtol=final_refined_tol['xtol'],
+                gtol=final_refined_tol['gtol'],
                 loss=self.config.loss_round4,
                 max_nfev=100,
             )

@@ -909,5 +909,32 @@ class TestAdaptiveSigma(unittest.TestCase):
         self.assertIn('self', sig.parameters)
 
 
+class TestToleranceTuning(unittest.TestCase):
+    """P4: Verify per-stage solver tolerance configuration."""
+
+    def test_p4_tolerance_schedule_config_exists(self):
+        """P4: RefractiveBAConfig has tolerance_schedule field."""
+        from modules.camera_calibration.wand_calibration.refraction_calibration_BA import RefractiveBAConfig
+
+        cfg = RefractiveBAConfig()
+        self.assertTrue(hasattr(cfg, 'tolerance_schedule'), "RefractiveBAConfig must have tolerance_schedule")
+        self.assertIsInstance(cfg.tolerance_schedule, dict)
+
+    def test_p4_per_stage_tolerance(self):
+        """P4: Tolerance schedule stages have tighter tolerances for later stages."""
+        from modules.camera_calibration.wand_calibration.refraction_calibration_BA import RefractiveBAConfig
+
+        cfg = RefractiveBAConfig()
+        tol = cfg.tolerance_schedule
+        if 'loop_planes' in tol and 'final_refined' in tol:
+            # Final stage should have tighter (smaller) ftol
+            self.assertLessEqual(tol['final_refined']['ftol'], tol['loop_planes']['ftol'])
+        # Ensure all stages have required keys
+        for stage, vals in tol.items():
+            self.assertIn('ftol', vals, f"Stage {stage} missing ftol")
+            self.assertIn('xtol', vals, f"Stage {stage} missing xtol")
+            self.assertIn('gtol', vals, f"Stage {stage} missing gtol")
+
+
 if __name__ == "__main__":
     unittest.main()
