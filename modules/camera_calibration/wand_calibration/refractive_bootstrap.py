@@ -420,7 +420,23 @@ class PinholeBootstrapP0:
         if len(valid_lengths) < 5:
             raise RuntimeError("[P0 FAIL] Triangulation failed to produce valid structure")
         
-        median_length = np.median(valid_lengths)
+        # W3b: IQR-based robust scale recovery
+        # Use interquartile range to filter outliers before computing median
+        q1 = np.percentile(valid_lengths, 25)
+        q3 = np.percentile(valid_lengths, 75)
+        iqr = q3 - q1
+        iqr_lower = q1 - 1.5 * iqr
+        iqr_upper = q3 + 1.5 * iqr
+        
+        # Filter to inliers within IQR bounds
+        inlier_lengths = valid_lengths[(valid_lengths >= iqr_lower) & (valid_lengths <= iqr_upper)]
+        
+        if len(inlier_lengths) < 3:
+            # Fallback to median if too few inliers
+            median_length = np.median(valid_lengths)
+        else:
+            median_length = np.median(inlier_lengths)
+        
         scale_factor = self.config.wand_length_mm / median_length
         
         # Apply scale to translation
