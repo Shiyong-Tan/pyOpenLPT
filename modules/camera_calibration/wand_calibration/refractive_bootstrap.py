@@ -1,4 +1,3 @@
-# pyright: reportMissingImports=false, reportAttributeAccessIssue=false, reportMissingTypeArgument=false, reportUninitializedInstanceVariable=false
 """
 Refractive Bootstrap (P0 Stage)
 ===============================
@@ -17,15 +16,12 @@ KEY RULES:
 - Pair selection is handled externally via precalibrate
 """
 
-import logging
 import numpy as np
 from scipy.optimize import least_squares
 import cv2
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import re
-
-logger = logging.getLogger(__name__)
 
 
 def select_best_pair_via_precalib(base_calibrator, wand_len_mm: float, initial_focal_px: float) -> Optional[Tuple[int, int]]:
@@ -170,27 +166,6 @@ class PinholeBootstrapP0Config:
     ui_focal_px: float = 9000.0  # UI-provided focal length (FROZEN)
     ftol: float = 1e-6
     xtol: float = 1e-6
-    
-    def __post_init__(self):
-        """Validate configuration fields."""
-        if self.wand_length_mm <= 0:
-            raise ValueError(f"wand_length_mm must be > 0, got {self.wand_length_mm}")
-        if self.ui_focal_px <= 0:
-            raise ValueError(f"ui_focal_px must be > 0, got {self.ui_focal_px}")
-        if self.ftol <= 0:
-            raise ValueError(f"ftol must be > 0, got {self.ftol}")
-        if self.xtol <= 0:
-            raise ValueError(f"xtol must be > 0, got {self.xtol}")
-        
-        # Check for NaN/inf in all float fields
-        if not np.isfinite(self.wand_length_mm):
-            raise ValueError(f"wand_length_mm must be finite, got {self.wand_length_mm}")
-        if not np.isfinite(self.ui_focal_px):
-            raise ValueError(f"ui_focal_px must be finite, got {self.ui_focal_px}")
-        if not np.isfinite(self.ftol):
-            raise ValueError(f"ftol must be finite, got {self.ftol}")
-        if not np.isfinite(self.xtol):
-            raise ValueError(f"xtol must be finite, got {self.xtol}")
 
 
 class PinholeBootstrapP0:
@@ -221,19 +196,6 @@ class PinholeBootstrapP0:
         cx, cy = w / 2.0, h / 2.0
         K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
         return K, f, cx, cy
-
-    @staticmethod
-    def _compute_phase3_wand_rms(final_res: np.ndarray, n_frames: int, n_cameras: int) -> float:
-        """Compute Phase 3 wand RMS from interleaved per-frame residual layout.
-
-        Residual blocks are laid out per frame as:
-            [wand_k, reproj_k_cam0_uvA(2), reproj_k_cam0_uvB(2), ...]
-        so wand residuals are every ``(1 + 2*n_cameras)`` elements.
-        """
-        residuals_per_frame = 1 + 2 * n_cameras
-        wand_indices = np.arange(n_frames, dtype=np.int64) * residuals_per_frame
-        wand_residuals = final_res[wand_indices]
-        return float(np.sqrt(np.mean(wand_residuals**2)))
         
     def run(
         self,
@@ -270,8 +232,8 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("P0 Pair Init", -1, 0, 0, 0)
-            except Exception as e:
-                logger.debug("progress_callback error (P0 Pair Init): %s", e)
+            except:
+                pass
         
         # Collect valid frames and points
         valid_frames = self._collect_valid_frames(observations, cam_i, cam_j)
@@ -300,13 +262,13 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except Exception as e:
-                logger.debug("progress_callback error (Essential Matrix): %s", e)
+            except:
+                pass
 
         # Step 1: Essential Matrix (normalized rays, supports different intrinsics)
         pts_i_norm = cv2.undistortPoints(pts_i.reshape(-1, 1, 2), K_i, None).reshape(-1, 2)
         pts_j_norm = cv2.undistortPoints(pts_j.reshape(-1, 1, 2), K_j, None).reshape(-1, 2)
-        E, mask_ess = cv2.findEssentialMat(
+        E, mask = cv2.findEssentialMat(
             pts_i_norm,
             pts_j_norm,
             focal=1.0,
@@ -318,94 +280,29 @@ class PinholeBootstrapP0:
         
         if E is None or E.shape != (3, 3):
             raise RuntimeError("[P0 FAIL] Essential Matrix computation failed")
-
-        if mask_ess is None:
-            raise RuntimeError("[P0 FAIL] Essential Matrix did not return an inlier mask")
-
-        mask_ess_flat = np.asarray(mask_ess).reshape(-1) > 0
-        if mask_ess_flat.shape[0] != len(pts_i_norm):
-            raise RuntimeError(
-                f"[P0 FAIL] Essential mask shape mismatch: {mask_ess_flat.shape[0]} vs {len(pts_i_norm)}"
-            )
-
-        inlier_idx_ess = np.where(mask_ess_flat)[0]
-        if len(inlier_idx_ess) < 8:
-            raise RuntimeError(
-                f"[P0 FAIL] Insufficient inliers from essential matrix: {len(inlier_idx_ess)} < 8"
-            )
-
-        pts_i_ess = pts_i_norm[inlier_idx_ess]
-        pts_j_ess = pts_j_norm[inlier_idx_ess]
         
         # Step 2: Recover Pose (R, t)
-        n_inliers_pose, R_rel, t_rel, mask_pose = cv2.recoverPose(
-            E, pts_i_ess, pts_j_ess, focal=1.0, pp=(0.0, 0.0)
+        n_inliers, R_rel, t_rel, mask_pose = cv2.recoverPose(
+            E, pts_i_norm, pts_j_norm, focal=1.0, pp=(0.0, 0.0)
         )
-
-        if mask_pose is None:
-            raise RuntimeError("[P0 FAIL] recoverPose did not return inlier mask")
-
-        mask_pose_flat = np.asarray(mask_pose).reshape(-1) > 0
-        if mask_pose_flat.shape[0] != len(inlier_idx_ess):
-            raise RuntimeError(
-                f"[P0 FAIL] recoverPose mask shape mismatch: {mask_pose_flat.shape[0]} vs {len(inlier_idx_ess)}"
-            )
-
-        # Combined inlier mask in original correspondence indexing.
-        combined_mask = np.zeros(len(pts_i_norm), dtype=bool)
-        combined_mask[inlier_idx_ess] = mask_pose_flat
-        n_inliers = int(np.sum(combined_mask))
-
-        if n_inliers < 8:
-            raise RuntimeError(
-                f"[P0 FAIL] Insufficient inliers after pose recovery: {n_inliers} < 8"
-            )
         
-        print(f"  RANSAC inliers: {n_inliers} / {len(pts_i)} ({100.0 * n_inliers / max(1, len(pts_i)):.1f}%)")
-
-        # Build per-frame inlier summary (2 correspondences per frame: A and B endpoint).
-        frame_inlier_flags = []
-        for frame_idx, fid in enumerate(valid_frames):
-            corr_start = frame_idx * 2
-            frame_inliers = int(np.sum(combined_mask[corr_start:corr_start + 2]))
-            frame_inlier_flags.append(frame_inliers == 2)
-            print(f"    Frame {fid}: {frame_inliers}/2 inliers ({50.0 * frame_inliers:.1f}%)")
-
-        valid_frames_inlier = [fid for idx, fid in enumerate(valid_frames) if frame_inlier_flags[idx]]
-        if len(valid_frames_inlier) < 5:
-            raise RuntimeError(
-                f"[P0 FAIL] Insufficient inlier frames after RANSAC filtering: {len(valid_frames_inlier)} < 5"
-            )
-
-        inlier_to_original_idx = []
-        for idx, keep in enumerate(frame_inlier_flags):
-            if keep:
-                inlier_to_original_idx.extend([idx * 2, idx * 2 + 1])
-        inlier_to_original_idx = np.array(inlier_to_original_idx, dtype=np.int64)
+        print(f"  Inliers: {n_inliers} / {len(pts_i)}")
         
         # Step 3: Triangulate to compute scale
         print(f"\n[P0] Step 2: Triangulation & Scale Recovery...")
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except Exception as e:
-                logger.debug("progress_callback error (Triangulation): %s", e)
+            except:
+                pass
         
         # Projection matrices (cam_i at origin)
         P_i = np.hstack([np.eye(3), np.zeros((3, 1))])
         P_j = np.hstack([R_rel, t_rel])
         
-        # Triangulate inlier-only correspondences
-        pts_i_tri = pts_i_norm[inlier_to_original_idx]
-        pts_j_tri = pts_j_norm[inlier_to_original_idx]
-        pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i_tri.T, pts_j_tri.T)
-        # Guard homogeneous division: near-zero |w| indicates point at infinity/unstable geometry.
-        # NOTE: w can legitimately be negative (DLT sign convention) — guard on |w|, not w.
-        w_hom = pts_4d_hom[3]
-        pts_3d = np.full((pts_4d_hom.shape[1], 3), np.nan, dtype=np.float64)
-        valid_w = np.abs(w_hom) > 1e-8
-        if np.any(valid_w):
-            pts_3d[valid_w] = (pts_4d_hom[:3, valid_w] / w_hom[valid_w]).T  # (N, 3)
+        # Triangulate all points
+        pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i_norm.T, pts_j_norm.T)
+        pts_3d = (pts_4d_hom[:3] / pts_4d_hom[3]).T  # (N, 3)
         
         # Compute wand lengths
         wand_lengths = []
@@ -420,23 +317,7 @@ class PinholeBootstrapP0:
         if len(valid_lengths) < 5:
             raise RuntimeError("[P0 FAIL] Triangulation failed to produce valid structure")
         
-        # W3b: IQR-based robust scale recovery
-        # Use interquartile range to filter outliers before computing median
-        q1 = np.percentile(valid_lengths, 25)
-        q3 = np.percentile(valid_lengths, 75)
-        iqr = q3 - q1
-        iqr_lower = q1 - 1.5 * iqr
-        iqr_upper = q3 + 1.5 * iqr
-        
-        # Filter to inliers within IQR bounds
-        inlier_lengths = valid_lengths[(valid_lengths >= iqr_lower) & (valid_lengths <= iqr_upper)]
-        
-        if len(inlier_lengths) < 3:
-            # Fallback to median if too few inliers
-            median_length = np.median(valid_lengths)
-        else:
-            median_length = np.median(inlier_lengths)
-        
+        median_length = np.median(valid_lengths)
         scale_factor = self.config.wand_length_mm / median_length
         
         # Apply scale to translation
@@ -445,36 +326,37 @@ class PinholeBootstrapP0:
         # Convert R to rvec
         rvec_j, _ = cv2.Rodrigues(R_rel)
         
-        # Build params array for cam_j (cam_i is frozen at origin)
+        # Build params arrays (both cameras, like original Phase 1)
+        params_i = np.zeros(6)  # cam_i at origin initially
         params_j = np.concatenate([rvec_j.flatten(), t_scaled.flatten()])
         
         print(f"\n[P0] Step 3: Extrinsic Refinement (frozen intrinsics)...")
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except Exception as e:
-                logger.debug("progress_callback error (Extrinsic Refinement): %s", e)
+            except:
+                pass
         
         # Build initial 3D points (scaled)
         pts_3d_scaled = pts_3d * scale_factor
         n_pts = len(pts_3d_scaled)
         
-        # State vector: [cam_j(6), pts_3d(N*3)]  (cam_i frozen at origin)
-        x0 = np.concatenate([params_j, pts_3d_scaled.flatten()])
+        # State vector: [cam_i(6), cam_j(6), pts_3d(N*3)]
+        x0 = np.concatenate([params_i, params_j, pts_3d_scaled.flatten()])
         
         from scipy.sparse import lil_matrix
         
         # Residuals: for each frame: wand(1) + reproj(8) = 9
-        n_frames = len(valid_frames_inlier)
+        n_frames = len(valid_frames)
         n_res = n_frames * 9
-        n_cams = 1
+        n_cams = 2
         n_cam_params = 6
-        pt_start = n_cams * n_cam_params  # = 6
+        pt_start = n_cams * n_cam_params  # = 12
         n_params = pt_start + n_pts * 3
         
         A_sparsity = lil_matrix((n_res, n_params), dtype=int)
         
-        for i, fid in enumerate(valid_frames_inlier):
+        for i, fid in enumerate(valid_frames):
             idx_ptA = pt_start + i * 6
             idx_ptB = pt_start + i * 6 + 3
             base_res = i * 9
@@ -483,23 +365,24 @@ class PinholeBootstrapP0:
             A_sparsity[base_res, idx_ptA:idx_ptA+3] = 1
             A_sparsity[base_res, idx_ptB:idx_ptB+3] = 1
             
-            # Reproj cam_i ptA/ptB — cam_i is frozen (no state cols)
+            # Reproj cam_i ptA/ptB
+            A_sparsity[base_res+1:base_res+3, 0:6] = 1
             A_sparsity[base_res+1:base_res+3, idx_ptA:idx_ptA+3] = 1
+            A_sparsity[base_res+3:base_res+5, 0:6] = 1
             A_sparsity[base_res+3:base_res+5, idx_ptB:idx_ptB+3] = 1
             
             # Reproj cam_j ptA/ptB
-            A_sparsity[base_res+5:base_res+7, 0:6] = 1
+            A_sparsity[base_res+5:base_res+7, 6:12] = 1
             A_sparsity[base_res+5:base_res+7, idx_ptA:idx_ptA+3] = 1
-            A_sparsity[base_res+7:base_res+9, 0:6] = 1
+            A_sparsity[base_res+7:base_res+9, 6:12] = 1
             A_sparsity[base_res+7:base_res+9, idx_ptB:idx_ptB+3] = 1
         
         # Residuals function (frozen intrinsics)
         self._res_call_count = 0 
         def residuals_func(x):
-            # cam_i is frozen at origin
-            p_i = np.zeros(6)
-            p_j = x[:6]
-            pts = x[6:].reshape(-1, 3)
+            p_i = x[:6]
+            p_j = x[6:12]
+            pts = x[12:].reshape(-1, 3)
             
             R_i, _ = cv2.Rodrigues(p_i[:3])
             t_i = p_i[3:6].reshape(3, 1)
@@ -511,7 +394,7 @@ class PinholeBootstrapP0:
             n_len = 0
             sq_err_proj = 0.0
             n_proj = 0
-            for idx, fid in enumerate(valid_frames_inlier):
+            for idx, fid in enumerate(valid_frames):
                 uvA_i, uvB_i = observations[fid][cam_i]
                 uvA_j, uvB_j = observations[fid][cam_j]
                 
@@ -525,11 +408,11 @@ class PinholeBootstrapP0:
                 sq_err_len += d_len * d_len
                 n_len += 1
                 
-                # Reprojections with frozen K (cheirality: NaN → zero residual)
+                # Reprojections with frozen K
                 proj_Ai = self._project(ptA, R_i, t_i, K_i)
                 proj_Bi = self._project(ptB, R_i, t_i, K_i)
-                diff_Ai = np.zeros(2) if np.isnan(proj_Ai[0]) else (proj_Ai - uvA_i)
-                diff_Bi = np.zeros(2) if np.isnan(proj_Bi[0]) else (proj_Bi - uvB_i)
+                diff_Ai = (proj_Ai - uvA_i)
+                diff_Bi = (proj_Bi - uvB_i)
                 res.extend(diff_Ai.tolist())
                 res.extend(diff_Bi.tolist())
                 sq_err_proj += float(np.sum(diff_Ai**2) + np.sum(diff_Bi**2))
@@ -537,8 +420,8 @@ class PinholeBootstrapP0:
 
                 proj_Aj = self._project(ptA, R_j, t_j, K_j)
                 proj_Bj = self._project(ptB, R_j, t_j, K_j)
-                diff_Aj = np.zeros(2) if np.isnan(proj_Aj[0]) else (proj_Aj - uvA_j)
-                diff_Bj = np.zeros(2) if np.isnan(proj_Bj[0]) else (proj_Bj - uvB_j)
+                diff_Aj = (proj_Aj - uvA_j)
+                diff_Bj = (proj_Bj - uvB_j)
                 res.extend(diff_Aj.tolist())
                 res.extend(diff_Bj.tolist())
                 sq_err_proj += float(np.sum(diff_Aj**2) + np.sum(diff_Bj**2))
@@ -563,8 +446,8 @@ class PinholeBootstrapP0:
                         rmse_proj,
                         cost,
                     )
-                except Exception as e:
-                    logger.debug("progress_callback error (Phase 1 BA iter): %s", e)
+                except:
+                    pass
             
             return res_arr
 
@@ -582,29 +465,27 @@ class PinholeBootstrapP0:
         )
 
         
-        params_i_opt = np.zeros(6)  # frozen
-        params_j_opt = result.x[:6]
-        pts_3d_opt = result.x[6:].reshape(-1, 3)
+        params_i_opt = result.x[:6]
+        params_j_opt = result.x[6:12]
+        pts_3d_opt = result.x[12:].reshape(-1, 3)
         
         print(f"  BA cost: {result.cost:.2e}")
-        print(f"  cam_i: frozen at origin [0,0,0,0,0,0]")
+        print(f"  cam_i moved: |t| = {np.linalg.norm(params_i_opt[3:6]):.4f} mm")
         
         # Compute diagnostics
         report = self._compute_diagnostics(
             cam_i, cam_j, params_i_opt, params_j_opt,
-            observations, valid_frames_inlier, K_i, K_j
+            observations, valid_frames, K_i, K_j
         )
         report['scale_factor'] = scale_factor
         report['n_inliers'] = n_inliers
-        report['n_inliers_pose'] = int(n_inliers_pose)
-        report['n_inlier_frames'] = len(valid_frames_inlier)
-        report['phase1_inlier_frames'] = list(valid_frames_inlier)
         
         # Sanity checks
         self._validate(report)
         
         print(f"\n[P0] Phase 1 Complete:")
-        print(f"  cam_{cam_i}: frozen at origin [0,0,0,0,0,0]")
+        print(f"  cam_{cam_i} rvec: [{params_i_opt[0]:.4f}, {params_i_opt[1]:.4f}, {params_i_opt[2]:.4f}]")
+        print(f"  cam_{cam_i} tvec: [{params_i_opt[3]:.2f}, {params_i_opt[4]:.2f}, {params_i_opt[5]:.2f}]")
         print(f"  cam_{cam_j} rvec: [{params_j_opt[0]:.4f}, {params_j_opt[1]:.4f}, {params_j_opt[2]:.4f}]")
         print(f"  cam_{cam_j} tvec: [{params_j_opt[3]:.2f}, {params_j_opt[4]:.2f}, {params_j_opt[5]:.2f}]")
         print(f"  Baseline: {report['baseline_mm']:.2f} mm")
@@ -619,12 +500,33 @@ class PinholeBootstrapP0:
         pt_cam = R @ pt3d.reshape(3, 1) + t
         pt_cam = pt_cam.flatten()
         if pt_cam[2] <= 0:
-            return np.array([np.nan, np.nan])  # Cheirality: behind camera
+            return np.array([1e6, 1e6])  # Behind camera
         pt_norm = pt_cam[:2] / pt_cam[2]
         pt_px = K[:2, :2] @ pt_norm + K[:2, 2]
         return pt_px
 
+    def _ray_dir_world(self, uv: np.ndarray, K: np.ndarray, R: np.ndarray) -> np.ndarray:
+        """Build world-space pinhole ray direction from pixel coordinate."""
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = float(K[0, 2])
+        cy = float(K[1, 2])
+        x = (float(uv[0]) - cx) / max(abs(fx), 1e-12)
+        y = (float(uv[1]) - cy) / max(abs(fy), 1e-12)
+        d_cam = np.array([x, y, 1.0], dtype=np.float64)
+        d_cam /= (np.linalg.norm(d_cam) + 1e-12)
+        d_world = R.T @ d_cam
+        d_world /= (np.linalg.norm(d_world) + 1e-12)
+        return d_world
 
+    def _point_to_ray_dist(self, X: np.ndarray, C: np.ndarray, d: np.ndarray) -> float:
+        """Distance from 3D point to 3D ray (half-line), in mm."""
+        v = X - C
+        t = float(np.dot(v, d))
+        if t < 0.0:
+            return float(np.linalg.norm(v))
+        return float(np.linalg.norm(v - t * d))
+    
     def _collect_valid_frames(
         self,
         observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
@@ -665,15 +567,7 @@ class PinholeBootstrapP0:
         wand_lengths = []
         reproj_errors = []
         
-        DIAG_FRAME_CAP = 200
-        frames_to_process = valid_frames[:DIAG_FRAME_CAP]
-        if len(valid_frames) >= DIAG_FRAME_CAP:
-            print(
-                f"  [WARN] Diagnostics frame count hit {DIAG_FRAME_CAP}-frame cap "
-                f"({len(valid_frames)} total frames truncated to {DIAG_FRAME_CAP})"
-            )
-        
-        for fid in frames_to_process:
+        for fid in valid_frames[:200]:
             uvA_i, uvB_i = observations[fid][cam_i]
             uvA_j, uvB_j = observations[fid][cam_j]
             
@@ -683,29 +577,17 @@ class PinholeBootstrapP0:
             pts_4d_B = cv2.triangulatePoints(P_i, P_j, 
                                              uvB_i.reshape(2, 1), uvB_j.reshape(2, 1))
             
-            # Guard homogeneous division: near-zero |w| indicates point at infinity/unstable geometry.
-            # NOTE: w can legitimately be negative (DLT sign convention) — guard on |w|, not w.
-            w_A = float(pts_4d_A[3, 0])
-            w_B = float(pts_4d_B[3, 0])
-            ptA = (pts_4d_A[:3] / w_A).flatten() if abs(w_A) > 1e-8 else np.full(3, np.nan, dtype=np.float64)
-            ptB = (pts_4d_B[:3] / w_B).flatten() if abs(w_B) > 1e-8 else np.full(3, np.nan, dtype=np.float64)
+            ptA = (pts_4d_A[:3] / pts_4d_A[3]).flatten()
+            ptB = (pts_4d_B[:3] / pts_4d_B[3]).flatten()
             
             wand_lengths.append(np.linalg.norm(ptB - ptA))
             
-            # Reprojection error for BOTH endpoints (skip behind-camera NaN projections)
+            # Reprojection error
             proj_Ai = self._project(ptA, R_i, t_i, K_i)
             proj_Aj = self._project(ptA, R_j, t_j, K_j)
-            proj_Bi = self._project(ptB, R_i, t_i, K_i)
-            proj_Bj = self._project(ptB, R_j, t_j, K_j)
             
-            if not np.isnan(proj_Ai[0]):
-                reproj_errors.append(np.linalg.norm(proj_Ai - uvA_i))
-            if not np.isnan(proj_Aj[0]):
-                reproj_errors.append(np.linalg.norm(proj_Aj - uvA_j))
-            if not np.isnan(proj_Bi[0]):
-                reproj_errors.append(np.linalg.norm(proj_Bi - uvB_i))
-            if not np.isnan(proj_Bj[0]):
-                reproj_errors.append(np.linalg.norm(proj_Bj - uvB_j))
+            reproj_errors.append(np.linalg.norm(proj_Ai - uvA_i))
+            reproj_errors.append(np.linalg.norm(proj_Aj - uvA_j))
         
         return {
             'baseline_mm': np.linalg.norm(params_j[3:6]),
@@ -714,7 +596,6 @@ class PinholeBootstrapP0:
             'wand_length_error': abs(np.median(wand_lengths) - self.config.wand_length_mm) if wand_lengths else float('inf'),
             'reproj_err_mean': np.mean(reproj_errors) if reproj_errors else 0,
             'reproj_err_max': np.max(reproj_errors) if reproj_errors else 0,
-            'reproj_n_samples': len(reproj_errors),
             'valid_frames': len(valid_frames),
         }
     
@@ -858,53 +739,7 @@ class PinholeBootstrapP0:
             # Compute final reprojection error
             pts_reproj_opt, _ = cv2.projectPoints(pts_3d_arr, rvec_opt, tvec_opt, K, dist_coeffs)
             pts_reproj_opt = pts_reproj_opt.reshape(-1, 2)
-            
-            # Compute per-point residuals
-            residuals = np.sqrt(np.sum((pts_2d - pts_reproj_opt)**2, axis=1))
-            median_residual = np.median(residuals)
-            threshold = 3.0 * median_residual
-            
-            # Filter outliers
-            inlier_mask = residuals <= threshold
-            n_outliers = np.sum(~inlier_mask)
-            
-            if n_outliers > 0:
-                print(f"    Filtering {n_outliers}/{len(pts_2d)} outliers (threshold={threshold:.2f}px)")
-                
-                # Re-optimize with inliers only
-                pts_2d_inliers = pts_2d[inlier_mask]
-                pts_3d_inliers = pts_3d_arr[inlier_mask]
-                
-                if len(pts_2d_inliers) >= 6:
-                    x0_cam_refined = np.concatenate([rvec_opt, tvec_opt])
-                    
-                    def residuals_cam_refined(x):
-                        r = x[:3].reshape(3, 1)
-                        t = x[3:6].reshape(3, 1)
-                        pts_proj, _ = cv2.projectPoints(pts_3d_inliers, r, t, K, dist_coeffs)
-                        pts_proj = pts_proj.reshape(-1, 2)
-                        return (pts_2d_inliers - pts_proj).flatten()
-                    
-                    result_refined = least_squares(
-                        residuals_cam_refined, x0_cam_refined,
-                        method='lm',
-                        ftol=self.config.ftol,
-                        xtol=self.config.xtol,
-                        max_nfev=100,
-                    )
-                    
-                    rvec_opt = result_refined.x[:3]
-                    tvec_opt = result_refined.x[3:6]
-                    
-                    # Compute final error on inliers
-                    pts_reproj_final, _ = cv2.projectPoints(pts_3d_inliers, rvec_opt, tvec_opt, K, dist_coeffs)
-                    pts_reproj_final = pts_reproj_final.reshape(-1, 2)
-                    reproj_err_final = np.sqrt(np.mean(np.sum((pts_2d_inliers - pts_reproj_final)**2, axis=1)))
-                else:
-                    print(f"    [WARN] Too few inliers after filtering ({len(pts_2d_inliers)} < 6), using original solution")
-                    reproj_err_final = np.sqrt(np.mean(residuals[inlier_mask]**2)) if np.any(inlier_mask) else np.sqrt(np.mean(residuals**2))
-            else:
-                reproj_err_final = np.sqrt(np.mean(residuals**2))
+            reproj_err_final = np.sqrt(np.mean(np.sum((pts_2d - pts_reproj_opt)**2, axis=1)))
             
             print(f"    rvec: [{rvec_opt[0]:.4f}, {rvec_opt[1]:.4f}, {rvec_opt[2]:.4f}]")
             print(f"    tvec: [{tvec_opt[0]:.2f}, {tvec_opt[1]:.2f}, {tvec_opt[2]:.2f}]")
@@ -948,12 +783,8 @@ class PinholeBootstrapP0:
             pts_4d_B = cv2.triangulatePoints(P_i, P_j, 
                                              uvB_i.reshape(2, 1), uvB_j.reshape(2, 1))
             
-            # Guard homogeneous division: near-zero |w| indicates point at infinity/unstable geometry.
-            # NOTE: w can legitimately be negative (DLT sign convention) — guard on |w|, not w.
-            w_A = float(pts_4d_A[3, 0])
-            w_B = float(pts_4d_B[3, 0])
-            XA = (pts_4d_A[:3] / w_A).flatten() if abs(w_A) > 1e-8 else np.full(3, np.nan, dtype=np.float64)
-            XB = (pts_4d_B[:3] / w_B).flatten() if abs(w_B) > 1e-8 else np.full(3, np.nan, dtype=np.float64)
+            XA = (pts_4d_A[:3] / pts_4d_A[3]).flatten()
+            XB = (pts_4d_B[:3] / pts_4d_B[3]).flatten()
             
             points_3d[fid] = (XA, XB)
         
@@ -977,16 +808,12 @@ class PinholeBootstrapP0:
         
         all_cam_ids = sorted(cam_params.keys())
         n_cams = len(all_cam_ids)
-        first_cam_id = all_cam_ids[0]
-        free_cam_ids = all_cam_ids[1:]
-        n_free_cams = len(free_cam_ids)
-        free_cam_id_to_idx = {cid: i for i, cid in enumerate(free_cam_ids)}
+        cam_id_to_idx = {cid: i for i, cid in enumerate(all_cam_ids)}
         
         print(f"\n{'='*60}")
         print(f"[P0 Phase 3] Global BA with frozen intrinsics")
         print(f"{'='*60}")
         print(f"  Cameras: {all_cam_ids}")
-        print(f"  Gauge anchor: cam_{first_cam_id} fixed at [0,0,0,0,0,0]")
         print("  Frozen intrinsics: per-camera table values")
         
         # Collect valid frames (seen by at least 2 calibrated cameras)
@@ -1030,12 +857,8 @@ class PinholeBootstrapP0:
             pts_4d_A = cv2.triangulatePoints(P1, P2, uvA_1.reshape(2, 1), uvA_2.reshape(2, 1))
             pts_4d_B = cv2.triangulatePoints(P1, P2, uvB_1.reshape(2, 1), uvB_2.reshape(2, 1))
             
-            # Guard homogeneous division: near-zero |w| indicates point at infinity/unstable geometry.
-            # NOTE: w can legitimately be negative (DLT sign convention) — guard on |w|, not w.
-            w_A = float(pts_4d_A[3, 0])
-            w_B = float(pts_4d_B[3, 0])
-            ptA = (pts_4d_A[:3] / w_A).flatten() if abs(w_A) > 1e-8 else np.full(3, np.nan, dtype=np.float64)
-            ptB = (pts_4d_B[:3] / w_B).flatten() if abs(w_B) > 1e-8 else np.full(3, np.nan, dtype=np.float64)
+            ptA = (pts_4d_A[:3] / pts_4d_A[3]).flatten()
+            ptB = (pts_4d_B[:3] / pts_4d_B[3]).flatten()
             
             pts_3d_init.append(ptA)
             pts_3d_init.append(ptB)
@@ -1047,15 +870,14 @@ class PinholeBootstrapP0:
         
         print(f"  Initial points: {n_pts}")
         
-        # Build state vector: [free_cams(n_free_cams*6), pts_3d(n_pts*3)]
+        # Build state vector: [all_cams(n_cams*6), pts_3d(n_pts*3)]
         n_cam_params = 6  # Only extrinsics
-        pt_start = n_free_cams * n_cam_params
+        pt_start = n_cams * n_cam_params
         
         x0 = np.zeros(pt_start + n_pts * 3)
         
-        for cid in free_cam_ids:
-            idx = free_cam_id_to_idx[cid]
-            params = cam_params[cid]
+        for cid, params in cam_params.items():
+            idx = cam_id_to_idx[cid]
             x0[idx * n_cam_params:(idx + 1) * n_cam_params] = params[:6]
         
         x0[pt_start:] = pts_3d_init.flatten()
@@ -1084,15 +906,7 @@ class PinholeBootstrapP0:
             
             # Reprojection for each camera
             for cid in cams_in_frame:
-                if cid == first_cam_id:
-                    # Frozen camera contributes residual rows with point-only Jacobian terms.
-                    A_sparsity[ridx:ridx+2, idx_ptA:idx_ptA+3] = 1
-                    ridx += 2
-                    A_sparsity[ridx:ridx+2, idx_ptB:idx_ptB+3] = 1
-                    ridx += 2
-                    continue
-
-                cam_idx = free_cam_id_to_idx[cid]
+                cam_idx = cam_id_to_idx[cid]
                 cam_start = cam_idx * n_cam_params
                 
                 # ptA projection (2 residuals)
@@ -1111,11 +925,9 @@ class PinholeBootstrapP0:
         self._phase3_res_count = 0
         def residuals_phase3(x):
             # Extract camera params
-            cams = {
-                first_cam_id: (np.eye(3), np.zeros((3, 1), dtype=np.float64))
-            }
-            for cid in free_cam_ids:
-                idx = free_cam_id_to_idx[cid]
+            cams = {}
+            for cid in all_cam_ids:
+                idx = cam_id_to_idx[cid]
                 p = x[idx * n_cam_params:(idx + 1) * n_cam_params]
                 R, _ = cv2.Rodrigues(p[:3])
                 t = p[3:6].reshape(3, 1)
@@ -1145,19 +957,19 @@ class PinholeBootstrapP0:
                 
                 # Reprojection for each camera
                 for cid in cams_in_frame:
-                    R_cam, t_cam = cams[cid]
+                    R, t = cams[cid]
                     uvA, uvB = observations[fid][cid]
                     
-                    # Project ptA (cheirality: NaN → zero residual)
-                    proj_A = self._project(ptA, R_cam, t_cam, K_by_cam[cid])
-                    diffA = np.zeros(2) if np.isnan(proj_A[0]) else (proj_A - uvA)
+                    # Project ptA
+                    proj_A = self._project(ptA, R, t, K_by_cam[cid])
+                    diffA = proj_A - uvA
                     res.extend(diffA.tolist())
                     sq_err_proj += float(np.sum(diffA**2))
                     n_proj += 2
                     
-                    # Project ptB (cheirality: NaN → zero residual)
-                    proj_B = self._project(ptB, R_cam, t_cam, K_by_cam[cid])
-                    diffB = np.zeros(2) if np.isnan(proj_B[0]) else (proj_B - uvB)
+                    # Project ptB
+                    proj_B = self._project(ptB, R, t, K_by_cam[cid])
+                    diffB = proj_B - uvB
                     res.extend(diffB.tolist())
                     sq_err_proj += float(np.sum(diffB**2))
                     n_proj += 2
@@ -1179,8 +991,8 @@ class PinholeBootstrapP0:
                         rmse_proj,
                         cost,
                     )
-                except Exception as e:
-                    logger.debug("progress_callback error (Phase 3 BA iter): %s", e)
+                except:
+                    pass
             
             return res_arr
 
@@ -1191,7 +1003,6 @@ class PinholeBootstrapP0:
             residuals_phase3, x0,
             jac_sparsity=A_sparsity,
             method='trf',
-            loss='huber',
             x_scale='jac',
             f_scale=1.0,
             verbose=1,
@@ -1203,16 +1014,15 @@ class PinholeBootstrapP0:
         print(f"  Phase 3 cost: {result.cost:.2e}")
         
         # Extract optimized params
-        cam_params_opt = {
-            first_cam_id: np.zeros(6, dtype=np.float64)
-        }
-        for cid in free_cam_ids:
-            idx = free_cam_id_to_idx[cid]
+        cam_params_opt = {}
+        for cid in all_cam_ids:
+            idx = cam_id_to_idx[cid]
             cam_params_opt[cid] = result.x[idx * n_cam_params:(idx + 1) * n_cam_params]
         
-        # Compute final RMS using wand residuals from interleaved frame blocks
+        # Compute final reprojection error
         final_res = residuals_phase3(result.x)
-        rms = self._compute_phase3_wand_rms(final_res, n_frames, n_cams)
+        reproj_res = final_res[n_frames:]  # Skip wand residuals
+        rms = np.sqrt(np.mean(reproj_res**2))
         print(f"  Final RMS: {rms:.2f}px")
         
         return cam_params_opt
@@ -1240,38 +1050,17 @@ class PinholeBootstrapP0:
             cam_i: params_i,
             cam_j: params_j,
         }
-
-        # Propagate Phase 1 inlier-validated frame set into Phase 2/3.
-        inlier_frames_phase1 = report.get('phase1_inlier_frames', [])
-        if inlier_frames_phase1:
-            observations_phase23 = {
-                fid: observations[fid]
-                for fid in inlier_frames_phase1
-                if fid in observations
-            }
-        else:
-            observations_phase23 = observations
-
-        valid_frames_phase23 = [
-            fid for fid, cams in observations_phase23.items() if len(cams) >= 2
-        ]
-        print(f"  Phase 2: {len(valid_frames_phase23)} valid frames (≥2 cameras)")
-        if len(valid_frames_phase23) < len(observations_phase23):
-            print(
-                "  [WARN] Some Phase 2/3 frames have <2 cameras and will be skipped "
-                f"({len(observations_phase23) - len(valid_frames_phase23)} frames)."
-            )
         
         # Triangulate 3D points
         print(f"\n[P0] Triangulating 3D points for Phase 2...")
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except Exception as e:
-                logger.debug("progress_callback error (Triangulate for Phase 2): %s", e)
+            except:
+                pass
 
         points_3d = self.triangulate_all_points(
-            cam_i, cam_j, params_i, params_j, observations_phase23, camera_settings
+            cam_i, cam_j, params_i, params_j, observations, camera_settings
         )
         report['points_3d'] = points_3d
         print(f"  Triangulated {len(points_3d)} frames")
@@ -1280,32 +1069,26 @@ class PinholeBootstrapP0:
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except Exception as e:
-                logger.debug("progress_callback error (Phase 2): %s", e)
+            except:
+                pass
         
         cam_params = self.run_phase2(
-            cam_params, observations_phase23, points_3d, camera_settings, all_cam_ids
+            cam_params, observations, points_3d, camera_settings, all_cam_ids
         )
         
         # Phase 3: Global BA with all cameras
         if progress_callback:
             try:
                 progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
-            except Exception as e:
-                logger.debug("progress_callback error (Phase 3): %s", e)
-
-        valid_frames_phase3 = [
-            fid for fid, cams in observations_phase23.items() if len(cams) >= 2
-        ]
-        print(f"  Phase 3: {len(valid_frames_phase3)} valid frames (≥2 cameras)")
+            except:
+                pass
 
         cam_params = self.run_phase3(
-            cam_params, observations_phase23, camera_settings, progress_callback=progress_callback
+            cam_params, observations, camera_settings, progress_callback=progress_callback
         )
 
         
         report['all_cam_ids'] = list(cam_params.keys())
-        report['phase23_frames'] = list(observations_phase23.keys())
         
         return cam_params, report
 
