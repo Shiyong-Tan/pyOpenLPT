@@ -282,11 +282,18 @@ class PinholeBootstrapP0:
             raise RuntimeError("[P0 FAIL] Essential Matrix computation failed")
         
         # Step 2: Recover Pose (R, t)
+        inlier_idx = np.where(mask.ravel() > 0)[0]
+        n_E_inliers = len(inlier_idx)
+
+        if n_E_inliers < 8:
+            raise RuntimeError(f"[P0 FAIL] Too few Essential inliers: {n_E_inliers}")
+
         n_inliers, R_rel, t_rel, mask_pose = cv2.recoverPose(
-            E, pts_i_norm, pts_j_norm, focal=1.0, pp=(0.0, 0.0)
+            E, pts_i_norm[inlier_idx], pts_j_norm[inlier_idx], focal=1.0, pp=(0.0, 0.0)
         )
-        
-        print(f"  Inliers: {n_inliers} / {len(pts_i)}")
+
+        print(f"  E-Matrix Inliers: {n_E_inliers} / {len(pts_i)}")
+        print(f"  Pose Inliers: {n_inliers} / {n_E_inliers}")
         
         # Step 3: Triangulate to compute scale
         print(f"\n[P0] Step 2: Triangulation & Scale Recovery...")
@@ -300,24 +307,46 @@ class PinholeBootstrapP0:
         P_i = np.hstack([np.eye(3), np.zeros((3, 1))])
         P_j = np.hstack([R_rel, t_rel])
         
-        # Triangulate all points
-        pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i_norm.T, pts_j_norm.T)
-        pts_3d = (pts_4d_hom[:3] / pts_4d_hom[3]).T  # (N, 3)
-        
-        # Compute wand lengths
-        wand_lengths = []
-        for i in range(0, len(pts_3d), 2):
-            ptA = pts_3d[i]
-            ptB = pts_3d[i + 1]
-            wand_lengths.append(np.linalg.norm(ptB - ptA))
-        
-        wand_lengths = np.array(wand_lengths)
-        valid_lengths = wand_lengths[(wand_lengths > 0.001) & (wand_lengths < 1000)]
-        
-        if len(valid_lengths) < 5:
-            raise RuntimeError("[P0 FAIL] Triangulation failed to produce valid structure")
-        
-        median_length = np.median(valid_lengths)
+        # Triangulate inlier correspondences for robust scale anchor
+        pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i_norm[inlier_idx].T, pts_j_norm[inlier_idx].T)
+        pts_3d_inlier = (pts_4d_hom[:3] / pts_4d_hom[3]).T
+
+        pose_inlier_idx_local = np.where(mask_pose.ravel() > 0)[0]
+        pose_inlier_idx_global = inlier_idx[pose_inlier_idx_local]
+
+        # Keep full point set for downstream optimization state
+        pts_4d_hom_all = cv2.triangulatePoints(P_i, P_j, pts_i_norm.T, pts_j_norm.T)
+        pts_3d = (pts_4d_hom_all[:3] / pts_4d_hom_all[3]).T
+
+        # Compute wand lengths using inlier-anchored frame pairs
+        wand_lengths_inlier = []
+        for i_frame in range(0, len(pts_3d) - 1, 2):
+            if i_frame in inlier_idx and (i_frame + 1) in inlier_idx:
+                idx_A_in_inliers = np.where(inlier_idx == i_frame)[0][0]
+                idx_B_in_inliers = np.where(inlier_idx == (i_frame + 1))[0][0]
+                ptA = pts_3d_inlier[idx_A_in_inliers]
+                ptB = pts_3d_inlier[idx_B_in_inliers]
+                wand_lengths_inlier.append(np.linalg.norm(ptB - ptA))
+
+        if len(wand_lengths_inlier) < 5:
+            raise RuntimeError("[P0 FAIL] Triangulation failed to produce valid inlier wand pairs")
+
+        wand_lengths_inlier = np.array(wand_lengths_inlier)
+        valid_lengths_inlier = wand_lengths_inlier[(wand_lengths_inlier > 0.001) & (wand_lengths_inlier < 1000)]
+
+        if len(valid_lengths_inlier) < 3:
+            wand_lengths = []
+            for i in range(0, len(pts_3d), 2):
+                ptA = pts_3d[i]
+                ptB = pts_3d[i + 1]
+                wand_lengths.append(np.linalg.norm(ptB - ptA))
+            wand_lengths = np.array(wand_lengths)
+            valid_lengths = wand_lengths[(wand_lengths > 0.001) & (wand_lengths < 1000)]
+            print(f"  [WARN] Insufficient inlier pairs ({len(valid_lengths_inlier)}); using all correspondences for scale.")
+            median_length = np.median(valid_lengths)
+        else:
+            median_length = np.median(valid_lengths_inlier)
+            print(f"  Scale anchor: {len(valid_lengths_inlier)} valid inlier wand pairs, median={median_length:.4f} mm")
         scale_factor = self.config.wand_length_mm / median_length
         
         # Apply scale to translation
