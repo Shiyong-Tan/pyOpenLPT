@@ -355,7 +355,7 @@ class PinholeBootstrapP0:
         # Convert R to rvec
         rvec_j, _ = cv2.Rodrigues(R_rel)
         
-        # Build params arrays (both cameras, like original Phase 1)
+        # Build params arrays (both cameras, matching production Phase 1)
         params_i = np.zeros(6)  # cam_i at origin initially
         params_j = np.concatenate([rvec_j.flatten(), t_scaled.flatten()])
         
@@ -370,6 +370,8 @@ class PinholeBootstrapP0:
         pts_3d_scaled = pts_3d * scale_factor
         n_pts = len(pts_3d_scaled)
         
+        # UNANCHORED BA (matching production): both cam_i and cam_j are free
+        # After convergence, results are re-expressed in cam_i's frame (post-processing anchoring)
         # State vector: [cam_i(6), cam_j(6), pts_3d(N*3)]
         x0 = np.concatenate([params_i, params_j, pts_3d_scaled.flatten()])
         
@@ -406,7 +408,7 @@ class PinholeBootstrapP0:
             A_sparsity[base_res+7:base_res+9, 6:12] = 1
             A_sparsity[base_res+7:base_res+9, idx_ptB:idx_ptB+3] = 1
         
-        # Residuals function (frozen intrinsics)
+        # Residuals function (frozen intrinsics, both cameras free)
         self._res_call_count = 0 
         def residuals_func(x):
             p_i = x[:6]
@@ -490,16 +492,45 @@ class PinholeBootstrapP0:
             verbose=1,
             ftol=self.config.ftol,
             xtol=self.config.xtol,
-            max_nfev=100,
+            max_nfev=2000,
         )
 
-        
-        params_i_opt = result.x[:6]
-        params_j_opt = result.x[6:12]
-        pts_3d_opt = result.x[12:].reshape(-1, 3)
-        
+        if not result.success and result.cost > 1e8:
+            raise RuntimeError(
+                f"[P0 FAIL] Phase 1 BA failed to converge: cost={result.cost:.2e}, "
+                f"message='{result.message}'"
+            )
+
+        # Extract raw BA results (both cameras free)
+        params_i_raw = result.x[:6]
+        params_j_raw = result.x[6:12]
+        pts_3d_raw = result.x[12:].reshape(-1, 3)
+
+        # Post-processing anchoring: re-express all results in cam_i's frame
+        # so that cam_i ends up at identity (origin)
+        # Convention: X_cam = R @ X_world + t
+        R_i_raw, _ = cv2.Rodrigues(params_i_raw[:3])
+        t_i_raw = params_i_raw[3:6].reshape(3, 1)
+        R_j_raw, _ = cv2.Rodrigues(params_j_raw[:3])
+        t_j_raw = params_j_raw[3:6].reshape(3, 1)
+
+        # Transform 3D points into cam_i's frame
+        pts_3d_opt = (R_i_raw @ pts_3d_raw.T + t_i_raw).T
+
+        # Transform cam_j into cam_i's frame:
+        #   R_j_anchored = R_j_raw @ R_i_raw^T
+        #   t_j_anchored = t_j_raw - R_j_anchored @ t_i_raw
+        R_j_anchored = R_j_raw @ R_i_raw.T
+        t_j_anchored = t_j_raw - R_j_anchored @ t_i_raw
+        rvec_j_anchored, _ = cv2.Rodrigues(R_j_anchored)
+
+        params_i_opt = np.zeros(6)   # cam_i at identity (anchored)
+        params_j_opt = np.concatenate([rvec_j_anchored.flatten(), t_j_anchored.flatten()])
+
+        print(f"  [ANCHORING] Phase 1 BA: cam_{cam_i} fixed at origin (post-processing re-expression)")
+        print(f"  cam_{cam_j} rvec: [{params_j_opt[0]:.4f}, {params_j_opt[1]:.4f}, {params_j_opt[2]:.4f}]")
+        print(f"  cam_{cam_j} tvec: [{params_j_opt[3]:.2f}, {params_j_opt[4]:.2f}, {params_j_opt[5]:.2f}]")
         print(f"  BA cost: {result.cost:.2e}")
-        print(f"  cam_i moved: |t| = {np.linalg.norm(params_i_opt[3:6]):.4f} mm")
         
         # Compute diagnostics
         report = self._compute_diagnostics(
@@ -615,8 +646,13 @@ class PinholeBootstrapP0:
             proj_Ai = self._project(ptA, R_i, t_i, K_i)
             proj_Aj = self._project(ptA, R_j, t_j, K_j)
             
+            # Include both ptA and ptB
+            proj_Bi = self._project(ptB, R_i, t_i, K_i)
+            proj_Bj = self._project(ptB, R_j, t_j, K_j)
             reproj_errors.append(np.linalg.norm(proj_Ai - uvA_i))
+            reproj_errors.append(np.linalg.norm(proj_Bi - uvB_i))
             reproj_errors.append(np.linalg.norm(proj_Aj - uvA_j))
+            reproj_errors.append(np.linalg.norm(proj_Bj - uvB_j))
         
         return {
             'baseline_mm': np.linalg.norm(params_j[3:6]),
@@ -732,6 +768,17 @@ class PinholeBootstrapP0:
                 flags=cv2.SOLVEPNP_ITERATIVE
             )
             
+            if not success:
+                print(f"    [WARN] PnP (ITERATIVE) failed for cam_{cid}. Falling back to EPNP result.")
+                # Re-run EPNP to restore good prior
+                success_epnp, rvec, tvec = cv2.solvePnP(
+                    pts_3d_arr, pts_2d, K, dist_coeffs,
+                    flags=cv2.SOLVEPNP_EPNP
+                )
+                if not success_epnp:
+                    print(f"    [WARN] EPNP fallback also failed for cam_{cid}. Skipping.")
+                    continue
+            
             rvec = rvec.flatten()
             tvec = tvec.flatten()
             
@@ -824,8 +871,9 @@ class PinholeBootstrapP0:
         cam_params: Dict[int, np.ndarray],
         observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
         camera_settings: Dict[int, dict],
+        cam_anchor_id: int = None,  # Camera to anchor (cam_i from Phase 1)
         progress_callback=None
-    ) -> Dict[int, np.ndarray]:
+    ) -> Tuple[Dict[int, np.ndarray], Dict[int, Tuple[np.ndarray, np.ndarray]]]:
         """
         Phase 3: Global BA with all cameras and frozen intrinsics.
         
@@ -856,7 +904,7 @@ class PinholeBootstrapP0:
         
         if len(valid_frames) < 10:
             print("  [WARN] Not enough frames for Phase 3, skipping.")
-            return cam_params
+            return cam_params, {}
         
         # Triangulate initial 3D points using first available pair per frame
         print("  Triangulating initial points for global BA...")
@@ -899,16 +947,25 @@ class PinholeBootstrapP0:
         
         print(f"  Initial points: {n_pts}")
         
-        # Build state vector: [all_cams(n_cams*6), pts_3d(n_pts*3)]
+        # ANCHORED: cam_anchor_id fixed to Phase 2 pose; only remaining cameras are free
         n_cam_params = 6  # Only extrinsics
-        pt_start = n_cams * n_cam_params
+        if cam_anchor_id is not None and cam_anchor_id in all_cam_ids:
+            cam_anchor_pose = cam_params[cam_anchor_id].copy()
+            free_cam_ids = [cid for cid in all_cam_ids if cid != cam_anchor_id]
+            print(f"  [ANCHORING] Phase 3 BA: cam_{cam_anchor_id} fixed to Phase 2 pose")
+            print(f"    cam_{cam_anchor_id} rvec: [{cam_anchor_pose[0]:.4f}, {cam_anchor_pose[1]:.4f}, {cam_anchor_pose[2]:.4f}]")
+            print(f"    cam_{cam_anchor_id} tvec: [{cam_anchor_pose[3]:.2f}, {cam_anchor_pose[4]:.2f}, {cam_anchor_pose[5]:.2f}]")
+        else:
+            cam_anchor_pose = None
+            free_cam_ids = all_cam_ids
+
+        n_free_cams = len(free_cam_ids)
+        free_cam_id_to_idx = {cid: i for i, cid in enumerate(free_cam_ids)}
+        pt_start = n_free_cams * n_cam_params
         
         x0 = np.zeros(pt_start + n_pts * 3)
-        
-        for cid, params in cam_params.items():
-            idx = cam_id_to_idx[cid]
-            x0[idx * n_cam_params:(idx + 1) * n_cam_params] = params[:6]
-        
+        for i, cid in enumerate(free_cam_ids):
+            x0[i * n_cam_params:(i + 1) * n_cam_params] = cam_params[cid][:6]
         x0[pt_start:] = pts_3d_init.flatten()
         
         # Build sparse Jacobian
@@ -935,18 +992,22 @@ class PinholeBootstrapP0:
             
             # Reprojection for each camera
             for cid in cams_in_frame:
-                cam_idx = cam_id_to_idx[cid]
-                cam_start = cam_idx * n_cam_params
-                
-                # ptA projection (2 residuals)
-                A_sparsity[ridx:ridx+2, cam_start:cam_start+6] = 1
-                A_sparsity[ridx:ridx+2, idx_ptA:idx_ptA+3] = 1
-                ridx += 2
-                
-                # ptB projection (2 residuals)
-                A_sparsity[ridx:ridx+2, cam_start:cam_start+6] = 1
-                A_sparsity[ridx:ridx+2, idx_ptB:idx_ptB+3] = 1
-                ridx += 2
+                if cid == cam_anchor_id:
+                    # Anchor camera: only points (no cam params in state)
+                    A_sparsity[ridx:ridx+2, idx_ptA:idx_ptA+3] = 1
+                    ridx += 2
+                    A_sparsity[ridx:ridx+2, idx_ptB:idx_ptB+3] = 1
+                    ridx += 2
+                else:
+                    # Free camera
+                    cam_idx = free_cam_id_to_idx[cid]
+                    cam_start = cam_idx * n_cam_params
+                    A_sparsity[ridx:ridx+2, cam_start:cam_start+6] = 1
+                    A_sparsity[ridx:ridx+2, idx_ptA:idx_ptA+3] = 1
+                    ridx += 2
+                    A_sparsity[ridx:ridx+2, cam_start:cam_start+6] = 1
+                    A_sparsity[ridx:ridx+2, idx_ptB:idx_ptB+3] = 1
+                    ridx += 2
         
         print(f"  Residuals: {n_res}, Params: {n_params}")
         
@@ -956,10 +1017,15 @@ class PinholeBootstrapP0:
             # Extract camera params
             cams = {}
             for cid in all_cam_ids:
-                idx = cam_id_to_idx[cid]
-                p = x[idx * n_cam_params:(idx + 1) * n_cam_params]
-                R, _ = cv2.Rodrigues(p[:3])
-                t = p[3:6].reshape(3, 1)
+                if cid == cam_anchor_id and cam_anchor_pose is not None:
+                    # Use fixed Phase 2 pose
+                    R, _ = cv2.Rodrigues(cam_anchor_pose[:3])
+                    t = cam_anchor_pose[3:6].reshape(3, 1)
+                else:
+                    cam_idx = free_cam_id_to_idx[cid]
+                    p = x[cam_idx * n_cam_params:(cam_idx + 1) * n_cam_params]
+                    R, _ = cv2.Rodrigues(p[:3])
+                    t = p[3:6].reshape(3, 1)
                 cams[cid] = (R, t)
             
             pts = x[pt_start:].reshape(-1, 3)
@@ -1040,21 +1106,53 @@ class PinholeBootstrapP0:
             max_nfev=100,
         )
         
+        if not result.success and result.cost > 1e10:
+            print(f"  [WARN] Phase 3 BA did not converge (cost={result.cost:.2e}). Returning Phase 2 params.")
+            return cam_params, {}  # Return Phase 2 params unchanged, empty points dict
+        
         print(f"  Phase 3 cost: {result.cost:.2e}")
         
         # Extract optimized params
         cam_params_opt = {}
-        for cid in all_cam_ids:
-            idx = cam_id_to_idx[cid]
-            cam_params_opt[cid] = result.x[idx * n_cam_params:(idx + 1) * n_cam_params]
+        for cid in free_cam_ids:
+            cam_idx = free_cam_id_to_idx[cid]
+            cam_params_opt[cid] = result.x[cam_idx * n_cam_params:(cam_idx + 1) * n_cam_params]
+
+        if cam_anchor_id is not None and cam_anchor_pose is not None:
+            cam_params_opt[cam_anchor_id] = cam_anchor_pose  # Keep Phase 2 pose
         
-        # Compute final reprojection error
-        final_res = residuals_phase3(result.x)
-        reproj_res = final_res[n_frames:]  # Skip wand residuals
-        rms = np.sqrt(np.mean(reproj_res**2))
+        # Compute final reprojection error (recompute from optimized result, skipping wand residuals properly)
+        all_reproj_errs = []
+        pts_final = result.x[pt_start:].reshape(-1, 3)
+        for frame_idx, (fid, cams_in_frame) in enumerate(frame_cams):
+            ptA = pts_final[frame_idx * 2]
+            ptB = pts_final[frame_idx * 2 + 1]
+            for cid in cams_in_frame:
+                if cid == cam_anchor_id and cam_anchor_pose is not None:
+                    R_c, _ = cv2.Rodrigues(cam_anchor_pose[:3])
+                    t_c = cam_anchor_pose[3:6].reshape(3, 1)
+                else:
+                    cam_idx = free_cam_id_to_idx[cid]
+                    p = result.x[cam_idx * n_cam_params:(cam_idx + 1) * n_cam_params]
+                    R_c, _ = cv2.Rodrigues(p[:3])
+                    t_c = p[3:6].reshape(3, 1)
+                proj_A = self._project(ptA, R_c, t_c, K_by_cam[cid])
+                proj_B = self._project(ptB, R_c, t_c, K_by_cam[cid])
+                uvA, uvB = observations[fid][cid]
+                all_reproj_errs.append(np.linalg.norm(proj_A - uvA))
+                all_reproj_errs.append(np.linalg.norm(proj_B - uvB))
+        rms = np.sqrt(np.mean(np.array(all_reproj_errs)**2)) if all_reproj_errs else float('nan')
         print(f"  Final RMS: {rms:.2f}px")
         
-        return cam_params_opt
+        # Re-triangulate final 3D points using Phase 3 optimized cameras
+        pts_3d_opt = result.x[pt_start:].reshape(-1, 3)
+        points_3d_final = {}
+        for frame_idx, (fid, cams_in_frame) in enumerate(frame_cams):
+            ptA = pts_3d_opt[frame_idx * 2]
+            ptB = pts_3d_opt[frame_idx * 2 + 1]
+            points_3d_final[fid] = (ptA.copy(), ptB.copy())
+
+        return cam_params_opt, points_3d_final
     
     def run_all(
         self,
@@ -1112,9 +1210,12 @@ class PinholeBootstrapP0:
             except:
                 pass
 
-        cam_params = self.run_phase3(
-            cam_params, observations, camera_settings, progress_callback=progress_callback
+        cam_params, points_3d_phase3 = self.run_phase3(
+            cam_params, observations, camera_settings,
+            cam_anchor_id=cam_i,  # Anchor cam_i to Phase 2 pose
+            progress_callback=progress_callback
         )
+        report['points_3d'] = points_3d_phase3  # Update with Phase 3 points (consistent with final poses)
 
         
         report['all_cam_ids'] = list(cam_params.keys())
