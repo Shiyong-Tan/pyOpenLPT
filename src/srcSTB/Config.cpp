@@ -2,13 +2,50 @@
 #include "ImageIO.h" // ensure correct case
 
 #include <algorithm>
+#include <filesystem>
 #include <sstream>
+#include <system_error>
+
+namespace {
+namespace fs = std::filesystem;
+
+fs::path absolute_lexical(const fs::path &path) {
+  std::error_code ec;
+  const fs::path abs_path = fs::absolute(path, ec);
+  if (ec) {
+    return path.lexically_normal();
+  }
+  return abs_path.lexically_normal();
+}
+
+std::string resolve_path_from_config_root(const fs::path &config_root,
+                                          const std::string &raw_path) {
+  if (raw_path.empty()) {
+    return raw_path;
+  }
+  const fs::path input(raw_path);
+  const fs::path resolved =
+      input.is_absolute() ? input : (config_root / input);
+  return resolved.lexically_normal().generic_string();
+}
+} // namespace
 
 // --------------------------- BasicSetting ---------------------------
 bool BasicSetting::readConfig(const std::string &config_path) {
-  std::ifstream file(config_path);
+  const fs::path config_abs = absolute_lexical(fs::path(config_path));
+  const fs::path config_root = config_abs.parent_path();
+  _config_root = config_root.generic_string();
+  if (!_config_root.empty()) {
+    char back = _config_root.back();
+    if (back != '/' && back != '\\') {
+      _config_root.push_back('/');
+    }
+  }
+
+  std::ifstream file(config_abs.string());
   if (!file.is_open()) {
-    std::cerr << "Failed to open config file: " << config_path << std::endl;
+    std::cerr << "Failed to open config file: " << config_abs.string()
+              << std::endl;
     return false;
   }
 
@@ -60,6 +97,7 @@ bool BasicSetting::readConfig(const std::string &config_path) {
 
   // number of cameras
   _n_cam = std::stoi(lines[line_id++]);
+  _cam_list.clear();
   _cam_list.reserve(static_cast<size_t>(_n_cam));
   for (int i = 0; i < _n_cam; ++i) {
     parser.str(lines[line_id++]);
@@ -68,17 +106,25 @@ bool BasicSetting::readConfig(const std::string &config_path) {
     std::getline(parser, line, ',');
     int max_intensity = std::stoi(line);
 
-    Camera cam(cam_path); // read parameters from cam_path
-    cam._max_intensity = max_intensity;
-    cam._is_active = true;
-    _cam_list.emplace_back(cam);
+    cam_path = resolve_path_from_config_root(config_root, cam_path);
+
+    auto cam_model_st = CameraFactory::loadFromFile(cam_path);
+    if (!cam_model_st) {
+      THROW_FATAL_CTX(ErrorCode::InvalidCameraState,
+                      "Failed to load camera model from:", cam_path);
+    }
+    auto cam_model = cam_model_st.value();
+    cam_model->max_intensity = max_intensity;
+    cam_model->is_active = true;
+    _cam_list.emplace_back(std::move(cam_model));
     parser.clear();
   }
 
   // image file paths
   _image_file_paths.reserve(static_cast<size_t>(_n_cam));
   for (int i = 0; i < _n_cam; ++i) {
-    _image_file_paths.push_back(lines[line_id++]);
+    _image_file_paths.push_back(
+        resolve_path_from_config_root(config_root, lines[line_id++]));
   }
 
   // axis limits
@@ -99,7 +145,7 @@ bool BasicSetting::readConfig(const std::string &config_path) {
 
   // unit conversion and output path
   _voxel_to_mm = std::stod(lines[line_id++]);
-  _output_path = lines[line_id++];
+  _output_path = resolve_path_from_config_root(config_root, lines[line_id++]);
   if (!_output_path.empty()) {
     char back = _output_path.back();
     if (back != '/' && back != '\\')
@@ -117,7 +163,8 @@ bool BasicSetting::readConfig(const std::string &config_path) {
   // object config file paths
   _object_config_paths.reserve(_object_types.size());
   for (size_t i = 0; i < _object_types.size(); ++i) {
-    _object_config_paths.push_back(lines[line_id++]);
+    _object_config_paths.push_back(
+        resolve_path_from_config_root(config_root, lines[line_id++]));
   }
 
   // track loading
@@ -130,7 +177,8 @@ bool BasicSetting::readConfig(const std::string &config_path) {
     if (!line.empty())
       _load_track_frame = std::stoi(line);
     if (line_id < static_cast<int>(lines.size()))
-      _load_track_path = lines[line_id++];
+      _load_track_path =
+          resolve_path_from_config_root(config_root, lines[line_id++]);
   }
   parser.clear();
 
@@ -262,7 +310,7 @@ bool TracerConfig::readConfig(const std::string &filepath,
     imgio_list.reserve(settings._n_cam);
     for (const auto &path : settings._image_file_paths) {
       ImageIO io;
-      io.loadImgPath("", path);
+      io.loadImgPath(settings._config_root, path);
       imgio_list.push_back(io);
     }
 
@@ -360,10 +408,12 @@ std::unique_ptr<Object3D> BubbleConfig::creatObject3D(CreateArgs args) const {
     if (auto *bb = dynamic_cast<const Bubble3D *>(args._proto))
       up->_r3d = bb->_r3d;
   }
-  if (up->_r3d <= 0.0 && args._compute_bubble_radius && args._cams &&
+  if (up->_r3d <= 0.0 && args._compute_bubble_radius &&
       !up->_obj2d_list.empty()) {
-    up->_r3d =
-        Bubble::calRadiusFromCams(*args._cams, up->_pt_center, up->_obj2d_list);
+    if (args._cam_list) {
+      up->_r3d = Bubble::calRadiusFromCams(*args._cam_list, up->_pt_center,
+                                           up->_obj2d_list);
+    }
   }
   if (up->_r3d <= 0.0)
     up->_r3d = -1.0;

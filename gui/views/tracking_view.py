@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (
     QPushButton, QGroupBox, QGridLayout, QProgressBar,
     QTextEdit, QSplitter, QTabWidget, QLineEdit, QMessageBox,
     QFileDialog, QProgressDialog, QSlider, QCheckBox, QSpinBox, QScrollArea,
-    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QButtonGroup
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QButtonGroup,
+    QComboBox, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QProcess, QIODevice, Signal, Slot, QObject, QThread, QCoreApplication, QSize, QTimer, QPoint, QPointF, QRectF
 from PySide6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QMouseEvent, QWheelEvent
@@ -232,6 +233,44 @@ class TrackLoaderWorker(QObject):
         except Exception as e:
             self.error.emit(str(e))
 
+
+class VSCWorker(QObject):
+    """Worker class to run VSC in a background thread."""
+
+    finished = Signal(bool, str, object)  # success, message, vsc_data
+    error = Signal(str)
+    log = Signal(str)
+
+    def __init__(self, proj_dir, min_track_len, sample_points, min_valid_points,
+                 tolerance_mode='default', tolerance_value=5.0):
+        super().__init__()
+        self.proj_dir = proj_dir
+        self.min_track_len = int(min_track_len)
+        self.sample_points = int(sample_points)
+        self.min_valid_points = int(min_valid_points)
+        self.tolerance_mode = tolerance_mode
+        self.tolerance_value = float(tolerance_value)
+
+    def run(self):
+        try:
+            from modules.vsc import VSCService
+
+            def log_cb(msg):
+                self.log.emit(str(msg))
+
+            service = VSCService(self.proj_dir, log_callback=log_cb)
+            service.set_params(
+                min_track_len=self.min_track_len,
+                sample_points=self.sample_points,
+                min_valid_points=self.min_valid_points,
+                tolerance_mode=self.tolerance_mode,
+                tolerance_value=self.tolerance_value,
+            )
+            success, message, vsc_data = service.run()
+            self.finished.emit(bool(success), str(message), vsc_data)
+        except Exception as e:
+            self.error.emit(str(e))
+
 class TrackingView(QWidget):
     """View for running and monitoring the tracking process."""
     
@@ -280,8 +319,30 @@ class TrackingView(QWidget):
         
         self.vsc_active = False
         self.vsc_data = {}
+        self.vsc_thread = None
+        self.vsc_worker = None
+        self._vsc_lpt = None
+        self._vsc_lpt_unavailable = False
+        self._vsc_cpp_cam_cache_init = {}
+        self._vsc_cpp_cam_cache_optim = {}
+        self._busy_tokens = {}
         
         self._setup_ui()
+
+    def _busy_begin(self, key, task_name):
+        if key in self._busy_tokens:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'begin_busy'):
+            self._busy_tokens[key] = wnd.begin_busy(task_name)
+
+    def _busy_end(self, key):
+        token = self._busy_tokens.pop(key, None)
+        if token is None:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'end_busy'):
+            wnd.end_busy(token)
     
     def _setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -737,7 +798,7 @@ class TrackingView(QWidget):
         
         vsc_layout.addWidget(QLabel("Sample Points:"), 1, 0)
         self.vsc_sample_points = QSpinBox()
-        self.vsc_sample_points.setRange(1000, 100000)
+        self.vsc_sample_points.setRange(1000, 2147483647)
         self.vsc_sample_points.setValue(20000)
         self.vsc_sample_points.setStyleSheet("background-color: #222; color: #fff; border: 1px solid #444;")
         vsc_layout.addWidget(self.vsc_sample_points, 1, 1)
@@ -749,6 +810,39 @@ class TrackingView(QWidget):
         self.vsc_min_valid.setStyleSheet("background-color: #222; color: #fff; border: 1px solid #444;")
         vsc_layout.addWidget(self.vsc_min_valid, 2, 1)
         
+        vsc_layout.addWidget(QLabel("Proj. Tolerance:"), 3, 0)
+        self.vsc_tolerance_mode = QComboBox()
+        self.vsc_tolerance_mode.addItems(["Default (r+1)", "Reproj. Error", "Custom"])
+        self.vsc_tolerance_mode.setStyleSheet("background-color: #222; color: #fff; border: 1px solid #444;")
+        vsc_layout.addWidget(self.vsc_tolerance_mode, 3, 1)
+        
+        self.vsc_tolerance_custom_widget = QWidget()
+        tol_h = QHBoxLayout(self.vsc_tolerance_custom_widget)
+        tol_h.setContentsMargins(0, 0, 0, 0)
+        tol_h.setSpacing(4)
+        self.vsc_tolerance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vsc_tolerance_slider.setRange(1, 200)  # 0.1 to 20.0 px (value / 10)
+        self.vsc_tolerance_slider.setValue(50)  # 5.0 px default
+        self.vsc_tolerance_slider.setStyleSheet("QSlider::groove:horizontal { background: #333; height: 4px; } QSlider::handle:horizontal { background: #2471a3; width: 12px; margin: -4px 0; border-radius: 6px; }")
+        self.vsc_tolerance_spin = QDoubleSpinBox()
+        self.vsc_tolerance_spin.setRange(0.1, 20.0)
+        self.vsc_tolerance_spin.setValue(5.0)
+        self.vsc_tolerance_spin.setSingleStep(0.1)
+        self.vsc_tolerance_spin.setDecimals(1)
+        self.vsc_tolerance_spin.setSuffix(" px")
+        self.vsc_tolerance_spin.setFixedWidth(80)
+        self.vsc_tolerance_spin.setStyleSheet("background-color: #222; color: #fff; border: 1px solid #444;")
+        tol_h.addWidget(self.vsc_tolerance_slider, 1)
+        tol_h.addWidget(self.vsc_tolerance_spin)
+        self.vsc_tolerance_custom_widget.setVisible(False)
+        vsc_layout.addWidget(self.vsc_tolerance_custom_widget, 4, 0, 1, 2)
+        
+        self.vsc_tolerance_slider.valueChanged.connect(lambda v: self.vsc_tolerance_spin.setValue(v / 10.0))
+        self.vsc_tolerance_spin.valueChanged.connect(lambda v: self.vsc_tolerance_slider.setValue(int(v * 10)))
+        self.vsc_tolerance_mode.currentIndexChanged.connect(
+            lambda idx: self.vsc_tolerance_custom_widget.setVisible(idx == 2)
+        )
+        
         # Run VSC Button
         self.vsc_btn = QPushButton(" Run VSC")
         self.vsc_btn.setIcon(qta.icon("fa5s.crosshairs", color="white"))
@@ -759,7 +853,7 @@ class TrackingView(QWidget):
             QPushButton:disabled { background-color: #333; color: #666; }
         """)
         self.vsc_btn.clicked.connect(self._run_vsc)
-        vsc_layout.addWidget(self.vsc_btn, 3, 0, 1, 2)
+        vsc_layout.addWidget(self.vsc_btn, 5, 0, 1, 2)
         
         # Frame List Table for VSC
         self.vsc_frame_table = QTableWidget()
@@ -777,7 +871,7 @@ class TrackingView(QWidget):
             QTableWidget::item:selected { background-color: #005a8c; color: #fff; }
         """)
         self.vsc_frame_table.itemClicked.connect(self._on_vsc_frame_selected)
-        vsc_layout.addWidget(self.vsc_frame_table, 4, 0, 1, 2)
+        vsc_layout.addWidget(self.vsc_frame_table, 6, 0, 1, 2)
 
         
         layout.addWidget(vsc_group)
@@ -851,6 +945,7 @@ class TrackingView(QWidget):
             return
 
         # Start process
+        self._busy_begin('run_tracking', 'Running tracking')
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         if use_python_module:
@@ -984,7 +1079,10 @@ class TrackingView(QWidget):
                         if i + 1 < len(lines):
                             path_line = lines[i+1].strip()
                             if path_line and not path_line.startswith('#'):
-                                output_dir = path_line
+                                if os.path.isabs(path_line):
+                                    output_dir = path_line
+                                else:
+                                    output_dir = os.path.normpath(os.path.join(proj_dir, path_line))
                                 break
         
         track_dir = os.path.join(output_dir, "ConvergeTrack")
@@ -1003,97 +1101,123 @@ class TrackingView(QWidget):
         self.vis_tabs.setCurrentWidget(self.log_text)
         
         # Disable button during execution
+        self._busy_begin('run_vsc', 'Running VSC')
         self.vsc_btn.setEnabled(False)
         self.vsc_btn.setText(" Running VSC...")
-        
-        # Import VSC service
-        try:
-            from modules.vsc import VSCService
-        except ImportError as e:
-            self._append_log(f"[Error] Failed to import VSC module: {e}\n")
-            self.vsc_btn.setEnabled(True)
-            self.vsc_btn.setText(" Run VSC")
-            return
-        
-        # Create and configure service
-        def log_to_ui(msg):
-            self._append_log(msg + "\n")
-            QCoreApplication.processEvents()
-        
-        service = VSCService(proj_dir, log_callback=log_to_ui)
-        service.set_params(
-            min_track_len=self.vsc_min_track_len.value(),
-            sample_points=self.vsc_sample_points.value(),
-            min_valid_points=self.vsc_min_valid.value()
+
+        # Run VSC in background thread to keep UI responsive.
+        self.vsc_thread = QThread()
+        tolerance_modes = ['default', 'reproj', 'custom']
+        tol_mode = tolerance_modes[self.vsc_tolerance_mode.currentIndex()]
+        tol_value = self.vsc_tolerance_spin.value()
+        self.vsc_worker = VSCWorker(
+            proj_dir,
+            self.vsc_min_track_len.value(),
+            self.vsc_sample_points.value(),
+            self.vsc_min_valid.value(),
+            tolerance_mode=tol_mode,
+            tolerance_value=tol_value,
         )
-        
-        # Run VSC
-        success, message, vsc_data = service.run()
-        
-        # Re-enable button
+        self.vsc_worker.moveToThread(self.vsc_thread)
+
+        self.vsc_thread.started.connect(self.vsc_worker.run)
+        self.vsc_worker.log.connect(self._on_vsc_log, Qt.ConnectionType.QueuedConnection)
+        self.vsc_worker.finished.connect(self._on_vsc_finished)
+        self.vsc_worker.error.connect(self._on_vsc_error)
+
+        self.vsc_worker.finished.connect(self.vsc_thread.quit)
+        self.vsc_worker.error.connect(self.vsc_thread.quit)
+        self.vsc_worker.finished.connect(self.vsc_worker.deleteLater)
+        self.vsc_worker.error.connect(self.vsc_worker.deleteLater)
+        self.vsc_thread.finished.connect(self.vsc_thread.deleteLater)
+
+        self.vsc_thread.start()
+
+    def _on_vsc_finished(self, success, message, vsc_data):
+        """Handle completion of background VSC execution."""
         self.vsc_btn.setEnabled(True)
         self.vsc_btn.setText(" Run VSC")
-        
+        self._vsc_cpp_cam_cache_init.clear()
+        self._vsc_cpp_cam_cache_optim.clear()
+
         if success or vsc_data.get('valid_points'):
             self.vsc_data = vsc_data
-            
+
             # Ingest tracks into cache efficiently
             if 'tracks' in vsc_data:
+                proj_dir = self.proj_path_edit.text()
                 self.cached_coords = {}
                 self.cached_lengths = {}
                 self.cached_2d_coords = {}
                 for tid, pts in vsc_data['tracks'].items():
-                    # pts is list of (frame, x, y, z, {cam_idx: (x2d, y2d, r2d)})
                     clean_3d = []
                     clean_2d = []
                     for p in pts:
                         try:
-                            # 3D: [f, x, y, z]
                             clean_3d.append([float(p[0]), float(p[1]), float(p[2]), float(p[3])])
-                            # 2D: (f, {cam_idx: (x2d, y2d, r2d)})
                             if len(p) > 4 and isinstance(p[4], dict):
                                 clean_2d.append((int(p[0]), p[4]))
-                        except: continue
-                    
+                        except Exception:
+                            continue
+
                     if clean_3d:
                         self.cached_coords[tid] = clean_3d
                         self.cached_lengths[tid] = len(clean_3d)
                         if clean_2d:
                             self.cached_2d_coords[tid] = clean_2d
-                
+
                 self.cached_proj_path = proj_dir
-                self.cached_obj_type = "Tracer" # Default for VSC
-                
-                # Compute global axis limits
+                self.cached_obj_type = "Tracer"  # Default for VSC
+
                 all_pts = []
                 for pts in self.cached_coords.values():
-                    # Take x, y, z
                     for p in pts:
                         all_pts.append(p[1:4])
-                
+
                 if all_pts:
                     all_pts = np.array(all_pts, dtype=np.float32)
                     margin = 0.05
                     mi = np.min(all_pts, axis=0)
                     ma = np.max(all_pts, axis=0)
                     diff = ma - mi
-                    self.global_xlim = (mi[0] - diff[0]*margin, ma[0] + diff[0]*margin)
-                    self.global_ylim = (mi[1] - diff[1]*margin, ma[1] + diff[1]*margin)
-                    self.global_zlim = (mi[2] - diff[2]*margin, ma[2] + diff[2]*margin)
-            
-            # Ensure cameras are discovered so 2D view has image paths
+                    self.global_xlim = (mi[0] - diff[0] * margin, ma[0] + diff[0] * margin)
+                    self.global_ylim = (mi[1] - diff[1] * margin, ma[1] + diff[1] * margin)
+                    self.global_zlim = (mi[2] - diff[2] * margin, ma[2] + diff[2] * margin)
+
             self._discover_cameras()
             self._update_vsc_visualization(vsc_data)
-            
+
         if success:
             self._append_log(f"\n[SUCCESS] {message}\n")
-            QMessageBox.information(self, "VSC Complete", 
-                f"Volume Self-Calibration completed successfully!\n\n"
-                f"Optimized cameras saved to camFile_VSC/vsc_cam*.txt\n"
-                f"Log saved to VSC_log.txt")
+            QMessageBox.information(
+                self,
+                "VSC Complete",
+                "Volume Self-Calibration completed successfully!\n\n"
+                "Optimized cameras saved to camFile_VSC/vsc_cam*.txt\n"
+                "Log saved to VSC_log.txt",
+            )
         else:
             self._append_log(f"\n[FAILED] {message}\n")
             QMessageBox.warning(self, "VSC Failed", f"Volume Self-Calibration failed:\n{message}")
+
+        self.vsc_worker = None
+        self.vsc_thread = None
+        self._busy_end('run_vsc')
+
+    @Slot(str)
+    def _on_vsc_log(self, message):
+        """Append VSC worker log on UI thread."""
+        self._append_log(str(message) + "\n")
+
+    def _on_vsc_error(self, message):
+        """Handle unexpected worker error."""
+        self.vsc_btn.setEnabled(True)
+        self.vsc_btn.setText(" Run VSC")
+        self._append_log(f"\n[Error] VSC worker crashed: {message}\n")
+        QMessageBox.warning(self, "VSC Error", f"VSC execution error:\n{message}")
+        self.vsc_worker = None
+        self.vsc_thread = None
+        self._busy_end('run_vsc')
 
     def _update_vsc_visualization(self, vsc_data):
         """Update UI with VSC results."""
@@ -1260,6 +1384,7 @@ class TrackingView(QWidget):
             
         status_str = "Successfully" if exit_code == 0 else f"with exit code {exit_code}"
         self.log_text.append(f"\n[Info] Tracking finished {status_str}.")
+        self._busy_end('run_tracking')
 
     def _load_track_statistics(self, force=False):
         """Initialize background loading of tracks with caching."""
@@ -1295,7 +1420,10 @@ class TrackingView(QWidget):
                         if i + 1 < len(lines):
                             path_line = lines[i+1].strip()
                             if path_line and not path_line.startswith('#'):
-                                output_dir = path_line
+                                if os.path.isabs(path_line):
+                                    output_dir = path_line
+                                else:
+                                    output_dir = os.path.normpath(os.path.join(proj_dir, path_line))
                                 break
         
         track_dir = os.path.join(output_dir, "ConvergeTrack")
@@ -1312,6 +1440,7 @@ class TrackingView(QWidget):
                 return
 
         self.is_loading = True
+        self._busy_begin('load_tracks', 'Loading tracks')
 
         # Show Loading Dialog
         self.loading_dialog = QProgressDialog("Reading tracks, please wait...", None, 0, 0, self)
@@ -1351,6 +1480,7 @@ class TrackingView(QWidget):
             self.cached_2d_coords = track_2d_coords
             # DO discover cameras even if VSC is active to ensure image paths are ready
             self._discover_cameras()
+            self._busy_end('load_tracks')
             return
             
         # Update cache
@@ -1489,6 +1619,7 @@ class TrackingView(QWidget):
         if self.loading_dialog:
             self.loading_dialog.close()
             self.loading_dialog = None
+        self._busy_end('load_tracks')
 
     def _on_loader_error(self, error_msg):
         """Handle errors during track loading."""
@@ -1496,6 +1627,7 @@ class TrackingView(QWidget):
         if hasattr(self, 'loading_dialog'):
             self.loading_dialog.close()
         QMessageBox.critical(self, "Loading Error", f"Failed to load track data:\n{error_msg}")
+        self._busy_end('load_tracks')
 
     def _discover_cameras(self):
         """Discover available cameras from config.txt and create checkboxes."""
@@ -1573,15 +1705,23 @@ class TrackingView(QWidget):
                     with open(txt_path, 'r') as f:
                         img_lines = [l.strip() for l in f if l.strip()]
                         
-                        # VSC Protocol: Paths are relative to the directory containing the .txt file
+                        # Path semantics:
+                        # 1) prefer project-root-relative (current config/preprocess behavior)
+                        # 2) fallback to txt-directory-relative (legacy behavior)
                         base_dir = os.path.dirname(txt_path)
                         resolved_paths = []
                         for l in img_lines:
                              if os.path.isabs(l):
                                  resolved_paths.append(os.path.normpath(l))
                              else:
-                                 # Correctly join filename with its parent directory
-                                 resolved_paths.append(os.path.normpath(os.path.join(base_dir, l)))
+                                 cand_proj = os.path.normpath(os.path.join(proj_path, l)) if proj_path else ""
+                                 cand_base = os.path.normpath(os.path.join(base_dir, l))
+                                 if cand_proj and os.path.exists(cand_proj):
+                                     resolved_paths.append(cand_proj)
+                                 elif os.path.exists(cand_base):
+                                     resolved_paths.append(cand_base)
+                                 else:
+                                     resolved_paths.append(cand_proj if cand_proj else cand_base)
                         
                         self.cam_image_paths[cam_key] = resolved_paths
                 except Exception as e:
@@ -2374,6 +2514,7 @@ class TrackingView(QWidget):
         valid_points = vsc_data.get('valid_points', [])
         cameras_init = vsc_data.get('cameras_init', {})
         cameras_optim = vsc_data.get('cameras_optim', {})
+        overlay_points_optim = vsc_data.get('overlay_points_optim', {})
         
         curr_f = self.current_anim_frame
         
@@ -2384,6 +2525,77 @@ class TrackingView(QWidget):
             return
 
         from modules.vsc.camera_io import project_point
+
+        def get_lpt_module():
+            if self._vsc_lpt_unavailable:
+                return None
+            if self._vsc_lpt is not None:
+                return self._vsc_lpt
+            try:
+                import pyopenlpt as lpt
+                self._vsc_lpt = lpt
+                return self._vsc_lpt
+            except Exception:
+                self._vsc_lpt_unavailable = True
+                return None
+
+        def get_cpp_cam(cam_idx, params, stage):
+            if stage == "optim":
+                cache = self._vsc_cpp_cam_cache_optim
+            else:
+                cache = self._vsc_cpp_cam_cache_init
+
+            proj_dir = self.proj_path_edit.text().strip()
+            if stage == "optim" and proj_dir:
+                optim_path = os.path.join(proj_dir, "camFile_VSC", f"vsc_cam{cam_idx}.txt")
+                if os.path.exists(optim_path):
+                    cam_path = optim_path
+                else:
+                    cam_path = params.get('file_path', params.get('cam_file_path', None))
+            else:
+                cam_path = params.get('file_path', params.get('cam_file_path', None))
+
+            if not cam_path:
+                return None
+            cam_path = os.path.normpath(cam_path)
+            if cam_path in cache:
+                return cache[cam_path]
+
+            lpt = get_lpt_module()
+            if lpt is None:
+                return None
+
+            try:
+                cam_obj = lpt.Camera(cam_path)
+            except Exception:
+                return None
+            cache[cam_path] = cam_obj
+            return cam_obj
+
+        def project_point_model_aware(cam_idx, params, pt3d, stage):
+            model = str(params.get('model', 'PINHOLE')).strip().upper()
+            if model != 'PINPLATE':
+                return project_point(pt3d, params['K'], params['R'], params['tvec'], params.get('dist'))
+
+            lpt = get_lpt_module()
+            if lpt is None:
+                return None
+
+            cam_obj = get_cpp_cam(cam_idx, params, stage)
+            if cam_obj is None:
+                return None
+
+            try:
+                pt = lpt.Pt3D(float(pt3d[0]), float(pt3d[1]), float(pt3d[2]))
+                try:
+                    ok, uv, _ = cam_obj.projectStatus(pt, False)
+                except TypeError:
+                    ok, uv, _ = cam_obj.projectStatus(pt)
+                if not ok:
+                    return None
+                return np.array([float(uv[0]), float(uv[1])], dtype=np.float64)
+            except Exception:
+                return None
         
         for i, cam_name in enumerate(self.selected_cams):
             if i >= 4: break
@@ -2437,20 +2649,29 @@ class TrackingView(QWidget):
                      if cam_idx in pt['2d_per_cam']:
                          det_2d = pt['2d_per_cam'][cam_idx]
                          markers.append((det_2d[0], det_2d[1], QColor(255, 0, 0), "circle"))
+
+                     # 2. Yellow (Before VSC) -> CSV projection (old camera chain)
+                     csv_map = pt.get('2d_csv_per_cam', {})
+                     if cam_idx in csv_map:
+                         csv_2d = csv_map[cam_idx]
+                         markers.append((csv_2d[0], csv_2d[1], QColor(255, 255, 0), "x"))
                      
                      pt3d = pt['pt3d']
+                     corr_id = pt.get('corr_id', None)
+                     pt3d_optim = None
+                     if corr_id is not None:
+                         pt3d_optim = overlay_points_optim.get(corr_id, None)
+                         if pt3d_optim is None:
+                             pt3d_optim = overlay_points_optim.get(str(corr_id), None)
+                     if pt3d_optim is None:
+                         pt3d_optim = pt3d
                      
-                     # 2. Yellow (Before VSC) -> 'x'
-                     if cam_idx in cameras_init:
-                         params = cameras_init[cam_idx]
-                         proj_2d = project_point(pt3d, params['K'], params['R'], params['tvec'], params.get('dist'))
-                         markers.append((proj_2d[0], proj_2d[1], QColor(255, 255, 0), "x"))
-                         
                      # 3. Green (After VSC) -> Plus '+'
                      if cam_idx in cameras_optim:
-                         params = cameras_optim[cam_idx]
-                         proj_2d = project_point(pt3d, params['K'], params['R'], params['tvec'], params.get('dist'))
-                         markers.append((proj_2d[0], proj_2d[1], QColor(0, 255, 0), "plus"))
+                          params = cameras_optim[cam_idx]
+                          proj_2d = project_point_model_aware(cam_idx, params, pt3d_optim, stage="optim")
+                          if proj_2d is not None:
+                              markers.append((proj_2d[0], proj_2d[1], QColor(0, 255, 0), "plus"))
 
             
                 # --- Rendering (Copy-Paste Logic from Standard View with VSC mods) ---

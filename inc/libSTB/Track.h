@@ -39,7 +39,8 @@ public:
 
     // Read from the current file position: consume all consecutive rows
     // that belong to the same TrackID. Stop (and rewind one line) when the ID changes.
-    void loadTrack(std::ifstream& fin, const ObjectConfig& cfg, const std::vector<Camera>& cams);
+    void loadTrack(std::ifstream& fin, const ObjectConfig& cfg,
+                   const std::vector<std::shared_ptr<Camera>>& camera_models);
 
 };
 

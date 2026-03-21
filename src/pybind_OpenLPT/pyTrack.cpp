@@ -35,7 +35,10 @@ void bind_Track(py::module_& m) {
 
         // 仅绑定公开方法；不要暴露/触碰私有成员
         .def("save_track", &Track::saveTrack, py::arg("ostream"), py::arg("track_id"))
-        .def("load_track", &Track::loadTrack, py::arg("ifstream"), py::arg("cfg"), py::arg("cams"))
+        .def("load_track",
+             static_cast<void (Track::*)(std::ifstream&, const ObjectConfig&,
+                                         const std::vector<std::shared_ptr<Camera>>&)>(&Track::loadTrack),
+             py::arg("ifstream"), py::arg("cfg"), py::arg("camera_models"))
 
         // 关键：add_next 适配器（Python 传 Object3D，绑定层重建 unique_ptr 后调库）
         .def("add_next",

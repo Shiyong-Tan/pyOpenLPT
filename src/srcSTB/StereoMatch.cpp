@@ -18,14 +18,12 @@ makeView(const std::vector<std::vector<std::unique_ptr<Object2D>>> &src2d) {
 }
 
 StereoMatch::StereoMatch(
-    const std::vector<Camera> &cams,
+    const std::vector<std::shared_ptr<Camera>> &camera_models,
     const std::vector<std::vector<std::unique_ptr<Object2D>>> &obj2d_list,
     const ObjectConfig &obj_cfg)
-    : _cams(cams) // 引用成员必须在这里初始化
-      ,
-      _obj_cfg(obj_cfg), _obj2d_list(makeView(obj2d_list)) {
+    : _cam_list(camera_models), _obj_cfg(obj_cfg), _obj2d_list(makeView(obj2d_list)) {
   // pre-check
-  const int n_cams = static_cast<int>(_cams.size());
+  const int n_cams = static_cast<int>(_cam_list.size());
   REQUIRE(n_cams > 0, ErrorCode::InvalidArgument, "preCheck: cams is empty.");
   REQUIRE(static_cast<int>(_obj2d_list.size()) == n_cams,
           ErrorCode::InvalidArgument,
@@ -33,7 +31,7 @@ StereoMatch::StereoMatch(
 
   int n_active = 0;
   for (int i = 0; i < n_cams; ++i)
-    if (_cams[i]._is_active)
+    if (_cam_list[i] && _cam_list[i]->is_active)
       ++n_active;
 
   REQUIRE(n_active >= 2, ErrorCode::InvalidArgument,
@@ -51,10 +49,10 @@ StereoMatch::StereoMatch(
   _idmaps.clear();
   _idmaps.resize(n_cams);
   for (int c = 0; c < n_cams; ++c) {
-    if (!_cams[c]._is_active)
+    if (!_cam_list[c] || !_cam_list[c]->is_active)
       continue;
     // create IDMap for this camera
-    _idmaps[c] = std::make_unique<IDMap>(_cams[c].getNRow(), _cams[c].getNCol(),
+    _idmaps[c] = std::make_unique<IDMap>(_cam_list[c]->getNRow(), _cam_list[c]->getNCol(),
                                          _obj_cfg._sm_param.idmap_cell_px);
 
     // build IDMap buckets
@@ -63,7 +61,7 @@ StereoMatch::StereoMatch(
 } // All reference variable should be initialized first
 
 std::vector<std::unique_ptr<Object3D>> StereoMatch::match() const {
-  const int n_cams = static_cast<int>(_cams.size());
+  const int n_cams = static_cast<int>(_cam_list.size());
 
   // ---- Choose reference camera: among active cams, pick the one with the
   // fewest 2D observations. ----
@@ -71,7 +69,7 @@ std::vector<std::unique_ptr<Object3D>> StereoMatch::match() const {
   {
     size_t best = std::numeric_limits<size_t>::max();
     for (int i = 0; i < n_cams; ++i) {
-      if (!_cams[i]._is_active)
+      if (!_cam_list[i] || !_cam_list[i]->is_active)
         continue;
       const size_t sz = _obj2d_list[i].size();
       if (sz < best) {
@@ -186,13 +184,13 @@ void StereoMatch::buildMatch(
     std::vector<std::vector<int>> &build_candidates) const {
   build_candidates.clear();
 
-  const int n_cams = static_cast<int>(_cams.size());
+  const int n_cams = static_cast<int>(_cam_list.size());
 
   // ---- Extract (ref_cam, ref_id) from the incoming pattern (match() already
   // guarantees it exists) ----
   int ref_cam = -1, ref_id = -1;
   for (int c = 0; c < n_cams; ++c) {
-    if (!_cams[c]._is_active)
+    if (!_cam_list[c] || !_cam_list[c]->is_active)
       continue;
     if (match_candidate_id[c] >= 0) {
       ref_cam = c;
@@ -207,7 +205,7 @@ void StereoMatch::buildMatch(
   std::vector<int> pool_cams;
   pool_cams.reserve(n_cams);
   for (int c = 0; c < n_cams; ++c) {
-    if (!_cams[c]._is_active)
+    if (!_cam_list[c] || !_cam_list[c]->is_active)
       continue;
     active_cams.push_back(c);
     if (c != ref_cam)
@@ -247,7 +245,10 @@ void StereoMatch::buildMatch(
 
   {
     const Pt2D &p = _obj2d_list[ref_cam][ref_id]->_pt_center;
-    root.los3d.push_back(_cams[ref_cam].lineOfSight(p));
+    auto los_status = _cam_list[ref_cam]->lineOfSight(p);
+    if (!los_status)
+      return;
+    root.los3d.push_back(los_status.value());
     root.chosen_pts = {p};
   }
 
@@ -383,7 +384,10 @@ void StereoMatch::buildMatch(
 
     {
       const Pt2D &p = _obj2d_list[cam][pid]->_pt_center;
-      nxt.los3d.push_back(_cams[cam].lineOfSight(p));
+      auto los_status = _cam_list[cam]->lineOfSight(p);
+      if (!los_status)
+        continue;
+      nxt.los3d.push_back(los_status.value());
       nxt.chosen_pts.push_back(p);
     }
 
@@ -459,8 +463,7 @@ void StereoMatch::enumerateCandidatesOnCam(
 
   // 1) Project LOS -> 2D image lines on this camera
   std::vector<Line2D> lines_px;
-  buildLinesOnCam(los3d, target_cam, lines_px);
-  if (lines_px.empty())
+  if (!buildLinesOnCam(los3d, target_cam, lines_px) || lines_px.empty())
     return;
 
   // 2) Compute per-row strip intersection in CELL indices
@@ -505,7 +508,7 @@ bool StereoMatch::checkMatch(const std::vector<int> &candidate_ids,
                              double &out_e_check) const {
   // out_e_check = 0.0;
   // out_e_check = std::numeric_limits<double>::quiet_NaN();
-  const int n_cams = static_cast<int>(_cams.size());
+  const int n_cams = static_cast<int>(_cam_list.size());
 
   // ---- 1) Gather LOS from chosen (build) cameras ----
   std::vector<Line3D> los3d;
@@ -515,7 +518,10 @@ bool StereoMatch::checkMatch(const std::vector<int> &candidate_ids,
     if (pid < 0)
       continue; // not chosen on this cam
     const Pt2D &q = _obj2d_list[cam][pid]->_pt_center;
-    los3d.push_back(_cams[cam].lineOfSight(q));
+    auto los_status = _cam_list[cam]->lineOfSight(q);
+    if (!los_status)
+      return false;
+    los3d.push_back(los_status.value());
   }
   if (los3d.size() < 2) {
     // Should not happen if build stage produced a valid candidate,
@@ -525,7 +531,7 @@ bool StereoMatch::checkMatch(const std::vector<int> &candidate_ids,
 
   int n_active_cam = 0;
   for (int c = 0; c < n_cams; ++c)
-    if (_cams[c]._is_active)
+    if (_cam_list[c] && _cam_list[c]->is_active)
       ++n_active_cam;
   if (los3d.size() ==
       n_active_cam) { // all active cams are used in build → nothing to check
@@ -556,7 +562,7 @@ bool StereoMatch::checkMatch(const std::vector<int> &candidate_ids,
 
   // ---- 2) For every active camera that is NOT chosen yet (check cameras) ----
   for (int cam = 0; cam < n_cams; ++cam) {
-    if (!_cams[cam]._is_active)
+    if (!_cam_list[cam] || !_cam_list[cam]->is_active)
       continue; // inactive -> ignore
     if (candidate_ids[cam] >= 0)
       continue; // already used in build -> skip
@@ -579,7 +585,10 @@ bool StereoMatch::checkMatch(const std::vector<int> &candidate_ids,
 
     for (int pid : inliers) {
       const Pt2D &q = _obj2d_list[cam][pid]->_pt_center;
-      Line3D los_q = _cams[cam].lineOfSight(q);
+      auto los_status = _cam_list[cam]->lineOfSight(q);
+      if (!los_status)
+        continue;
+      Line3D los_q = los_status.value();
 
       std::vector<Line3D> los_all = los3d;
       los_all.push_back(los_q);
@@ -600,8 +609,8 @@ bool StereoMatch::checkMatch(const std::vector<int> &candidate_ids,
     if (!std::isfinite(best_err_c) || best_err_c > tol_3d_mm)
       return false; // if the best is larger than tol_3d_mm, reject this
                     // candidate
-    if (best_err_c > out_e_check)
-      out_e_check = best_err_c; // E_check = 各相机 best 的最大
+    if (!std::isfinite(out_e_check) || best_err_c > out_e_check)
+      out_e_check = best_err_c; // E_check = max(best_err_c) over check cameras
   }
 
   // ---- 6) All check cameras have ≥1 supporting point ----
@@ -634,7 +643,7 @@ StereoMatch::pruneMatch(const std::vector<std::vector<int>> &match_candidates,
   using std::size_t;
 
   const size_t M = match_candidates.size();
-  const int n_cams = static_cast<int>(_cams.size());
+  const int n_cams = static_cast<int>(_cam_list.size());
 
   std::vector<std::vector<int>> empty_out;
   if (M == 0)
@@ -695,7 +704,7 @@ StereoMatch::pruneMatch(const std::vector<std::vector<int>> &match_candidates,
 
     const auto &ids = match_candidates[j];
     for (int c = 0; c < n_cams; ++c) {
-      if (!_cams[c]._is_active)
+      if (!_cam_list[c] || !_cam_list[c]->is_active)
         continue;
       const int pid = (c < (int)ids.size()) ? ids[c] : -1;
       if (pid < 0)
@@ -984,8 +993,7 @@ StereoMatch::pruneMatch(const std::vector<std::vector<int>> &match_candidates,
 // order preserved).
 std::vector<std::unique_ptr<Object3D>> StereoMatch::triangulateMatch(
     const std::vector<std::vector<int>> &selected_matches) const {
-  const auto &cams = _cams;
-  const auto &obs2d = _obj2d_list;
+    const auto &obs2d = _obj2d_list;
   const double tol3d = _obj_cfg._sm_param.tol_3d_mm; // [mm]
 
   std::vector<std::unique_ptr<Object3D>> out;
@@ -998,14 +1006,19 @@ std::vector<std::unique_ptr<Object3D>> StereoMatch::triangulateMatch(
   for (const auto &ids : selected_matches) {
     // 1) Build LOS from this match
     los.clear();
-    const int n_cams = static_cast<int>(cams.size());
+    const int n_cams = static_cast<int>(_cam_list.size());
     los.reserve(n_cams);
     for (int c = 0; c < n_cams; ++c) {
       const int pid = ids[c];
       if (pid < 0)
         continue;
       const Pt2D &q = obs2d[c][pid]->_pt_center;
-      los.push_back(cams[c].lineOfSight(q));
+      auto los_status = _cam_list[c]->lineOfSight(q);
+      if (!los_status) {
+        los.clear();
+        break;
+      }
+      los.push_back(los_status.value());
     }
     if (los.size() < 2)
       continue;
@@ -1034,7 +1047,7 @@ std::vector<std::unique_ptr<Object3D>> StereoMatch::triangulateMatch(
     CreateArgs a;
     a._pt_center = pt_world;
     a._obj2d_ready = std::move(obj2d_list);
-    a._cams = &cams; // only needed if Bubble radius should be computed
+    a._cam_list = &_cam_list;
     a._compute_bubble_radius = (_obj_cfg.kind() == ObjectKind::Bubble);
 
     auto obj3d = _obj_cfg.creatObject3D(
@@ -1050,31 +1063,48 @@ std::vector<std::unique_ptr<Object3D>> StereoMatch::triangulateMatch(
 }
 
 // ---- helper: make a 2D line on camera 'cam_id' from a 3D LOS ----
-inline Line2D StereoMatch::makeLine2DFromLOS3D(int cam_id,
-                                               const Line3D &los) const {
-  const Pt2D a = _cams[cam_id].project(los.pt);
-  const Pt2D b = _cams[cam_id].project(Pt3D{los.pt[0] + los.unit_vector[0],
-                                            los.pt[1] + los.unit_vector[1],
-                                            los.pt[2] + los.unit_vector[2]});
-  // REQUIRE(std::isfinite(a[0]) && std::isfinite(a[1]) && std::isfinite(b[0])
-  // && std::isfinite(b[1]),
-  //         ErrorCode::OutOfRange, "Fail projection.");
+inline bool StereoMatch::makeLine2DFromLOS3D(int cam_id, const Line3D &los,
+                                              Line2D &out_line) const {
+  // TODO(refraction): This workaround avoids projecting los.pt (interface point)
+  // to reduce boundary degeneracy in refractive projection. It does NOT address
+  // physical invalid branches (e.g., TIR/parallel geometry) and should be
+  // replaced by a robust failure-aware LOS-to-2D construction.
+  Pt3D p_a{los.pt[0] + los.unit_vector[0], los.pt[1] + los.unit_vector[1],
+           los.pt[2] + los.unit_vector[2]};
+  Pt3D p_b{los.pt[0] + 2.0 * los.unit_vector[0],
+           los.pt[1] + 2.0 * los.unit_vector[1],
+           los.pt[2] + 2.0 * los.unit_vector[2]};
+
+  auto a_status = _cam_list[cam_id]->project(p_a);
+  if (!a_status)
+    return false;
+  auto b_status = _cam_list[cam_id]->project(p_b);
+  if (!b_status)
+    return false;
+
+  const Pt2D a = a_status.value();
+  const Pt2D b = b_status.value();
   Line2D L;
   L.pt = a;
   L.unit_vector = myMATH::createUnitVector(a, b); // assumed normalized
-  return L;
+  out_line = L;
+  return true;
 }
 
 // ---- helper: project a set of LOS to 2D lines on a camera (re-uses output
 // buffer) ----
-inline void StereoMatch::buildLinesOnCam(const std::vector<Line3D> &los3d,
+inline bool StereoMatch::buildLinesOnCam(const std::vector<Line3D> &los3d,
                                          int cam_id,
                                          std::vector<Line2D> &out_lines) const {
   out_lines.clear();
   out_lines.reserve(los3d.size());
   for (const auto &L3 : los3d) {
-    out_lines.push_back(makeLine2DFromLOS3D(cam_id, L3));
+    Line2D line;
+    if (!makeLine2DFromLOS3D(cam_id, L3, line))
+      return false;
+    out_lines.push_back(line);
   }
+  return true;
 }
 
 // ---- early checks & tolerances (decl only; you已有实现或后续实现) ----
@@ -1209,7 +1239,10 @@ bool StereoMatch::checkBackProjection(
   if (chosen_cams.empty())
     return true;
 
-  const Line3D los_t = _cams[target_cam].lineOfSight(q_t);
+  auto los_t_status = _cam_list[target_cam]->lineOfSight(q_t);
+  if (!los_t_status)
+    return false;
+  const Line3D los_t = los_t_status.value();
 
   const double tol2 =
       _obj_cfg._sm_param.tol_2d_px * _obj_cfg._sm_param.tol_2d_px;
@@ -1219,7 +1252,9 @@ bool StereoMatch::checkBackProjection(
     const int ci = chosen_cams[i];
     const Pt2D &qi = chosen_pts[i];
 
-    Line2D L = makeLine2DFromLOS3D(ci, los_t);
+    Line2D L;
+    if (!makeLine2DFromLOS3D(ci, los_t, L))
+      return false;
     if (myMATH::dist2(qi, L) > tol2)
       return false;
   }
@@ -1269,8 +1304,11 @@ bool StereoMatch::bubbleEarlyCheck(const std::vector<int> &cams_in_path,
       continue;
 
     const Pt2D &q = base->_pt_center; // same domain as calibration
-    los.push_back(_cams[cam].lineOfSight(q));
-    cams.push_back(&_cams[cam]);
+    auto los_status = _cam_list[cam]->lineOfSight(q);
+    if (!los_status)
+      return true;
+    los.push_back(los_status.value());
+    cams.push_back(_cam_list[cam].get());
     obj2d_by_cam.push_back(base);
   }
   if (los.size() < 2)
@@ -1310,12 +1348,14 @@ int StereoMatch::selectSecondCameraByLineLength(
     return -1;
 
   auto segLenOnCam = [&](int cam) -> double {
-    Line2D L = makeLine2DFromLOS3D(cam, los_ref);
+    Line2D L;
+    if (!makeLine2DFromLOS3D(cam, los_ref, L))
+      return std::numeric_limits<double>::infinity();
     const double px = L.pt[0], py = L.pt[1];
     const double ux = L.unit_vector[0], uy = L.unit_vector[1];
 
-    const double W = static_cast<double>(_cams[cam].getNCol());
-    const double H = static_cast<double>(_cams[cam].getNRow());
+    const double W = static_cast<double>(_cam_list[cam]->getNCol());
+    const double H = static_cast<double>(_cam_list[cam]->getNRow());
 
     auto in = [](double v, double lo, double hi) { return v >= lo && v <= hi; };
     auto push_if = [&](double x, double y, std::vector<Pt2D> &v) {
@@ -1384,7 +1424,8 @@ int StereoMatch::selectNextCameraByMaxPairAngle(
   std::vector<Line2D> lines_px; // reused buffer
 
   for (int cam : remaining_cams) {
-    buildLinesOnCam(los3d, cam, lines_px);
+    if (!buildLinesOnCam(los3d, cam, lines_px))
+      continue;
 
     double score = 0.0;
     if (lines_px.size() >= 2) {

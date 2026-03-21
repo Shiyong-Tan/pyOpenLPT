@@ -3,10 +3,12 @@
 #include <cstdio>
 #include <cstdlib> // EXIT_SUCCESS / EXIT_FAILURE
 #include <ctime>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <omp.h>
 #include <string>
+#include <system_error>
 #include <vector>
 
 
@@ -37,15 +39,25 @@ inline void init_omp_global(int n_threads = 0) {
 
 // -------------------- 核心逻辑 --------------------
 int run_openlpt(const std::string &config_path) {
+  namespace fs = std::filesystem;
 
   // 全局设置：所有后续浮点输出两位小数
   std::cout.setf(std::ios::fixed, std::ios::floatfield);
   std::cout.precision(2);
 
+  std::string resolved_config_path = config_path;
+  {
+    std::error_code ec;
+    const fs::path cfg_abs = fs::absolute(fs::path(config_path), ec);
+    if (!ec) {
+      resolved_config_path = cfg_abs.lexically_normal().string();
+    }
+  }
+
   BasicSetting basic_settings;
-  if (!basic_settings.readConfig(config_path)) {
+  if (!basic_settings.readConfig(resolved_config_path)) {
     std::cerr << "Error: Failed to read basic configuration from file: "
-              << config_path << std::endl;
+              << resolved_config_path << std::endl;
     return EXIT_FAILURE;
   }
 
@@ -80,7 +92,8 @@ int run_openlpt(const std::string &config_path) {
     // --- Prepare image IO ---
     if (basic_settings._cam_list.size() !=
         basic_settings._image_file_paths.size()) {
-      std::cerr << "Error: #cams (" << basic_settings._cam_list.size()
+      std::cerr << "Error: #cam_list ("
+                << basic_settings._cam_list.size()
                 << ") != #image paths ("
                 << basic_settings._image_file_paths.size() << ")\n";
       return EXIT_FAILURE;
@@ -90,7 +103,7 @@ int run_openlpt(const std::string &config_path) {
     imgio_list.reserve(basic_settings._image_file_paths.size());
     for (const auto &path : basic_settings._image_file_paths) {
       ImageIO io;
-      io.loadImgPath("", path);
+      io.loadImgPath(basic_settings._config_root, path);
       imgio_list.push_back(io);
     }
 

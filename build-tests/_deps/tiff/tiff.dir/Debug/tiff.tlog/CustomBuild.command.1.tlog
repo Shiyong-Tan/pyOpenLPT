@@ -1,0 +1,10 @@
+^D:\0.CODE\OPENLPTGUI\OPENLPT\INC\LIBTIFF\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SD:/0.Code/OpenLPTGUI/OpenLPT -BD:/0.Code/OpenLPTGUI/OpenLPT/build-tests --check-stamp-file D:/0.Code/OpenLPTGUI/OpenLPT/build-tests/_deps/tiff/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

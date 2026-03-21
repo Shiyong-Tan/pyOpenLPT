@@ -2,6 +2,7 @@
 #define SHAKE_H
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <type_traits> // ★ for std::underlying_type_t
 #include <vector>
@@ -28,7 +29,8 @@ inline ObjFlag &operator|=(ObjFlag &a, ObjFlag b) {
 
 class Shake {
 public:
-  Shake(const std::vector<Camera> &cams, const ObjectConfig &obj_cfg);
+  Shake(const std::vector<std::shared_ptr<Camera>> &camera_models,
+        const ObjectConfig &obj_cfg);
   ~Shake() = default;
 
   // shake objects, objs will be updated, return a vector denoting ghost objects
@@ -48,7 +50,7 @@ public:
   };
 
 private:
-  const std::vector<Camera> &_cams;
+  const std::vector<std::shared_ptr<Camera>> &_cam_list;
   const ObjectConfig &_obj_cfg;
   std::vector<Image> _img_res_list; // residual image
   std::vector<double> _score_list;  // shaking score for objects, which is
@@ -119,13 +121,14 @@ private:
 // class for ShakeStrategy, which is inherited by different object strategy
 class ShakeStrategy {
 protected:
-  const std::vector<Camera> &_cams;
+  const std::vector<std::shared_ptr<Camera>> &_cam_list;
   const ObjectConfig &_obj_cfg;
 
 public:
-  explicit ShakeStrategy(const std::vector<Camera> &cams,
+  explicit ShakeStrategy(
+                         const std::vector<std::shared_ptr<Camera>> &camera_models,
                          const ObjectConfig &obj_cfg)
-      : _cams(cams), _obj_cfg(obj_cfg) {}
+      : _cam_list(camera_models), _obj_cfg(obj_cfg) {}
   virtual ~ShakeStrategy() = default;
 
   // 2D projection for an object
@@ -149,7 +152,7 @@ public:
   virtual std::vector<bool>
   selectShakeCam(const Object3D &obj, const std::vector<ROIInfo> &roi_info,
                  const std::vector<Image> &imgOrig) const {
-    return std::vector<bool>(_cams.size(), true);
+    return std::vector<bool>(_cam_list.size(), true);
   };
 
   // additional check for object after shaking, for example, bubble needs to

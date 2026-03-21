@@ -8,8 +8,8 @@
 #include "ObjectInfo.h"
 
 OTF::OTF(int n_cam, int nx, int ny, int nz, AxisLimit const &boundary,
-         std::vector<Camera> const &cam_list) {
-  loadParam(n_cam, nx, ny, nz, boundary, cam_list);
+         const std::vector<std::shared_ptr<Camera>> &camera_models) {
+  loadParam(n_cam, nx, ny, nz, boundary, camera_models);
 };
 
 OTF::OTF(std::string otf_file) { loadParam(otf_file); };
@@ -158,7 +158,7 @@ void OTF::setGrid() {
 
 void OTF::loadParam(int n_cam, int nx, int ny, int nz,
                     AxisLimit const &boundary,
-                    std::vector<Camera> const &cam_list) {
+                    const std::vector<std::shared_ptr<Camera>> &camera_models) {
   if (nx < 2 || ny < 2 || nz < 2) {
     Status st = STATUS_ERR(ErrorCode::InvalidArgument,
                            "Grid number should be larger than 1");
@@ -181,7 +181,8 @@ void OTF::loadParam(int n_cam, int nx, int ny, int nz,
   // a depends on each camera's max_intensity / 2
   _param.a = Matrix<double>(n_cam, _param.n_grid, 125);
   for (int cam = 0; cam < n_cam; ++cam) {
-    double init_val = cam_list[cam]._max_intensity / 2.0;
+    double init_val = camera_models[cam] ? camera_models[cam]->max_intensity / 2.0
+                                         : 125.0;
     for (int g = 0; g < _param.n_grid; ++g)
       _param.a(cam, g) = init_val;
   }

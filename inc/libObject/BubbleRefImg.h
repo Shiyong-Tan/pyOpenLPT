@@ -4,6 +4,7 @@
 #include <string>
 #include <typeinfo>
 #include <vector>
+#include <memory>
 
 #include "BubbleResize.h"
 #include "Matrix.h"
@@ -21,8 +22,9 @@ public:
   bool calBubbleRefImg(
       const std::vector<std::unique_ptr<Object3D>> &objs_out,
       const std::vector<std::vector<std::unique_ptr<Object2D>>> &bb2d_list_all,
-      const std::vector<Camera> &cams, const std::vector<Image> &img_input,
-      std::string output_folder = "", double r_thres = 6, int n_bb_thres = 5);
+      const std::vector<std::shared_ptr<::Camera>> &camera_models,
+      const std::vector<Image> &img_input, std::string output_folder = "",
+      double r_thres = 6, int n_bb_thres = 5);
 
   // Save reference images to folder (e.g. "BubbleRefImg_0.tif", etc.)
   bool saveRefImg(std::string folder, int n_cam) const;

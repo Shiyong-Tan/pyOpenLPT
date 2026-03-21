@@ -21,6 +21,7 @@
 #include "ImageIO.h"
 #include "OTF.h"
 #include "ObjectFinder.h"
+#include "Camera.h"
 #include "VSC.h"
 #include "myMATH.h"
 
@@ -28,6 +29,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <omp.h>
 
 #include <random>
@@ -300,14 +302,17 @@ bool VSC::isReady() const {
 
 void VSC::accumulate(int frame_id, const std::deque<Track> &active_tracks,
                      const std::vector<Image> &images,
-                     const std::vector<Camera> &cams,
+                     const std::vector<std::shared_ptr<Camera>> &camera_models,
                      const ObjectConfig &obj_cfg) {
   // Initialize strategy on first call
   if (!_strategy) {
     initStrategy(obj_cfg);
   }
 
-  const size_t n_cams = cams.size();
+  const size_t n_cams = camera_models.size();
+  if (n_cams == 0) {
+    return;
+  }
 
   // ----- Step 1: Detect 2D objects in all cameras -----
   // Each camera's detections are stored independently for parallel processing.
@@ -410,7 +415,16 @@ void VSC::accumulate(int frame_id, const std::deque<Track> &active_tracks,
 
       // Project 3D point to 2D
       // Project 3D point to 2D
-      Pt2D P2_proj = cams[k].project(P3);
+      if (!camera_models[k]) {
+        all_visible = false;
+        break;
+      }
+      auto proj_status = camera_models[k]->project(P3);
+      if (!proj_status) {
+        all_visible = false;
+        break;
+      }
+      Pt2D P2_proj = proj_status.value();
 
       // ----- Isolation Check using precomputed is_isolated -----
       // Find the nearest candidate to the projected point
@@ -439,9 +453,9 @@ void VSC::accumulate(int frame_id, const std::deque<Track> &active_tracks,
 
       // Check if projection is within image bounds
       if (P2_proj[0] - obj_r_px < 0 ||
-          P2_proj[0] + obj_r_px >= cams[k].getNCol() ||
+          P2_proj[0] + obj_r_px >= camera_models[k]->getNCol() ||
           P2_proj[1] - obj_r_px < 0 ||
-          P2_proj[1] + obj_r_px >= cams[k].getNRow()) {
+          P2_proj[1] + obj_r_px >= camera_models[k]->getNRow()) {
         all_visible = false;
         break;
       }
@@ -980,24 +994,65 @@ VSC::OTFParams VSC::estimateOTFParams(const Matrix<double> &roi,
  * @param cam Camera to extract from.
  * @return [rx, ry, rz, tx, ty, tz, f_eff, k1].
  */
-std::vector<double> getCamExtrinsics(Camera &cam) {
-  Pt3D r_vec = cam.rmtxTorvec(cam._pinhole_param.r_mtx);
-  Pt3D t_vec = cam._pinhole_param.t_vec;
+struct CamParamPack {
+  std::vector<double> params;
+  bool has_k1 = false;
+  bool has_k2 = false;
+};
 
-  double fx = cam._pinhole_param.cam_mtx(0, 0);
-  double fy = cam._pinhole_param.cam_mtx(1, 1);
-  double cx = cam._pinhole_param.cam_mtx(0, 2);
-  double cy = cam._pinhole_param.cam_mtx(1, 2);
+static Pt3D rotationMatrixToVector(const Matrix<double> &r_mtx) {
+  Pt3D r_vec;
+
+  double tr = (myMATH::trace<double>(r_mtx) - 1.0) / 2.0;
+  tr = tr > 1.0 ? 1.0 : tr < -1.0 ? -1.0 : tr;
+  double theta = std::acos(tr);
+  double s = std::sin(theta);
+
+  if (std::abs(s) > 1e-12) {
+    double ratio = theta / (2.0 * s);
+    r_vec[0] = (r_mtx(2, 1) - r_mtx(1, 2)) * ratio;
+    r_vec[1] = (r_mtx(0, 2) - r_mtx(2, 0)) * ratio;
+    r_vec[2] = (r_mtx(1, 0) - r_mtx(0, 1)) * ratio;
+  } else if (tr > 0.0) {
+    r_vec[0] = 0.0;
+    r_vec[1] = 0.0;
+    r_vec[2] = 0.0;
+  } else {
+    r_vec[0] = theta * std::sqrt((r_mtx(0, 0) + 1.0) / 2.0);
+    r_vec[1] =
+        theta * std::sqrt((r_mtx(1, 1) + 1.0) / 2.0) * (r_mtx(0, 1) > 0 ? 1 : -1);
+    r_vec[2] =
+        theta * std::sqrt((r_mtx(2, 2) + 1.0) / 2.0) * (r_mtx(0, 2) > 0 ? 1 : -1);
+  }
+
+  return r_vec;
+}
+
+CamParamPack getCamExtrinsics(const PinholeCamera &cam) {
+  CamParamPack pack;
+  pack.params.resize(12, 0.0);
+
+  const auto &p = cam.param();
+
+  Pt3D r_vec = rotationMatrixToVector(p.r_mtx);
+  Pt3D t_vec = p.t_vec;
+
+  double fx = p.cam_mtx(0, 0);
+  double fy = p.cam_mtx(1, 1);
+  double cx = p.cam_mtx(0, 2);
+  double cy = p.cam_mtx(1, 2);
 
   double k1 = 0.0, k2 = 0.0;
-  if (cam._pinhole_param.dist_coeff.size() > 0)
-    k1 = cam._pinhole_param.dist_coeff[0];
-  if (cam._pinhole_param.dist_coeff.size() > 1)
-    k2 = cam._pinhole_param.dist_coeff[1];
+  pack.has_k1 = p.dist_coeff.size() > 0;
+  pack.has_k2 = p.dist_coeff.size() > 1;
+  if (pack.has_k1)
+    k1 = p.dist_coeff[0];
+  if (pack.has_k2)
+    k2 = p.dist_coeff[1];
 
-  // [rx, ry, rz, tx, ty, tz, fx, fy, cx, cy, k1, k2]
-  return {r_vec[0], r_vec[1], r_vec[2], t_vec[0], t_vec[1], t_vec[2],
-          fx,       fy,       cx,       cy,       k1,       k2};
+  pack.params = {r_vec[0], r_vec[1], r_vec[2], t_vec[0], t_vec[1], t_vec[2],
+                 fx,       fy,       cx,       cy,       k1,       k2};
+  return pack;
 }
 
 /**
@@ -1006,7 +1061,8 @@ std::vector<double> getCamExtrinsics(Camera &cam) {
  * @param cam Camera to update.
  * @param params [rx, ry, rz, tx, ty, tz, f_eff, k1].
  */
-void updateCamExtrinsics(Camera &cam, const std::vector<double> &params) {
+bool updateCamExtrinsics(PinholeCamera &cam, const std::vector<double> &params,
+                         bool has_k1, bool has_k2) {
   // Extract rotation vector
   Pt3D r_vec;
   r_vec[0] = params[0];
@@ -1027,42 +1083,23 @@ void updateCamExtrinsics(Camera &cam, const std::vector<double> &params) {
   double k1 = params[10];
   double k2 = params[11];
 
-  // Update rotation matrix and translation
-  cam._pinhole_param.r_mtx = Rodrigues(r_vec);
-  cam._pinhole_param.t_vec = t_vec;
-
-  // Update intrinsics
-  cam._pinhole_param.cam_mtx(0, 0) = fx;
-  cam._pinhole_param.cam_mtx(1, 1) = fy;
-  cam._pinhole_param.cam_mtx(0, 2) = cx;
-  cam._pinhole_param.cam_mtx(1, 2) = cy;
-
-  // Update distortion k1, k2
-  // Logic: If empty, resize based on non-zero k1/k2.
-  // If exists, update up to what we have, respecting original size.
-  if (cam._pinhole_param.dist_coeff.empty()) {
-    if (k2 != 0.0) {
-      cam._pinhole_param.dist_coeff.resize(2);
-      cam._pinhole_param.n_dist_coeff = 2;
-      cam._pinhole_param.dist_coeff[0] = k1;
-      cam._pinhole_param.dist_coeff[1] = k2;
-    } else if (k1 != 0.0) {
-      cam._pinhole_param.dist_coeff.resize(1);
-      cam._pinhole_param.n_dist_coeff = 1;
-      cam._pinhole_param.dist_coeff[0] = k1;
-    }
-  } else {
-    // If exists, update available slots
-    if (cam._pinhole_param.dist_coeff.size() > 0)
-      cam._pinhole_param.dist_coeff[0] = k1;
-    if (cam._pinhole_param.dist_coeff.size() > 1)
-      cam._pinhole_param.dist_coeff[1] = k2;
+  std::vector<double> dist_coeff;
+  if (has_k2) {
+    dist_coeff = {k1, k2};
+  } else if (has_k1) {
+    dist_coeff = {k1};
   }
 
-  // Update inverse matrices (needed for lineOfSight calculations)
-  cam._pinhole_param.r_mtx_inv = myMATH::inverse(cam._pinhole_param.r_mtx);
-  cam._pinhole_param.t_vec_inv =
-      (cam._pinhole_param.r_mtx_inv * cam._pinhole_param.t_vec) * -1.0;
+  Status st = cam.setExtrinsics(r_vec, t_vec);
+  if (!st)
+    return false;
+  st = cam.setIntrinsics(fx, fy, cx, cy, dist_coeff);
+  if (!st)
+    return false;
+  st = cam.commitUpdate();
+  if (!st)
+    return false;
+  return true;
 }
 
 // ========================================================================
@@ -1100,7 +1137,7 @@ void updateCamExtrinsics(Camera &cam, const std::vector<double> &params) {
 // 3. Finite Differences: Jacobian J is computed numerically.
 // 4. Robustness: Updates are only accepted if reprojection error decreases.
 //
-bool VSC::runVSC(std::vector<Camera> &cams) {
+bool VSC::runVSC(std::vector<std::shared_ptr<Camera>> &camera_models) {
   if (!isReady())
     return false;
 
@@ -1135,16 +1172,25 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
 
   // ----- Collect active camera indices -----
   std::vector<size_t> active_cams;
-  int max_dist_order = 0; // Track max distortion order used
-  for (size_t k = 0; k < cams.size(); ++k) {
-    if (cams[k]._is_active && cams[k]._type == CameraType::PINHOLE) {
-      active_cams.push_back(k);
-      // Check distortion size
-      if (cams[k]._pinhole_param.dist_coeff.size() > 1)
-        max_dist_order = std::max(max_dist_order, 2);
-      else if (cams[k]._pinhole_param.dist_coeff.size() > 0)
-        max_dist_order = std::max(max_dist_order, 1);
-    }
+  std::vector<std::shared_ptr<PinholeCamera>> working_cams;
+  std::vector<bool> has_k1_flags;
+  std::vector<bool> has_k2_flags;
+  for (size_t k = 0; k < camera_models.size(); ++k) {
+    const auto &base_cam = camera_models[k];
+    if (!base_cam)
+      continue;
+    if (!base_cam->is_active || base_cam->type() != CameraType::Pinhole)
+      continue;
+
+    auto pinhole_cam = std::dynamic_pointer_cast<PinholeCamera>(base_cam);
+    if (!pinhole_cam)
+      continue;
+
+    active_cams.push_back(k);
+    auto pack = getCamExtrinsics(*pinhole_cam);
+    has_k1_flags.push_back(pack.has_k1);
+    has_k2_flags.push_back(pack.has_k2);
+    working_cams.push_back(pinhole_cam);
   }
 
   if (active_cams.empty()) {
@@ -1196,13 +1242,11 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
 
   // ----- Initialize joint parameter vector -----
   std::vector<double> params(total_params);
-  std::vector<Camera> working_cams(n_cams);
 
   for (int i = 0; i < n_cams; ++i) {
-    working_cams[i] = cams[active_cams[i]];
-    std::vector<double> cam_params = getCamExtrinsics(working_cams[i]);
+    CamParamPack cam_pack = getCamExtrinsics(*working_cams[i]);
     for (int j = 0; j < n_params_per_cam; ++j) {
-      params[i * n_params_per_cam + j] = cam_params[j];
+      params[i * n_params_per_cam + j] = cam_pack.params[j];
     }
   }
 
@@ -1211,7 +1255,8 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
     for (int i = 0; i < n_cams; ++i) {
       std::vector<double> cam_p(p.begin() + i * n_params_per_cam,
                                 p.begin() + (i + 1) * n_params_per_cam);
-      updateCamExtrinsics(working_cams[i], cam_p);
+      updateCamExtrinsics(*working_cams[i], cam_p, has_k1_flags[i],
+                          has_k2_flags[i]);
     }
   };
 
@@ -1220,11 +1265,25 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
   auto computeErrors = [&](const std::vector<double> &p)
       -> std::tuple<double, double, double, int> {
     // First update cameras
-    std::vector<Camera> temp_cams = working_cams;
+    std::vector<std::shared_ptr<PinholeCamera>> temp_cams;
+    temp_cams.reserve(static_cast<size_t>(n_cams));
+    for (int i = 0; i < n_cams; ++i)
+      temp_cams.push_back(std::make_shared<PinholeCamera>(*working_cams[i]));
     for (int i = 0; i < n_cams; ++i) {
       std::vector<double> cam_p(p.begin() + i * n_params_per_cam,
                                 p.begin() + (i + 1) * n_params_per_cam);
-      updateCamExtrinsics(temp_cams[i], cam_p);
+      if (!updateCamExtrinsics(*temp_cams[i], cam_p, has_k1_flags[i],
+                               has_k2_flags[i])) {
+        return {std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(), 0};
+      }
+    }
+
+    std::vector<std::shared_ptr<Camera>> temp_cam_list;
+    temp_cam_list.reserve(static_cast<size_t>(n_cams));
+    for (int i = 0; i < n_cams; ++i) {
+      temp_cam_list.push_back(std::static_pointer_cast<Camera>(temp_cams[i]));
     }
 
     double total_err = 0.0;
@@ -1238,12 +1297,15 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
       for (const auto &obs : corr.obs) {
         int cam_idx = obs.first;
         Pt2D pt_2d = obs.second;
-        // Undistort and get line of sight
-        Pt2D pt_undist = temp_cams[cam_idx].undistort(
-            pt_2d, temp_cams[cam_idx]._pinhole_param);
-        Line3D los = temp_cams[cam_idx].pinholeLine(pt_undist);
-        lines.push_back(los);
+        auto los_status = temp_cam_list[cam_idx]->lineOfSight(pt_2d);
+        if (!los_status) {
+          lines.clear();
+          break;
+        }
+        lines.push_back(los_status.value());
       }
+      if (lines.size() < 2)
+        continue;
 
       // Triangulate 3D point
       Pt3D pt3d;
@@ -1255,13 +1317,21 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
       }
 
       // Compute reprojection error for each observation
+      bool reproj_ok = true;
       for (const auto &obs : corr.obs) {
         int cam_idx = obs.first;
         Pt2D pt_meas = obs.second;
-        Pt2D pt_proj = temp_cams[cam_idx].project(pt3d);
+        auto proj_status = temp_cam_list[cam_idx]->project(pt3d);
+        if (!proj_status) {
+          reproj_ok = false;
+          break;
+        }
+        Pt2D pt_proj = proj_status.value();
         double reproj_err = myMATH::dist2(pt_proj, pt_meas);
         reproj_err_sum += reproj_err;
       }
+      if (!reproj_ok)
+        continue;
 
       // Triangulation error (from myMATH::triangulation output)
       triang_err_sum += triang_error * triang_error;
@@ -1271,9 +1341,15 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
       // Note: Different scales, but LM handles this via Jacobian weighting
       total_err += triang_error * triang_error;
       for (const auto &obs : corr.obs) {
-        Pt2D pt_proj = temp_cams[obs.first].project(pt3d);
-        total_err += myMATH::dist2(pt_proj, obs.second);
+        auto proj_status = temp_cam_list[obs.first]->project(pt3d);
+        if (!proj_status) {
+          reproj_ok = false;
+          break;
+        }
+        total_err += myMATH::dist2(proj_status.value(), obs.second);
       }
+      if (!reproj_ok)
+        continue;
     }
 
     return {total_err, triang_err_sum, reproj_err_sum, n_valid};
@@ -1322,8 +1398,8 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
       ub[base + 9] = cy + c_bounds;
 
       // Adaptive Distortion Constraints (k1, k2)
-      bool has_k1 = (working_cams[i]._pinhole_param.dist_coeff.size() > 0);
-      bool has_k2 = (working_cams[i]._pinhole_param.dist_coeff.size() > 1);
+      bool has_k1 = has_k1_flags[i];
+      bool has_k2 = has_k2_flags[i];
 
       // k1 bounds
       if (has_k1) {
@@ -1459,7 +1535,7 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
   // ----- Apply final parameters to cameras -----
   updateCamerasFromParams(params);
   for (int i = 0; i < n_cams; ++i) {
-    cams[active_cams[i]] = working_cams[i];
+    camera_models[active_cams[i]] = std::static_pointer_cast<Camera>(working_cams[i]);
   }
 
   // ----- Final error -----
@@ -1473,12 +1549,16 @@ bool VSC::runVSC(std::vector<Camera> &cams) {
 
   // ----- Save cameras -----
   if (!_cfg._output_path.empty()) {
-    for (size_t k = 0; k < cams.size(); ++k) {
-      if (!cams[k]._is_active)
+    for (size_t k = 0; k < camera_models.size(); ++k) {
+      if (!camera_models[k] || !camera_models[k]->is_active)
         continue;
       std::string cam_path =
           _cfg._output_path + "/vsc_cam" + std::to_string(k) + ".txt";
-      cams[k].saveParameters(cam_path);
+      auto st = camera_models[k]->saveParameters(cam_path);
+      if (!st) {
+        std::cerr << "  VSC warning: failed to save camera " << k << ": "
+                  << st.err.toString() << std::endl;
+      }
     }
     std::cout << "  VSC cameras saved to " << _cfg._output_path << std::endl;
   }

@@ -25,42 +25,39 @@ void Track::saveTrack(std::ostream& output, int track_id)
     }
 }
 
-void Track::loadTrack(std::ifstream& fin, const ObjectConfig& cfg, const std::vector<Camera>& cams)
+void Track::loadTrack(std::ifstream& fin, const ObjectConfig& cfg,
+                      const std::vector<std::shared_ptr<Camera>>& camera_models)
 {
     std::string line;
     int my_tid = -1;
 
     while (true) {
-        std::streampos pos = fin.tellg();        // remember start of this line
-        if (!std::getline(fin, line)) break;     // EOF
+        std::streampos pos = fin.tellg();
+        if (!std::getline(fin, line)) break;
         if (line.empty()) continue;
 
         std::istringstream row(line);
 
-        // Parse TrackID (tid), FrameID (fid)
-        std::string s_tid, s_fid; 
+        std::string s_tid, s_fid;
         if (!std::getline(row, s_tid, ',') || !std::getline(row, s_fid, ',')) continue;
 
         int tid = -1, fid = 0;
         try { tid = std::stoi(s_tid); fid = std::stoi(s_fid); }
         catch (...) { continue; }
 
-        // Initialize my_tid on the first valid line; afterward enforce continuity.
         if (my_tid == -1) {
             my_tid = tid;
         } else if (tid != my_tid) {
-            // Next track begins: rewind so caller can process it.
             fin.clear();
             fin.seekg(pos);
             break;
         }
 
-        // Consume the 3D payload from the remainder of the row
-        CreateArgs a;                              // default: construct current kind
+        CreateArgs a;
         auto obj = cfg.creatObject3D(std::move(a));
-        obj->loadObject3D(row);                    // Tracer: X,Y,Z; Bubble: X,Y,Z,R3D
+        obj->loadObject3D(row);
         obj->_is_tracked = true;
-        obj->projectObject2D(cams);
+        obj->projectObject2D(camera_models);
 
         _obj3d_list.emplace_back(std::move(obj));
         _t_list.emplace_back(fid);

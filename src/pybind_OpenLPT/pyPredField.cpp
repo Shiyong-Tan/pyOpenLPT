@@ -22,7 +22,8 @@ protected:
         return std::make_unique<Tracer2D>();  // 只需要有个占位的 2D 对象
     }
 
-    void additional2DProjection(const std::vector<Camera>&) override {
+    void additional2DProjection(
+        const std::vector<std::shared_ptr<Camera>>&) override {
         // 对 PredField 用途来说不需要额外投影
     }
 };

@@ -3,6 +3,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,9 +24,10 @@ public:
   int _frame_end;
   int _fps;
   int _n_thread = 0; // default: 0 means using all threads.
-  std::vector<Camera> _cam_list;
+  std::vector<std::shared_ptr<Camera>> _cam_list;
   AxisLimit _axis_limit;
   double _voxel_to_mm;
+  std::string _config_root;
   std::string _output_path;
   std::vector<std::string> _image_file_paths;
   std::vector<std::string> _object_types;
@@ -143,7 +145,7 @@ struct CreateArgs {
   std::optional<double> _r3d_bubble;    // for Bubble
 
   // Optional for Bubble radius computation
-  const std::vector<Camera> *_cams = nullptr;
+  const std::vector<std::shared_ptr<Camera>> *_cam_list = nullptr;
   bool _compute_bubble_radius = false;
 
   NONCOPYABLE_MOVABLE(CreateArgs);

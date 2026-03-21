@@ -77,11 +77,6 @@ class VSCOptimizer:
     def _log(self, msg: str):
         if self.log_callback:
             self.log_callback(msg)
-            try:
-                from PySide6.QtWidgets import QApplication
-                QApplication.processEvents()
-            except Exception:
-                pass
         else:
             print(msg)
 

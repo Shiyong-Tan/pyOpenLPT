@@ -56,8 +56,14 @@ void bind_ObjectInfo(py::module_& m) {
             [](Object3D& self, size_t i) -> Object2D* { return get_obj2d_at(self, i); },
             py::return_value_policy::reference_internal)
         // Methods
-        .def("projectObject2D",     &Object3D::projectObject2D, py::arg("cam_list"))
-        .def("isReconstructable",   &Object3D::isReconstructable, py::arg("cam_list"))
+        .def("projectObject2D",
+            static_cast<void (Object3D::*)(const std::vector<std::shared_ptr<Camera>>&)>(
+                &Object3D::projectObject2D),
+            py::arg("camera_models"))
+        .def("isReconstructable",
+            static_cast<bool (Object3D::*)(const std::vector<std::shared_ptr<Camera>>&)>(
+                &Object3D::isReconstructable),
+            py::arg("camera_models"))
         // I/O: overloads with file path
         .def("saveObject3D",
             [](const Object3D& self, const std::string& file) {
@@ -89,33 +95,45 @@ void bind_ObjectInfo(py::module_& m) {
     auto bb = m.def_submodule("Bubble");
 
     bb.def("calRadiusFromOneCam",
-           &Bubble::calRadiusFromOneCam,
-           py::arg("cam"), py::arg("X"), py::arg("r_px"));
+           [](const std::shared_ptr<Camera>& cam, const Pt3D& X, double r_px) {
+               if (!cam) {
+                   throw std::runtime_error("Bubble.calRadiusFromOneCam: null camera model");
+               }
+               return Bubble::calRadiusFromOneCam(*cam, X, r_px);
+           },
+           py::arg("camera_model"), py::arg("X"), py::arg("r_px"));
 
     bb.def("cal2DRadius",
-           &Bubble::cal2DRadius,
-           py::arg("cam"), py::arg("X"), py::arg("R"));
+           [](const std::shared_ptr<Camera>& cam, const Pt3D& X, double R) {
+               if (!cam) {
+                   throw std::runtime_error("Bubble.cal2DRadius: null camera model");
+               }
+               return Bubble::cal2DRadius(*cam, X, R);
+           },
+           py::arg("camera_model"), py::arg("X"), py::arg("R"));
 
     // Wrapper: accepts list[Object2D*], deep-copies to vector<unique_ptr<Object2D>>
     bb.def("calRadiusFromCams",
-           [](const std::vector<Camera>& cams,
+           [](const std::vector<std::shared_ptr<Camera>>& camera_models,
               const Pt3D& X,
               const std::vector<Object2D*>& obj2d_list_py) {
                auto tmp = make_unique_obj2d_list(obj2d_list_py);
-               return Bubble::calRadiusFromCams(cams, X, tmp);
+               return Bubble::calRadiusFromCams(camera_models, X, tmp);
            },
-           py::arg("cams"), py::arg("X"), py::arg("obj2d_list"));
+           py::arg("camera_models"), py::arg("X"), py::arg("obj2d_list"));
 
-    // Wrapper: accepts list[Camera] and list[Object2D*], converts to const pointer views
+    // Wrapper: accepts list[CameraModel] and list[Object2D*], converts to const pointer views
     bb.def("checkRadiusConsistency",
            [](const Pt3D& X,
-              const std::vector<Camera>& cams_vec,
+              const std::vector<std::shared_ptr<Camera>>& camera_models,
               const std::vector<Object2D*>& objs_vec,
               double tol_2d_px,
               double tol_3d) {
                std::vector<const Camera*> cams;
-               cams.reserve(cams_vec.size());
-               for (auto const& c : cams_vec) cams.push_back(&c);
+               cams.reserve(camera_models.size());
+               for (auto const& c : camera_models) {
+                   cams.push_back(c.get());
+               }
 
                std::vector<const Object2D*> views;
                views.reserve(objs_vec.size());
@@ -123,6 +141,7 @@ void bind_ObjectInfo(py::module_& m) {
 
                return Bubble::checkRadiusConsistency(X, cams, views, tol_2d_px, tol_3d);
            },
-           py::arg("X"), py::arg("cams"), py::arg("obj2d_by_cam"),
+           py::arg("X"), py::arg("camera_models"), py::arg("obj2d_by_cam"),
            py::arg("tol_2d_px"), py::arg("tol_3d"));
+
 }

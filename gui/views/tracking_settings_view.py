@@ -27,7 +27,23 @@ class TrackingSettingsView(QWidget):
         self.tri_err_3sigma_mm = None # Store for dynamic voxel conversion
         self.detected_cam_files = [] # Store detected camera filenames (e.g. cam0.txt or vsc_cam1.txt)
         self.last_project_path = None # Track changes to prevent overwriting manual paths
+        self._busy_tokens = {}
         self._setup_ui()
+
+    def _busy_begin(self, key, task_name):
+        if key in self._busy_tokens:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'begin_busy'):
+            self._busy_tokens[key] = wnd.begin_busy(task_name)
+
+    def _busy_end(self, key):
+        token = self._busy_tokens.pop(key, None)
+        if token is None:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'end_busy'):
+            wnd.end_busy(token)
     
     def showEvent(self, event):
         """Called when this view is shown. Refresh paths/data from other modules."""
@@ -647,13 +663,11 @@ class TrackingSettingsView(QWidget):
         if " (" in cam_dir:
             cam_dir = cam_dir.split(" (")[0]
             
-        if not self.calibration_view or not hasattr(self.calibration_view, 'wand_calibrator'):
+        if not self.calibration_view:
             return
-            
-        calibrator = self.calibration_view.wand_calibrator
-        if not calibrator.final_params or calibrator.points_3d is None:
-            return # No calibration data or 3D points
-            
+
+        calib_view = self.calibration_view
+
         # Create directory if it doesn't exist
         if not os.path.exists(cam_dir):
             try:
@@ -661,6 +675,30 @@ class TrackingSettingsView(QWidget):
             except OSError as e:
                 print(f"[TrackingSettings] Error creating {cam_dir}: {e}")
                 return
+
+        is_dir_empty = not os.listdir(cam_dir)
+
+        # Refractive export path (PINPLATE)
+        has_refr_result = bool(getattr(calib_view, '_refr_has_result', False))
+        refr_dirty = bool(getattr(calib_view, '_refr_params_dirty', False))
+        if has_refr_result:
+            if refr_dirty or is_dir_empty:
+                if hasattr(calib_view, 'export_refractive_camfiles_to_dir'):
+                    ok = calib_view.export_refractive_camfiles_to_dir(cam_dir)
+                    if ok:
+                        n_cam = len(getattr(calib_view, '_refr_final_cam_params', {}) or {})
+                        print(f"[TrackingSettings] Auto-saved {n_cam} refractive camera params to {cam_dir}")
+                        return
+            # Refractive result exists and output is already synced.
+            # Do not fall back to pinhole export, which would overwrite PINPLATE files.
+            return
+
+        if not hasattr(calib_view, 'wand_calibrator'):
+            return
+             
+        calibrator = calib_view.wand_calibrator
+        if not calibrator.final_params or calibrator.points_3d is None:
+            return # No calibration data or 3D points
         
         # Save each camera directly into cam_dir
         saved_count = 0
@@ -696,14 +734,46 @@ class TrackingSettingsView(QWidget):
             QMessageBox.warning(self, "Invalid Path", "Please select a valid Project Directory first.")
             return
 
+        project_dir = os.path.abspath(project_dir)
+
+        def _clean_ui_path(path_text):
+            p = (path_text or "").strip().replace('\\', '/')
+            if " (" in p:
+                p = p.split(" (")[0]
+            if " (Not Found)" in p:
+                p = p.replace(" (Not Found)", "")
+            return p
+
+        def _to_rel(path_text):
+            p = _clean_ui_path(path_text)
+            if not p:
+                return ""
+            if not os.path.isabs(p):
+                return p.replace('\\', '/')
+            try:
+                rel = os.path.relpath(os.path.abspath(p), start=project_dir)
+            except ValueError:
+                rel = p
+            return rel.replace('\\', '/')
+
+        def _join_rel(base, tail):
+            base = (base or "").replace('\\', '/').rstrip('/')
+            tail = (tail or "").replace('\\', '/').lstrip('/')
+            if not base:
+                return tail
+            if not tail:
+                return base
+            return f"{base}/{tail}"
+
         obj_type = self.obj_type_combo.currentText()
         stb_config_name = "tracerConfig.txt" if obj_type == "Tracer" else "bubbleConfig.txt"
-        stb_config_path = os.path.join(project_dir, stb_config_name).replace('\\', '/')
-        master_config_path = os.path.join(project_dir, "config.txt").replace('\\', '/')
+        stb_config_rel = stb_config_name
+        stb_config_path_abs = os.path.join(project_dir, stb_config_name).replace('\\', '/')
+        master_config_path_abs = os.path.join(project_dir, "config.txt").replace('\\', '/')
 
         try:
             # 1. Save Master config.txt
-            with open(master_config_path, 'w') as f:
+            with open(master_config_path_abs, 'w') as f:
                 f.write("# Frame Range: [startID,endID]\n")
                 f.write(f"{self.frame_start_spin.value()},{self.frame_end_spin.value()}\n")
                 
@@ -719,25 +789,20 @@ class TrackingSettingsView(QWidget):
                 
                 fwrite_cam_info = "# Camera File Path, Max Intensity\n"
                 f.write(fwrite_cam_info)
-                cam_dir = self.camera_path_display.text().strip().replace('\\', '/')
-                if " (" in cam_dir:
-                    cam_dir = cam_dir.split(" (")[0]
+                cam_dir_rel = _to_rel(self.camera_path_display.text())
                 for i in range(n_cams):
                     if i < len(self.detected_cam_files):
                         # Use actual detected filename (e.g. vsc_cam1.txt)
                         fname = self.detected_cam_files[i]
-                        f.write(f"{cam_dir}/{fname},255\n")
+                        f.write(f"{_join_rel(cam_dir_rel, fname)},255\n")
                     else:
                         # Fallback if request n_cams > detected files
-                        f.write(f"{cam_dir}/cam{i}.txt,255\n")
+                        f.write(f"{_join_rel(cam_dir_rel, f'cam{i}.txt')},255\n")
                 
                 f.write("# Image File Path\n")
-                img_dir = self.image_path_display.text().strip().replace('\\', '/')
-                # Image path display might contain "(Not Found)", strip it
-                if " (Not Found)" in img_dir:
-                    img_dir = img_dir.replace(" (Not Found)", "")
+                img_dir_rel = _to_rel(self.image_path_display.text())
                 for i in range(n_cams):
-                    f.write(f"{img_dir}/cam{i}ImageNames.txt\n")
+                    f.write(f"{_join_rel(img_dir_rel, f'cam{i}ImageNames.txt')}\n")
                 
                 f.write("# View Volume: (xmin,xmax,ymin,ymax,zmin,zmax)\n")
                 vol_str = f"{self.vol_x_min.value()},{self.vol_x_max.value()}," \
@@ -749,26 +814,26 @@ class TrackingSettingsView(QWidget):
                 f.write(f"{self.voxel_spin.value()}\n")
                 
                 f.write("# Output Folder Path: \n")
-                f.write(f"{self.output_path.text().strip()}\n")
+                f.write(f"{_to_rel(self.output_path.text())}\n")
                 
                 f.write("# Object Types: \n")
                 f.write(f"{obj_type}\n")
                 
                 f.write("# STB Config Files:\n")
-                f.write(f"{stb_config_path}\n")
+                f.write(f"{stb_config_rel}\n")
                 
                 f.write("# Flag to load previous track files, previous frameID\n")
                 resume_flag = 1 if self.resume_check.isChecked() else 0
                 f.write(f"{resume_flag},{self.resume_frame_spin.value()}\n")
                 
-                results_path = self.output_path.text().strip().replace('\\', '/')
+                results_path_rel = _to_rel(self.output_path.text())
                 f.write("# Path to active long track files\n")
-                f.write(f"{results_path}/ConvergeTrack/\n")
+                f.write(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/\n")
                 f.write("# Path to active short track files\n")
-                f.write(f"{results_path}/ConvergeTrack/\n")
+                f.write(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/\n")
 
             # 2. Save [type]Config.txt
-            with open(stb_config_path, 'w') as f:
+            with open(stb_config_path_abs, 'w') as f:
                 f.write("############################\n")
                 f.write("######### Tracking #########\n")
                 f.write("############################\n")
@@ -814,7 +879,7 @@ class TrackingSettingsView(QWidget):
                     f.write(f"{self.bubble_max_rad.value()}  # maximum bubble size to track\n")
                     f.write(f"{self.bubble_sens.value()} # sensitivity of identify circles\n")
 
-            QMessageBox.information(self, "Success", f"Configuration saved to:\n{master_config_path}\n{stb_config_path}")
+            QMessageBox.information(self, "Success", f"Configuration saved to:\n{master_config_path_abs}\n{stb_config_path_abs}")
             print(f"[TrackingSettings] Saved config files to {project_dir}")
 
         except Exception as e:
@@ -837,20 +902,24 @@ class TrackingSettingsView(QWidget):
             
         # 1. Check if we have live calibration data to sync
         has_live_data = False
-        if self.calibration_view and hasattr(self.calibration_view, 'wand_calibrator'):
-            calibrator = self.calibration_view.wand_calibrator
-            if calibrator and calibrator.final_params:
+        if self.calibration_view:
+            calibrator = self.calibration_view.wand_calibrator if hasattr(self.calibration_view, 'wand_calibrator') else None
+            has_pin_live = bool(calibrator and calibrator.final_params)
+            has_refr_live = bool(getattr(self.calibration_view, '_refr_has_result', False))
+            if has_pin_live or has_refr_live:
                 # If we have live data, we should probably update the files to ensure they are in sync
                 
                 # Check if sync is actually needed:
                 # 1. New results available (dirty flag)
                 # 2. OR Destination folder is missing/empty
                 is_dir_empty = not os.path.exists(cam_dir) or not os.listdir(cam_dir)
-                needs_sync = getattr(calibrator, 'params_dirty', False) or is_dir_empty
+                pin_dirty = bool(getattr(calibrator, 'params_dirty', False)) if has_pin_live else False
+                refr_dirty = bool(getattr(self.calibration_view, '_refr_params_dirty', False)) if has_refr_live else False
+                needs_sync = pin_dirty or refr_dirty or is_dir_empty
                 
                 if needs_sync:
                     # Check if heavy calculation is needed (not in cache)
-                    needs_calc = not (hasattr(calibrator, 'per_frame_errors') and calibrator.per_frame_errors)
+                    needs_calc = bool(has_pin_live and pin_dirty and not (hasattr(calibrator, 'per_frame_errors') and calibrator.per_frame_errors))
                     
                     if needs_calc:
                         from PySide6.QtWidgets import QProgressDialog, QApplication
@@ -892,12 +961,32 @@ class TrackingSettingsView(QWidget):
             
         cams_data = []
         for cf in self.detected_cam_files:
-            data = self._parse_cam_file(os.path.join(cam_dir, cf))
+            cam_file_path = os.path.join(cam_dir, cf)
+            data = self._parse_cam_file(cam_file_path)
             if data:
+                data['cam_file_path'] = cam_file_path
                 cams_data.append(data)
         
         if cams_data:
+            self._estimate_ipr_tolerance_from_cam_errors(cams_data)
             self._estimate_volume_from_cameras(cams_data)
+
+    def _estimate_ipr_tolerance_from_cam_errors(self, cams_data):
+        """Update IPR tolerances from camera reprojection/triangulation statistics."""
+        proj_stats = [c['proj_err'] for c in cams_data if 'proj_err' in c]
+        tri_stats = [c['tri_err'] for c in cams_data if 'tri_err' in c]
+
+        if proj_stats:
+            means_2d = [s[0] for s in proj_stats]
+            stds_2d = [s[1] for s in proj_stats]
+            tol_2d = np.mean(means_2d) + 3 * np.mean(stds_2d)
+            self.ipr_2d_tol.setValue(round(tol_2d, 4))
+
+        if tri_stats:
+            means_3d = [s[0] for s in tri_stats]
+            stds_3d = [s[1] for s in tri_stats]
+            self.tri_err_3sigma_mm = np.mean(means_3d) + 3 * np.mean(stds_3d)
+            self._update_3d_tolerance_voxel()
 
     def _show_cam_params_warning(self):
         """Show warning if camera parameters are missing."""
@@ -915,6 +1004,12 @@ class TrackingSettingsView(QWidget):
         """Parse camera parameter file (Internal Python Implementation)."""
         data = {}
         try:
+            def _split_num_tokens(s):
+                return [tok for tok in s.replace(',', ' ').split() if tok]
+
+            def _parse_num_list(s):
+                return [float(x) for x in _split_num_tokens(s)]
+
             with open(file_path, 'r') as f:
                 lines = f.readlines()
                 
@@ -944,44 +1039,105 @@ class TrackingSettingsView(QWidget):
             
             if "Image Size" in data:
                 # row, col
-                parts = data['Image Size'][0].split(",")
-                params['h'] = int(parts[0])
-                params['w'] = int(parts[1])
+                parts = _split_num_tokens(data['Image Size'][0])
+                if len(parts) >= 2:
+                    params['h'] = int(float(parts[0]))
+                    params['w'] = int(float(parts[1]))
                 
             if "Inverse of Rotation Matrix" in data:
                 R_inv = []
                 for row in data["Inverse of Rotation Matrix"]:
-                    R_inv.append([float(x) for x in row.split(",")])
-                params['R_inv'] = np.array(R_inv)
+                    vals = _parse_num_list(row)
+                    if len(vals) >= 3:
+                        R_inv.append(vals[:3])
+                if len(R_inv) == 3:
+                    params['R_inv'] = np.array(R_inv, dtype=np.float64)
                 
             if "Inverse of Translation Vector" in data:
-                t_inv = [float(x) for x in data["Inverse of Translation Vector"][0].split(",")]
+                t_inv = _parse_num_list(data["Inverse of Translation Vector"][0])
                 params['t_inv'] = np.array(t_inv) # Camera center in world space
                 
             if "Camera Matrix" in data:
                 K = []
                 for row in data["Camera Matrix"]:
-                    K.append([float(x) for x in row.split(",")])
-                params['K'] = np.array(K)
-                
+                    vals = _parse_num_list(row)
+                    if len(vals) >= 3:
+                        K.append(vals[:3])
+                if len(K) == 3:
+                    params['K'] = np.array(K, dtype=np.float64)
+
+            if "Rotation Matrix" in data:
+                R = []
+                for row in data["Rotation Matrix"]:
+                    vals = _parse_num_list(row)
+                    if len(vals) >= 3:
+                        R.append(vals[:3])
+                if len(R) == 3:
+                    params['R'] = np.array(R, dtype=np.float64)
+
+            rvec_file = None
             if "Rotation Vector" in data:
-                rvec = [float(x) for x in data["Rotation Vector"][0].split(",")]
-                params['rvec'] = np.array(rvec)
+                rvec_vals = _parse_num_list(data["Rotation Vector"][0])
+                if len(rvec_vals) >= 3:
+                    rvec_file = np.array(rvec_vals[:3], dtype=np.float64)
+                    params['rvec_file'] = rvec_file
                 
             if "Translation Vector" in data:
-                tvec = [float(x) for x in data["Translation Vector"][0].split(",")]
-                params['tvec'] = np.array(tvec)
+                tvec = _parse_num_list(data["Translation Vector"][0])
+                if len(tvec) >= 3:
+                    params['tvec'] = np.array(tvec[:3], dtype=np.float64)
                 
             if "Distortion Coefficients" in data:
                 # Handle comma separated list
-                raw_dist = data["Distortion Coefficients"][0].split(",")
-                params['dist'] = np.array([float(x) for x in raw_dist if x.strip()])
+                params['dist'] = np.array(_parse_num_list(data["Distortion Coefficients"][0]), dtype=np.float64)
+
+            # Resolve rotation robustly from both Rotation Matrix and Rotation Vector.
+            # Priority: valid Rotation Matrix -> Rodrigues(rvec).
+            rvec_from_R = None
+            if 'R' in params:
+                R = params['R']
+                # Basic orthonormality check
+                try:
+                    RtR = R.T @ R
+                    detR = np.linalg.det(R)
+                    if np.all(np.isfinite(R)) and np.linalg.norm(RtR - np.eye(3)) < 1e-2 and abs(detR - 1.0) < 1e-2:
+                        rv, _ = cv2.Rodrigues(R)
+                        rvec_from_R = rv.ravel().astype(np.float64)
+                except Exception:
+                    rvec_from_R = None
+
+            if rvec_from_R is not None:
+                params['rvec'] = rvec_from_R
+
+                if rvec_file is not None:
+                    # Cross-check consistency (angle between two rotations)
+                    try:
+                        R_file, _ = cv2.Rodrigues(rvec_file.reshape(3, 1))
+                        dR = R_file @ params['R'].T
+                        tr = float(np.trace(dR))
+                        ang = np.degrees(np.arccos(np.clip((tr - 1.0) * 0.5, -1.0, 1.0)))
+                        if ang > 0.1:
+                            print(f"[TrackingSettings] Warning: Rotation Vector/Matrix mismatch in {os.path.basename(file_path)} (angle diff={ang:.4f}deg). Using Rotation Matrix.")
+                    except Exception:
+                        pass
+
+                    # Auto-fix placeholder rvec=0,0,0 from valid rotation matrix.
+                    if np.linalg.norm(rvec_file) < 1e-12:
+                        self._patch_rotation_vector_in_cam_file(file_path, rvec_from_R)
+            elif rvec_file is not None:
+                # Fallback: only Rotation Vector is available
+                params['rvec'] = rvec_file
+                try:
+                    Rv, _ = cv2.Rodrigues(rvec_file.reshape(3, 1))
+                    params['R'] = Rv.astype(np.float64)
+                except Exception:
+                    pass
 
             if "Camera Calibration Error" in data:
                  val = data["Camera Calibration Error"][0]
                  if val != "None":
                      try:
-                         parts = [float(x) for x in val.split(",") if x.strip()]
+                         parts = _parse_num_list(val)
                          if len(parts) == 2:
                              params['proj_err'] = (parts[0], parts[1]) # (mean, std)
                          elif len(parts) == 1:
@@ -992,7 +1148,7 @@ class TrackingSettingsView(QWidget):
                  val = data["Pose Calibration Error"][0]
                  if val != "None":
                      try:
-                         parts = [float(x) for x in val.split(",") if x.strip()]
+                         parts = _parse_num_list(val)
                          if len(parts) == 2:
                              params['tri_err'] = (parts[0], parts[1]) # (mean, std)
                          elif len(parts) == 1:
@@ -1004,40 +1160,167 @@ class TrackingSettingsView(QWidget):
             print(f"Error parsing {file_path}: {e}")
             return None
 
+    def _patch_rotation_vector_in_cam_file(self, file_path, rvec):
+        """Patch '# Rotation Vector' value in-place when file contains placeholder zeros."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            line_idx = None
+            for i, line in enumerate(lines):
+                if line.strip().startswith('# Rotation Vector'):
+                    if i + 1 < len(lines):
+                        line_idx = i + 1
+                    break
+
+            if line_idx is None:
+                return
+
+            new_line = f"{float(rvec[0]):.8g},{float(rvec[1]):.8g},{float(rvec[2]):.8g}\n"
+            old_line = lines[line_idx].strip()
+            if old_line == new_line.strip():
+                return
+
+            lines[line_idx] = new_line
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+
+            print(f"[TrackingSettings] Patched Rotation Vector from Rotation Matrix: {os.path.basename(file_path)}")
+        except Exception as e:
+            print(f"[TrackingSettings] Warning: failed to patch Rotation Vector in {os.path.basename(file_path)}: {e}")
+
     def _estimate_volume_from_cameras(self, cams_data):
-        """Estimate common view volume using voxel grid visibility check."""
-        # 1. Estimate robust working center
-        P0 = self._robust_estimate_working_center(cams_data)
-        if P0 is None:
-            return
+        """Estimate common view volume using adaptive voxel visibility search.
 
-        # 2. Choose automatic coarse box size
-        centers = []
-        for c in cams_data:
-            if 't_inv' in c:
-                centers.append(c['t_inv'])
-            elif 'rvec' in c and 'tvec' in c:
-                R, _ = cv2.Rodrigues(c['rvec'])
-                centers.append((-R.T @ c['tvec'].reshape(3,1)).ravel())
-        
-        if not centers:
-            return
-            
-        centers = np.array(centers)
-        d = np.median(np.linalg.norm(centers - P0, axis=1))
-        # Initial search box is large enough to cover expected volume
-        half = np.array([0.8*d, 0.8*d, 0.8*d])
-        bbmin0, bbmax0 = P0 - half, P0 + half
+        Priority of initial center candidates:
+        1) world origin [0,0,0]
+        2) robust center from camera axes intersections
+        """
 
-        # 3. Coarse scan (20mm steps)
-        bbmin1, bbmax1 = self._common_fov_bbox_voxel(cams_data, bbmin0, bbmax0, step=20.0)
+        def get_center(cam):
+            if 't_inv' in cam:
+                return np.asarray(cam['t_inv'], dtype=np.float64)
+            if 'rvec' in cam and 'tvec' in cam:
+                R, _ = cv2.Rodrigues(cam['rvec'])
+                return (-R.T @ cam['tvec'].reshape(3, 1)).ravel()
+            return None
+
+        centers = [get_center(c) for c in cams_data]
+        centers = [c for c in centers if c is not None and np.all(np.isfinite(c))]
+        if len(centers) < 2:
+            return
+        centers = np.asarray(centers)
+
+        def estimate_initial_half(P_ref):
+            # pinhole FOV-based estimate at reference depth, with robust fallbacks
+            d_ref = np.median(np.linalg.norm(centers - P_ref, axis=1))
+            d_ref = max(float(d_ref), 50.0)
+
+            hx_list, hy_list = [], []
+            for cam in cams_data:
+                if 'K' not in cam or 'w' not in cam or 'h' not in cam:
+                    continue
+                K = cam['K']
+                if K is None or K.shape != (3, 3):
+                    continue
+                fx = float(K[0, 0]) if abs(float(K[0, 0])) > 1e-12 else 0.0
+                fy = float(K[1, 1]) if abs(float(K[1, 1])) > 1e-12 else 0.0
+                if fx <= 0 or fy <= 0:
+                    continue
+                hx_list.append(d_ref * float(cam['w']) / (2.0 * fx))
+                hy_list.append(d_ref * float(cam['h']) / (2.0 * fy))
+
+            if hx_list and hy_list:
+                hx = max(10.0, min(hx_list) * 0.8)
+                hy = max(10.0, min(hy_list) * 0.8)
+            else:
+                # fallback from camera-center spread
+                spread = np.median(np.linalg.norm(centers - P_ref, axis=1))
+                spread = max(float(spread), 50.0)
+                hx = hy = 0.8 * spread
+
+            hz = max(20.0, 0.8 * d_ref)
+            return np.array([hx, hy, hz], dtype=np.float64)
+
+        def adaptive_search(P_ref):
+            # Start from FOV-estimated box
+            half = estimate_initial_half(P_ref)
+            bbmin = P_ref - half
+            bbmax = P_ref + half
+
+            for it in range(7):
+                span = np.maximum(bbmax - bbmin, 1.0)
+                step = float(np.clip(np.max(span) / 30.0, 2.0, 20.0))
+                vmin, vmax = self._common_fov_bbox_voxel(cams_data, bbmin, bbmax, step=step)
+
+                if vmin is None:
+                    # expand and retry
+                    c = 0.5 * (bbmin + bbmax)
+                    h = 0.5 * (bbmax - bbmin) * 1.5
+                    bbmin, bbmax = c - h, c + h
+                    print(f"[TrackingSettings] adaptive coarse iter={it+1}: empty, expanding bbox (x1.5)")
+                    continue
+
+                used = np.maximum(vmax - vmin, step)
+                c = 0.5 * (bbmin + bbmax)
+                h = 0.5 * (bbmax - bbmin)
+
+                # edge occupation: if close to edge, expand; otherwise shrink
+                left_gap = vmin - bbmin
+                right_gap = bbmax - vmax
+                edge_tol = np.maximum(0.1 * h, np.array([step, step, step], dtype=np.float64))
+
+                for ax in range(3):
+                    near_left = left_gap[ax] <= edge_tol[ax]
+                    near_right = right_gap[ax] <= edge_tol[ax]
+                    if near_left or near_right:
+                        h[ax] *= 1.3
+                    else:
+                        target_h = 0.5 * used[ax] + 2.0 * step
+                        h[ax] = max(target_h, h[ax] * 0.8)
+
+                new_bbmin, new_bbmax = c - h, c + h
+                rel = np.max(np.abs((new_bbmax - new_bbmin) - (bbmax - bbmin)) / np.maximum(bbmax - bbmin, 1.0))
+                bbmin, bbmax = new_bbmin, new_bbmax
+
+                print(
+                    f"[TrackingSettings] adaptive coarse iter={it+1}: step={step:.2f}mm, "
+                    f"span=({(bbmax[0]-bbmin[0]):.1f},{(bbmax[1]-bbmin[1]):.1f},{(bbmax[2]-bbmin[2]):.1f}), rel_change={rel:.3f}"
+                )
+
+                if rel < 0.05:
+                    break
+
+            # Final coarse extraction from converged box
+            final_span = np.maximum(bbmax - bbmin, 1.0)
+            final_step = float(np.clip(np.max(final_span) / 30.0, 2.0, 20.0))
+            return self._common_fov_bbox_voxel(cams_data, bbmin, bbmax, step=final_step)
+
+        # Origin first, robust center second
+        candidates = [
+            ("origin", np.array([0.0, 0.0, 0.0], dtype=np.float64)),
+        ]
+        P_robust = self._robust_estimate_working_center(cams_data)
+        if P_robust is not None:
+            candidates.append(("robust", P_robust))
+
+        bbmin1 = bbmax1 = None
+        for name, P_ref in candidates:
+            print(f"[TrackingSettings] Coarse search center={name}, P0={P_ref}")
+            bbmin1, bbmax1 = adaptive_search(P_ref)
+            if bbmin1 is not None:
+                break
+
         if bbmin1 is None:
             print("[TrackingSettings] No coarse common FOV found.")
             return
 
-        # 4. Fine scan (2mm steps for precision, pad 20mm)
-        bbminF, bbmaxF = self._common_fov_bbox_voxel(cams_data, bbmin1 - 20, bbmax1 + 20, step=2.0)
-        
+        # Fine scan from coarse result; adaptive pad for small volumes
+        span1 = np.maximum(bbmax1 - bbmin1, 1.0)
+        pad = float(np.clip(0.1 * np.max(span1), 2.0, 20.0))
+        fine_step = float(np.clip(np.max(span1) / 80.0, 1.0, 2.0))
+        bbminF, bbmaxF = self._common_fov_bbox_voxel(cams_data, bbmin1 - pad, bbmax1 + pad, step=fine_step)
+
         if bbminF is not None:
             # Round outward to nearest multiple of 5
             x_min = np.floor(bbminF[0] / 5.0) * 5.0
@@ -1053,28 +1336,9 @@ class TrackingSettingsView(QWidget):
             self.vol_y_max.setValue(y_max)
             self.vol_z_min.setValue(z_min)
             self.vol_z_max.setValue(z_max)
-            
-            # Update Voxel Size: (maxX - minX) / 1000
+
             voxel_size = (x_max - x_min) / 1000.0
             self.voxel_spin.setValue(voxel_size)
-
-        # 5. Adaptive IPR Tolerances (Mean + 3*Std across all cameras)
-        proj_stats = [c['proj_err'] for c in cams_data if 'proj_err' in c]
-        tri_stats = [c['tri_err'] for c in cams_data if 'tri_err' in c]
-        
-        if proj_stats:
-            # Calculate aggregate 3-sigma across all cameras
-            # Using average of means and average of stds as a robust estimation
-            means_2d = [s[0] for s in proj_stats]
-            stds_2d = [s[1] for s in proj_stats]
-            tol_2d = np.mean(means_2d) + 3 * np.mean(stds_2d)
-            self.ipr_2d_tol.setValue(round(tol_2d, 4))
-            
-        if tri_stats:
-            means_3d = [s[0] for s in tri_stats]
-            stds_3d = [s[1] for s in tri_stats]
-            self.tri_err_3sigma_mm = np.mean(means_3d) + 3 * np.mean(stds_3d)
-            self._update_3d_tolerance_voxel()
 
     def _on_voxel_scale_changed(self):
         """Update 3D tolerance in voxels if scale changes."""
@@ -1173,25 +1437,77 @@ class TrackingSettingsView(QWidget):
             return None, None
 
         visible_all = np.ones(len(pts_w), dtype=bool)
+        pinplate_cam_cache = {}
+        lpt_mod = None
+        lpt_import_failed = False
 
         for cam in cams:
-            if not all(k in cam for k in ['K', 'rvec', 'tvec', 'h', 'w']):
-                continue
-                
-            K = cam['K']
-            dist = cam.get('dist', np.zeros(5))
-            rvec = cam['rvec']
-            tvec = cam['tvec']
-            H, W = cam['h'], cam['w']
+            model = str(cam.get('model', '')).strip().upper()
+            H = cam.get('h')
+            W = cam.get('w')
 
-            img_pts, _ = cv2.projectPoints(pts_w, rvec, tvec, K, dist)
-            uv = img_pts.reshape(-1, 2)
+            ok = None
 
-            R, _ = cv2.Rodrigues(rvec)
-            pts_c = (R @ pts_w.T + tvec.reshape(3,1)).T
-            Zc = pts_c[:, 2]
+            if model == 'PINPLATE' and H is not None and W is not None and 'cam_file_path' in cam:
+                if lpt_mod is None and not lpt_import_failed:
+                    try:
+                        import pyopenlpt as lpt_mod
+                    except Exception:
+                        lpt_import_failed = True
 
-            ok = (Zc > 0) & (uv[:,0] >= 0) & (uv[:,0] < W) & (uv[:,1] >= 0) & (uv[:,1] < H)
+                if lpt_mod is not None:
+                    cam_path = cam['cam_file_path']
+                    cam_obj = pinplate_cam_cache.get(cam_path)
+                    if cam_obj is None:
+                        try:
+                            cam_obj = lpt_mod.Camera(cam_path)
+                            pinplate_cam_cache[cam_path] = cam_obj
+                        except Exception:
+                            cam_obj = None
+
+                    if cam_obj is not None:
+                        try:
+                            pts_world = [
+                                lpt_mod.Pt3D(float(p[0]), float(p[1]), float(p[2]))
+                                for p in pts_w
+                            ]
+                            try:
+                                proj_status = cam_obj.projectBatchStatus(pts_world, False)
+                            except TypeError:
+                                proj_status = cam_obj.projectBatchStatus(pts_world)
+
+                            ok_local = np.zeros(len(pts_w), dtype=bool)
+                            for idx, st in enumerate(proj_status):
+                                if not st or not st[0]:
+                                    continue
+                                uv = st[1]
+                                u = float(uv[0])
+                                v = float(uv[1])
+                                if 0 <= u < W and 0 <= v < H:
+                                    ok_local[idx] = True
+                            ok = ok_local
+                        except Exception:
+                            ok = None
+
+            if ok is None:
+                if not all(k in cam for k in ['K', 'rvec', 'tvec', 'h', 'w']):
+                    continue
+
+                K = cam['K']
+                dist = cam.get('dist', np.zeros(5))
+                rvec = cam['rvec']
+                tvec = cam['tvec']
+                H, W = cam['h'], cam['w']
+
+                img_pts, _ = cv2.projectPoints(pts_w, rvec, tvec, K, dist)
+                uv = img_pts.reshape(-1, 2)
+
+                R, _ = cv2.Rodrigues(rvec)
+                pts_c = (R @ pts_w.T + tvec.reshape(3,1)).T
+                Zc = pts_c[:, 2]
+
+                ok = (Zc > 0) & (uv[:,0] >= 0) & (uv[:,0] < W) & (uv[:,1] >= 0) & (uv[:,1] < H)
+
             visible_all &= ok
             if not np.any(visible_all):
                 return None, None
@@ -1206,6 +1522,7 @@ class TrackingSettingsView(QWidget):
         """Validate current settings by running 2D detection and 3D matching on the first frame."""
         from PySide6.QtWidgets import QProgressDialog, QApplication
         from PySide6.QtCore import Qt
+        self._busy_begin('validate_settings', 'Validating tracking settings')
         
         # 1. Save configuration first to ensure files are up to date
         self._save_configuration()
@@ -1245,7 +1562,7 @@ class TrackingSettingsView(QWidget):
             # Load basic settings
             basic_settings = lpt.BasicSetting()
             basic_settings.readConfig(config_file)
-            cam_list = basic_settings._cam_list
+            camera_models = basic_settings._cam_list
             
             # Select correct config object
             obj_type = self.obj_type_combo.currentText()
@@ -1267,9 +1584,10 @@ class TrackingSettingsView(QWidget):
             
             # Load images for the first frame (frame_id = 0)
             imgio_list = []
+            folder_base = os.path.abspath(project_dir).replace('\\', '/') + '/'
             for path in basic_settings._image_file_paths:
                 io = lpt.ImageIO()
-                io.loadImgPath("", path)
+                io.loadImgPath(folder_base, path)
                 imgio_list.append(io)
                 
             num_cams = len(imgio_list)
@@ -1298,7 +1616,7 @@ class TrackingSettingsView(QWidget):
             QApplication.processEvents()
             
             # Initial 3D match
-            stereomath = lpt.StereoMatch(cam_list, obj2d_list, obj_cfg)
+            stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
             obj3d_list = stereomath.match()
             count_3d = len(obj3d_list)
             print(f"[Validation] Initial Match: found {count_3d} 3D objects.")
@@ -1319,7 +1637,7 @@ class TrackingSettingsView(QWidget):
                 QApplication.processEvents()
                 
                 # Retry matching
-                stereomath = lpt.StereoMatch(cam_list, obj2d_list, obj_cfg)
+                stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
                 obj3d_list = stereomath.match()
                 count_3d = len(obj3d_list)
                 modified_2d = True
@@ -1341,7 +1659,7 @@ class TrackingSettingsView(QWidget):
                 QApplication.processEvents()
                 
                 # Retry matching
-                stereomath = lpt.StereoMatch(cam_list, obj2d_list, obj_cfg)
+                stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
                 obj3d_list = stereomath.match()
                 count_3d = len(obj3d_list)
                 modified_3d = True
@@ -1392,3 +1710,5 @@ class TrackingSettingsView(QWidget):
         except Exception as e:
             progress.close()
             QMessageBox.critical(self, "Validation Error", f"An error occurred during validation:\n{str(e)}")
+        finally:
+            self._busy_end('validate_settings')

@@ -7,7 +7,7 @@
 #include <type_traits>
 
 #include "BubbleRefImg.h"
-#include "CameraUtil.h"
+#include "Camera.h"
 #include "Config.h"
 #include "IPR.h"
 #include "myMATH.h"
@@ -18,14 +18,15 @@
 // - Deterministic via fixed RNG seed for reproducibility.
 static void limit2DObjectNumber(
     std::vector<std::vector<std::unique_ptr<Object2D>>> &o2d_list_all,
-    const std::vector<Camera> &cams, std::size_t cap) {
+    const std::vector<std::shared_ptr<Camera>> &cams,
+    std::size_t cap) {
   if (cap == 0)
     return;
   const std::size_t n_cam = cams.size();
   std::default_random_engine rng(1234);
 
   for (std::size_t cam_id = 0; cam_id < n_cam; ++cam_id) {
-    if (!cams[cam_id]._is_active)
+    if (!cams[cam_id]->is_active)
       continue;
 
     auto &lst = o2d_list_all[cam_id];
@@ -61,24 +62,49 @@ static void filterOutInvalid(std::vector<std::unique_ptr<Object3D>> &objs,
   objs.swap(kept);
 }
 
+static void setActiveAll(std::vector<std::shared_ptr<Camera>> &camera_models) {
+  for (size_t i = 0; i < camera_models.size(); ++i) {
+    if (camera_models[i]) {
+      camera_models[i]->is_active = true;
+    }
+  }
+}
+
+static void setActiveSubset(std::vector<std::shared_ptr<Camera>> &camera_models,
+                            const std::vector<int> &ids) {
+  std::vector<char> is_active(camera_models.size(), 0);
+  for (int id : ids) {
+    if (id >= 0 && static_cast<size_t>(id) < camera_models.size()) {
+      is_active[static_cast<size_t>(id)] = 1;
+    }
+  }
+
+  for (size_t i = 0; i < camera_models.size(); ++i) {
+    if (camera_models[i]) {
+      const bool active = is_active[i] != 0;
+      camera_models[i]->is_active = active;
+    }
+  }
+}
+
 // Run one full IPR iteration on the CURRENT active camera set.
 // - Returns newly reconstructed 3D objects (derived from Object3D).
 // - Mutates `images` in-place (residual/mask updates) for active cameras only.
 // - `cfg` carries both the object type and all IPR parameters.
 // - All indices are GLOBAL cam_id aligned (no compacting).
 static std::vector<std::unique_ptr<Object3D>>
-runSingleIPRIteration(const std::vector<Camera> &cams,
+runSingleIPRIteration(const std::vector<std::shared_ptr<Camera>> &camera_models,
                       std::vector<Image> &images, ObjectConfig &cfg) {
   std::vector<std::unique_ptr<Object3D>> objs_out;
 
   const auto &ipr = cfg._ipr_param;
-  const std::size_t n_cam = cams.size();
+  const std::size_t n_cam = camera_models.size();
 
   // Count active cameras (runIPR ensures >=2; we just need the count for
   // SMParam).
   int n_active = 0;
-  for (const auto &c : cams)
-    if (c._is_active)
+  for (const auto &c : camera_models)
+    if (c->is_active)
       ++n_active;
 
   // 1) 2D detection (GLOBAL cam_id alignment; inactive slots remain empty)
@@ -92,7 +118,7 @@ runSingleIPRIteration(const std::vector<Camera> &cams,
   const clock_t t_find2D_start = clock();
 #pragma omp parallel for schedule(static)
   for (int cam_id = 0; cam_id < static_cast<int>(n_cam); ++cam_id) {
-    if (!cams[cam_id]._is_active)
+    if (!camera_models[cam_id]->is_active)
       continue;
 
     // Implementation should branch internally by reading `cfg` (Tracer/Bubble).
@@ -107,12 +133,12 @@ runSingleIPRIteration(const std::vector<Camera> &cams,
             << " s)" << "\n";
 
   // 1.1) Global limiting (drop randomly across active cameras)
-  limit2DObjectNumber(o2d_list_all, cams,
+  limit2DObjectNumber(o2d_list_all, camera_models,
                       static_cast<std::size_t>(ipr.n_obj2d_process_max));
 
   // 2) Stereo matching (may parallelize internally; active set is fixed this
   // pass)
-  StereoMatch stereo_match(cams, o2d_list_all, cfg);
+  StereoMatch stereo_match(camera_models, o2d_list_all, cfg);
 
   const clock_t t_match_start = clock();
 
@@ -143,14 +169,14 @@ runSingleIPRIteration(const std::vector<Camera> &cams,
     // must pass this before shaking
     auto &bb_cfg = static_cast<BubbleConfig &>(cfg);
 
-    if (!bb_cfg._bb_ref_img._is_valid) {
-      const bool ok = bb_cfg._bb_ref_img.calBubbleRefImg(
-          objs_out,     // std::vector<std::unique_ptr<Object3D>>
-          o2d_list_all, // std::vector<std::vector<std::unique_ptr<Object2D>>>
-          cams,         // std::vector<Camera>
-          images,       // const std::vector<Image>&
-          bb_cfg._output_path // output folder
-      );
+      if (!bb_cfg._bb_ref_img._is_valid) {
+        const bool ok = bb_cfg._bb_ref_img.calBubbleRefImg(
+            objs_out,       // std::vector<std::unique_ptr<Object3D>>
+            o2d_list_all,   // std::vector<std::vector<std::unique_ptr<Object2D>>>
+            camera_models,  // std::vector<std::shared_ptr<Camera>>
+            images,         // const std::vector<Image>&
+            bb_cfg._output_path // output folder
+        );
 
       if (!ok) {
         THROW_FATAL_CTX(ErrorCode::NoEnoughData,
@@ -172,7 +198,7 @@ runSingleIPRIteration(const std::vector<Camera> &cams,
   }
 
   // 3) Shake refinement (updates `images` in-place for active cameras)
-  Shake shaker(cams, cfg);
+  Shake shaker(camera_models, cfg);
   const clock_t t_shake_start = clock();
 
   std::vector<ObjFlag> flags =
@@ -206,7 +232,7 @@ std::vector<std::unique_ptr<Object3D>> IPR::runIPR(ObjectConfig &cfg,
   const IPRParam &ipr_param = cfg._ipr_param;
 
   // Always start from a well-defined state: all cameras active
-  CameraUtil::setActiveAll(_cam_list);
+  setActiveAll(_cam_list);
 
   // drop = 0 .. max_drop; drop=0 means "full set" case.
   // The maximum we can drop is limited by cfg.n_reduced (from ObjectConfig) and
@@ -233,7 +259,7 @@ std::vector<std::unique_ptr<Object3D>> IPR::runIPR(ObjectConfig &cfg,
       const auto &ids = subsets[si];
 
       // Activate exactly this subset (others inactive)
-      CameraUtil::setActiveSubset(_cam_list, ids);
+      setActiveSubset(_cam_list, ids);
 
       // for obtaining bubble reference image or OTF
       // we need to use all cameras
@@ -272,8 +298,8 @@ std::vector<std::unique_ptr<Object3D>> IPR::runIPR(ObjectConfig &cfg,
         // cfg._sm_param.tol_2d_px = tol_2d_px_orig + 1.0 / loops * loop; // 1.0
         // is used for "double" calculation
 
-        auto objs = runSingleIPRIteration(
-            _cam_list, images, cfg); // images will be updated for every loop.
+        auto objs = runSingleIPRIteration(_cam_list, images,
+                                          cfg); // images will be updated for every loop.
 
         if (calibration_loop) {
           cfg._sm_param.match_cam_count =
@@ -298,7 +324,7 @@ std::vector<std::unique_ptr<Object3D>> IPR::runIPR(ObjectConfig &cfg,
   cfg._sm_param.match_cam_count = orig_match_cam_count; // reset back
 
   // Leave system in a well-defined state: all cameras active on exit
-  CameraUtil::setActiveAll(_cam_list);
+  setActiveAll(_cam_list);
 
   std::cout << "IPR FINISH! FOUND " << all_objs.size() << " OBJECTS.\n";
   return all_objs;

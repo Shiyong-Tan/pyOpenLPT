@@ -1,23 +1,27 @@
 import numpy as np
 import cv2
+import os
+from datetime import datetime
 
 import matplotlib
 matplotlib.use('qtagg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QPushButton, QTabWidget, QComboBox, QSpinBox, 
-                             QDoubleSpinBox, QListWidget, QGroupBox, QFormLayout,
-                             QCheckBox, QFileDialog, QScrollArea, QFrame,
-                             QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
-                             QSizePolicy, QGridLayout)
+                              QPushButton, QTabWidget, QComboBox, QSpinBox, 
+                              QDoubleSpinBox, QListWidget, QGroupBox, QFormLayout,
+                              QCheckBox, QFileDialog, QScrollArea, QFrame,
+                              QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
+                              QSizePolicy, QGridLayout, QRadioButton, QButtonGroup)
 from PySide6.QtCore import Qt
 from .widgets import RangeSlider
 from .wand_calibration.wand_calibrator import WandCalibrator
+from .wand_calibration.refraction_wand_calibrator import RefractiveWandCalibrator
 from PySide6.QtGui import QPainter, QPen, QColor, QPixmap, QPainterPath
-from PySide6.QtCore import QRect, Signal, QPoint
+from PySide6.QtCore import QRect, Signal, QPoint, QThread, QTimer, Slot, QObject
 
 class ZoomableImageLabel(QLabel):
     """
@@ -377,6 +381,101 @@ class ZoomableImageLabel(QLabel):
             painter.setPen(QColor(100, 100, 100))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No Image")
 
+class RefractiveCalibWorker(QObject):
+    """
+    Worker thread for refractive calibration to prevent GUI freeze.
+    """
+    progress = Signal(str, float, float, float, float)
+    finished = Signal(bool, object, object, object)
+    error = Signal(str)
+    
+    def __init__(self, wand_points, wand_length, initial_focal, dist_coeff_num, 
+                 active_cam_ids, all_cam_ids, cams_intrinsics, image_size,
+                 num_windows, cam_to_window, window_media, out_path, 
+                 wand_points_filtered=None, camera_settings=None,
+                 precalib_provider=None, use_proj_residuals=False):
+        super().__init__()
+        self.wand_points = wand_points
+        self.wand_points_filtered = wand_points_filtered
+        self.wand_length = wand_length
+        self.initial_focal = initial_focal
+        self.dist_coeff_num = dist_coeff_num
+        self.active_cam_ids = active_cam_ids
+        self.all_cam_ids = all_cam_ids
+        self.cams_intrinsics = cams_intrinsics 
+        self.image_size = image_size
+        self.camera_settings = camera_settings or {}
+        self.precalib_provider = precalib_provider
+        self.use_proj_residuals = bool(use_proj_residuals)
+        
+        # Runtime args
+        self.num_windows = num_windows
+        self.cam_to_window = cam_to_window
+        self.window_media = window_media
+        self.out_path = out_path
+        
+        self._killed = False
+        
+    def run(self):
+        import traceback
+        try:
+            # Mock base calibrator interface
+            class MockWandCalibrator:
+                pass
+            
+            mock_base = MockWandCalibrator()
+            mock_base.wand_points = self.wand_points
+            mock_base.wand_points_filtered = self.wand_points_filtered
+            mock_base.active_cam_ids = self.active_cam_ids
+            mock_base.cams = self.cams_intrinsics
+            mock_base.cameras = self.cams_intrinsics
+            mock_base.dist_coeff_num = self.dist_coeff_num
+            mock_base.wand_length = self.wand_length
+            mock_base.initial_focal = self.initial_focal
+            mock_base.image_size = self.image_size
+            mock_base.camera_settings = self.camera_settings
+
+            # Expose real precalibration capability when available.
+            if self.precalib_provider is not None and hasattr(self.precalib_provider, 'run_precalibration_check'):
+                mock_base.run_precalibration_check = self.precalib_provider.run_precalibration_check
+            
+            # Instantiate
+            from .wand_calibration.refraction_wand_calibrator import RefractiveWandCalibrator
+            calibrator = RefractiveWandCalibrator(mock_base)
+            
+            # Define callback
+            def cb(phase, r=None, l=None, p=None, c=None):
+                if self._killed: raise RuntimeError("Worker Killed")
+                # Backward compatibility:
+                # old callbacks pass (phase, ray, len, cost)
+                # new callbacks pass (phase, ray, len, proj, cost)
+                if c is None:
+                    c = p if p is not None else 0.0
+                    p = 0.0
+                self.progress.emit(str(phase), float(r) if r is not None else -1.0, 
+                                          float(l) if l is not None else -1.0,
+                                          float(p) if p is not None else -1.0,
+                                          float(c))
+            
+            # Run calibration
+            success, cam_params, report, dataset = calibrator.calibrate(
+                num_windows=self.num_windows,
+                cam_to_window=self.cam_to_window,
+                window_media=self.window_media,
+                out_path=self.out_path,
+                verbosity=1,
+                progress_callback=cb,
+                use_proj_residuals=self.use_proj_residuals,
+            )
+            
+            # [FIX] Propagate per-frame errors back to main thread
+            dataset['per_frame_errors'] = getattr(calibrator.base, 'per_frame_errors', {})
+            
+            self.finished.emit(success, cam_params, report, dataset)
+            
+        except Exception as e:
+            self.error.emit(traceback.format_exc())
+
 class NumericTableWidgetItem(QTableWidgetItem):
     """TableWidgetItem that sorts numerically instead of alphabetically."""
     def __lt__(self, other):
@@ -384,6 +483,16 @@ class NumericTableWidgetItem(QTableWidgetItem):
             return float(self.text()) < float(other.text())
         except ValueError:
             return super().__lt__(other)
+
+
+class TrimmedDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that trims trailing zeros in display text."""
+    def textFromValue(self, value):
+        text = f"{float(value):.{self.decimals()}f}"
+        text = text.rstrip('0').rstrip('.')
+        if text in ("", "-0"):
+            return "0"
+        return text
 
 class Calibration3DViewer(QWidget):
     def __init__(self, parent=None):
@@ -400,6 +509,11 @@ class Calibration3DViewer(QWidget):
             self.ax = self.figure.add_subplot(111, projection='3d')
             self.reset_plot()
             self._initialized = True
+            
+            # Scroll wheel zoom
+            self._zoom_factor = 1.0
+            self.canvas.mpl_connect('scroll_event', self._on_scroll)
+            
             print("[Calibration3DViewer] Initialized successfully")
         except Exception as e:
             print(f"[Calibration3DViewer] ERROR during init: {e}")
@@ -409,7 +523,45 @@ class Calibration3DViewer(QWidget):
             # Fallback: show error label
             layout = QVBoxLayout(self)
             layout.addWidget(QLabel(f"3D Viewer Error: {e}"))
+    
+    def _on_scroll(self, event):
+        """Handle mouse scroll wheel for zooming."""
+        if event.inaxes != self.ax:
+            return
         
+        # Zoom factor adjustment
+        if event.button == 'up':
+            scale = 0.9  # Zoom in (reduce limits)
+        elif event.button == 'down':
+            scale = 1.1  # Zoom out (expand limits)
+        else:
+            return
+        
+        self._zoom_factor *= scale
+        
+        # Get current limits
+        xlim = self.ax.get_xlim3d()
+        ylim = self.ax.get_ylim3d()
+        zlim = self.ax.get_zlim3d()
+        
+        # Compute centers
+        x_center = (xlim[0] + xlim[1]) / 2
+        y_center = (ylim[0] + ylim[1]) / 2
+        z_center = (zlim[0] + zlim[1]) / 2
+        
+        # Compute new half-widths
+        x_half = (xlim[1] - xlim[0]) / 2 * scale
+        y_half = (ylim[1] - ylim[0]) / 2 * scale
+        z_half = (zlim[1] - zlim[0]) / 2 * scale
+        
+        # Apply new limits
+        self.ax.set_xlim3d([x_center - x_half, x_center + x_half])
+        self.ax.set_ylim3d([y_center - y_half, y_center + y_half])
+        self.ax.set_zlim3d([z_center - z_half, z_center + z_half])
+        
+        self.canvas.draw_idle()
+        
+
     def reset_plot(self):
         self.ax.clear()
         self.ax.set_facecolor('black')
@@ -434,7 +586,7 @@ class Calibration3DViewer(QWidget):
         
         self.canvas.draw()
         
-    def plot_calibration(self, cameras, points_3d=None):
+    def plot_calibration(self, cameras, points_3d=None, axis_map: str = None):
         """Plot cameras and points in 3D (MATLAB style)."""
         self.ax.clear()
         
@@ -444,9 +596,14 @@ class Calibration3DViewer(QWidget):
         self.ax.xaxis.label.set_color('white')
         self.ax.yaxis.label.set_color('white')
         self.ax.zaxis.label.set_color('white')
-        self.ax.set_xlabel('X (m)')
-        self.ax.set_ylabel('Y (m)')
-        self.ax.set_zlabel('Z (m)')
+        if axis_map == 'y_up':
+            self.ax.set_xlabel('X (m)')
+            self.ax.set_ylabel('Z (m)')
+            self.ax.set_zlabel('Y (m)')
+        else:
+            self.ax.set_xlabel('X (m)')
+            self.ax.set_ylabel('Y (m)')
+            self.ax.set_zlabel('Z (m)')
         
         # Keep pane borders but remove fill
         self.ax.xaxis.pane.fill = False
@@ -458,14 +615,21 @@ class Calibration3DViewer(QWidget):
         
         # Convert mm to m (divide by 1000)
         scale = 1000.0
+        def map_point(p):
+            if axis_map == 'y_up':
+                return np.array([p[0], p[2], p[1]])
+            return np.array(p)
         
         all_x, all_y, all_z = [], [], []
         
         # 1. Plot Wand Points (Blue)
         if points_3d is not None and len(points_3d) > 0:
-            xs = points_3d[:, 0] / scale
-            ys = points_3d[:, 1] / scale
-            zs = points_3d[:, 2] / scale
+            pts = points_3d / scale
+            if axis_map == 'y_up':
+                pts = pts[:, [0, 2, 1]]
+            xs = pts[:, 0]
+            ys = pts[:, 1]
+            zs = pts[:, 2]
             self.ax.scatter(xs, ys, zs, c='#0077FF', s=5, marker='.', alpha=0.7, label='Wand Points')
             all_x.extend(xs)
             all_y.extend(ys)
@@ -480,6 +644,7 @@ class Calibration3DViewer(QWidget):
                     t = params['T']
                     C = -R.T @ t
                     C = C.flatten() / scale
+                    C = map_point(C)
                     camera_data.append((c_id, C, R))
                     all_x.append(C[0])
                     all_y.append(C[1])
@@ -508,6 +673,7 @@ class Calibration3DViewer(QWidget):
             
             # Direction line (length = half of range)
             z_dir = R.T @ np.array([0, 0, 1]) * axis_len_m
+            z_dir = map_point(z_dir)
             end_pt = C + z_dir
             self.ax.plot3D([C[0], end_pt[0]], [C[1], end_pt[1]], [C[2], end_pt[2]], 
                            color='#FFFF00', linewidth=2)
@@ -515,6 +681,232 @@ class Calibration3DViewer(QWidget):
         self.ax.set_box_aspect([1, 1, 1])
         
         self.canvas.draw()
+        
+    def plot_refractive(self, cameras, window_planes, points_3d=None):
+        """Plot refractive calibration results (Cameras + Points + Window Planes)."""
+        # Ensure cameras have 'R' and 'T' keys (convert from rvec/tvec if needed)
+        import cv2
+        converted_cams = {}
+        for cid, params in cameras.items():
+            # Handle both dict format and numpy array format (refractive calibrator)
+            if isinstance(params, np.ndarray):
+                # Array format: [rvec(3), tvec(3), f, cx, cy, k1, k2]
+                arr = params.flatten()
+                rvec = arr[0:3].reshape(3, 1)
+                tvec = arr[3:6].reshape(3, 1)
+                R, _ = cv2.Rodrigues(rvec)
+                cam_data = {'R': R, 'T': tvec, 'rvec': rvec, 'tvec': tvec}
+            elif isinstance(params, dict):
+                cam_data = dict(params)  # Copy
+                if 'R' not in cam_data and 'rvec' in cam_data:
+                    rvec = np.array(cam_data['rvec']).reshape(3, 1)
+                    R, _ = cv2.Rodrigues(rvec)
+                    cam_data['R'] = R
+                if 'T' not in cam_data and 'tvec' in cam_data:
+                    cam_data['T'] = np.array(cam_data['tvec']).reshape(3, 1)
+            else:
+                # Unknown format, skip
+                continue
+            converted_cams[cid] = cam_data
+
+        
+        # First plot standard elements (cameras + points)
+        self.plot_calibration(converted_cams, points_3d, axis_map='y_up')
+        
+        # Now add window planes (positioned between cameras and 3D points)
+        scale = 1000.0  # mm -> m
+        
+        try:
+            # Calculate bounding box of 3D points and cameras (in meters)
+            all_pts = []
+            cam_positions = {}
+            
+            # Collect camera positions
+            for cid, cam_data in converted_cams.items():
+                if 'R' in cam_data and 'T' in cam_data:
+                    R = cam_data['R']
+                    t = cam_data['T']
+                    C = -R.T @ t  # Camera center in world coords
+                    C = C.flatten() / scale
+                    cam_positions[cid] = C
+                    all_pts.append(C)
+            
+            # Collect 3D point positions
+            if points_3d is not None and len(points_3d) > 0:
+                pts_m = points_3d / scale
+                pts_center = np.mean(pts_m, axis=0)
+                pts_min = np.min(pts_m, axis=0)
+                pts_max = np.max(pts_m, axis=0)
+                all_pts.append(pts_min)
+                all_pts.append(pts_max)
+            else:
+                pts_center = np.zeros(3)
+            
+            # Reference point (mean of points if available, otherwise origin)
+            if points_3d is not None and len(points_3d) > 0:
+                pts_m = points_3d / scale
+                x_ref = np.mean(pts_m, axis=0)
+            else:
+                x_ref = np.zeros(3)
+
+            # Overall bounding box from cameras + points (or origin fallback)
+            bbox_sources = []
+            if cam_positions:
+                bbox_sources.extend(cam_positions.values())
+            if points_3d is not None and len(points_3d) > 0:
+                bbox_sources.extend((points_3d / scale).tolist())
+            else:
+                bbox_sources.append(x_ref)
+
+            if bbox_sources:
+                bbox_sources = np.array(bbox_sources)
+                overall_min = np.min(bbox_sources, axis=0)
+                overall_max = np.max(bbox_sources, axis=0)
+                diag = np.linalg.norm(overall_max - overall_min)
+                pad = 0.1 * diag if diag > 1e-9 else 0.1
+                overall_min = overall_min - pad
+                overall_max = overall_max + pad
+            else:
+                overall_min = np.array([-0.5, -0.5, -0.5])
+                overall_max = np.array([0.5, 0.5, 0.5])
+
+            # AABB vertices (0..7) and edges
+            x0, y0, z0 = overall_min
+            x1, y1, z1 = overall_max
+            bbox_pts = np.array([
+                [x0, y0, z0], [x1, y0, z0], [x0, y1, z0], [x1, y1, z0],
+                [x0, y0, z1], [x1, y0, z1], [x0, y1, z1], [x1, y1, z1]
+            ])
+            bbox_edges = [
+                (0, 1), (1, 3), (3, 2), (2, 0),
+                (4, 5), (5, 7), (7, 6), (6, 4),
+                (0, 4), (1, 5), (2, 6), (3, 7)
+            ]
+
+            def _unique_points(points, eps=1e-6):
+                uniq = []
+                for p in points:
+                    if not any(np.linalg.norm(p - q) < eps for q in uniq):
+                        uniq.append(p)
+                return uniq
+
+            def _plane_aabb_intersections(n, p_ref):
+                pts = []
+                for i, j in bbox_edges:
+                    p0 = bbox_pts[i]
+                    p1 = bbox_pts[j]
+                    s0 = np.dot(n, p0 - p_ref)
+                    s1 = np.dot(n, p1 - p_ref)
+
+                    if abs(s0) < 1e-9:
+                        pts.append(p0)
+                    if abs(s1) < 1e-9:
+                        pts.append(p1)
+
+                    if s0 * s1 < 0:
+                        denom = s1 - s0
+                        if abs(denom) < 1e-12:
+                            continue
+                        t = -s0 / denom
+                        if 0.0 <= t <= 1.0:
+                            pts.append(p0 + t * (p1 - p0))
+                return _unique_points(pts)
+
+            def _sort_points_on_plane(points, n):
+                if abs(n[2]) > 0.9:
+                    temp = np.array([1.0, 0.0, 0.0])
+                else:
+                    temp = np.array([0.0, 0.0, 1.0])
+                u = np.cross(n, temp)
+                u = u / (np.linalg.norm(u) + 1e-12)
+                v = np.cross(n, u)
+                v = v / (np.linalg.norm(v) + 1e-12)
+
+                pts = np.array(points)
+                proj = np.stack([pts @ u, pts @ v], axis=1)
+                center = np.mean(proj, axis=0)
+                angles = np.arctan2(proj[:, 1] - center[1], proj[:, 0] - center[0])
+                order = np.argsort(angles)
+                return pts[order]
+
+            def _clip_polygon_by_plane(poly, n, p_ref, eps=1e-9):
+                if poly is None or len(poly) == 0:
+                    return []
+                clipped = []
+                num = len(poly)
+                for i in range(num):
+                    curr = poly[i]
+                    prev = poly[i - 1]
+                    d_curr = np.dot(n, curr - p_ref)
+                    d_prev = np.dot(n, prev - p_ref)
+                    curr_in = d_curr <= eps
+                    prev_in = d_prev <= eps
+
+                    if curr_in and prev_in:
+                        clipped.append(curr)
+                    elif prev_in and not curr_in:
+                        t = d_prev / (d_prev - d_curr + eps)
+                        clipped.append(prev + t * (curr - prev))
+                    elif not prev_in and curr_in:
+                        t = d_prev / (d_prev - d_curr + eps)
+                        clipped.append(prev + t * (curr - prev))
+                        clipped.append(curr)
+                return _unique_points(clipped, eps=1e-6)
+
+            plane_defs = []
+            for wid, plane in window_planes.items():
+                if 'plane_n' not in plane or 'plane_pt' not in plane:
+                    continue
+
+                n = np.array(plane['plane_n'], dtype=float)
+                p_ref = np.array(plane['plane_pt'], dtype=float) / scale
+
+                norm_n = np.linalg.norm(n)
+                if norm_n < 1e-6:
+                    continue
+                n = n / norm_n
+                if np.dot(n, x_ref - p_ref) > 0:
+                    n = -n
+
+                plane_defs.append((wid, n, p_ref))
+
+            for wid, n, p_ref in plane_defs:
+                inter_pts = _plane_aabb_intersections(n, p_ref)
+                if len(inter_pts) < 3:
+                    continue
+
+                poly_pts = _sort_points_on_plane(inter_pts, n)
+
+                for owid, on, op_ref in plane_defs:
+                    if owid == wid:
+                        continue
+                    poly_pts = _clip_polygon_by_plane(poly_pts, on, op_ref)
+                    if len(poly_pts) < 3:
+                        break
+
+                if len(poly_pts) < 3:
+                    continue
+
+                poly_pts_viz = np.array(poly_pts)[:, [0, 2, 1]]
+                poly = Poly3DCollection([poly_pts_viz], alpha=0.3, facecolors='#00d4ff',
+                                        edgecolors='#00d4ff', linewidths=0.5)
+                self.ax.add_collection3d(poly)
+
+                label_pt = np.mean(poly_pts, axis=0)
+                label_pt = np.array([label_pt[0], label_pt[2], label_pt[1]])
+                self.ax.text(label_pt[0], label_pt[1], label_pt[2],
+                             f"Win {wid}", color='#00d4ff', fontsize=8)
+            
+            self.canvas.draw()
+            
+        except Exception as e:
+            import traceback
+            print(f"[Viz] Error plotting windows: {e}")
+            print(traceback.format_exc())
+
+
+
+
 
 class CameraCalibrationView(QWidget):
 # ... (skip to create_wand_tab_v2)
@@ -641,7 +1033,7 @@ class CameraCalibrationView(QWidget):
         self._apply_input_style(self.wand_type_combo)
         self.wand_type_combo.addItems(["Dark on Bright", "Bright on Dark"])
         
-        self.radius_range = RangeSlider(min_val=1, max_val=500, initial_min=20, initial_max=200, suffix=" px")
+        self.radius_range = RangeSlider(min_val=1, max_val=200, initial_min=20, initial_max=200, suffix=" px")
         
         from .widgets import SimpleSlider
         self.sensitivity_slider = SimpleSlider(min_val=0.5, max_val=1.0, initial=0.85, decimals=2)
@@ -692,6 +1084,54 @@ class CameraCalibrationView(QWidget):
         self.frame_table.setFixedHeight(120) 
         det_layout.addWidget(self.frame_table)
 
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(14)
+        mode_row.addWidget(QLabel("Detection Mode:"))
+
+        self.detect_mode_group = QButtonGroup(self)
+        self.detect_mode_fast = QRadioButton("fast")
+        self.detect_mode_reliable = QRadioButton("reliable")
+        self.detect_mode_fast.setChecked(True)
+
+        detect_mode_radio_style = """
+            QRadioButton {
+                color: #eaeaea;
+                spacing: 8px;
+            }
+            QRadioButton::indicator {
+                width: 8px;
+                height: 8px;
+                border: 1px solid #ffffff;
+                background: transparent;
+                border-radius: 5px;
+                image: none;
+            }
+            QRadioButton::indicator:unchecked {
+                background: transparent;
+            }
+            QRadioButton::indicator:checked {
+                border: 1px solid #ffffff;
+                background: #00d26a;
+            }
+        """
+        self.detect_mode_fast.setStyleSheet(detect_mode_radio_style)
+        self.detect_mode_reliable.setStyleSheet(detect_mode_radio_style)
+
+        self.detect_mode_fast.setToolTip(
+            "fast but less accurate, recommended for good quality image without distortion."
+        )
+        self.detect_mode_reliable.setToolTip(
+            "reliable but slower, recommended for camera system with refraction."
+        )
+
+        self.detect_mode_group.addButton(self.detect_mode_fast)
+        self.detect_mode_group.addButton(self.detect_mode_reliable)
+        mode_row.addWidget(self.detect_mode_fast)
+        mode_row.addWidget(self.detect_mode_reliable)
+        mode_row.addStretch()
+        det_layout.addLayout(mode_row)
+
         # Actions
         self.btn_detect_single = QPushButton("Test Detect (Current Frame)")
         self.btn_detect_single.setStyleSheet(btn_style)
@@ -727,7 +1167,8 @@ class CameraCalibrationView(QWidget):
         
         self.wand_model_combo = QComboBox()
         self._apply_input_style(self.wand_model_combo)
-        self.wand_model_combo.addItems(["Pinhole", "Polynomial"])
+        self.wand_model_combo.addItems(["Pinhole", "Pinhole+Refraction"])
+        self.wand_model_combo.currentIndexChanged.connect(self._on_model_changed)
         
         self.wand_len_spin = QDoubleSpinBox()
         self._apply_input_style(self.wand_len_spin)
@@ -735,17 +1176,131 @@ class CameraCalibrationView(QWidget):
         self.wand_len_spin.setRange(1, 5000)
         self.wand_len_spin.setSuffix(" mm")
         
-        # Distortion Coefficient Count (0 = no distortion, up to 4)
-        self.dist_coeff_spin = QSpinBox()
-        self._apply_input_style(self.dist_coeff_spin)
-        self.dist_coeff_spin.setValue(0)
-        self.dist_coeff_spin.setRange(0, 4)
-        self.dist_coeff_spin.setToolTip("Number of radial distortion coefficients (0=none, 1=k1, 2=k1+k2, etc.)")
+        # Distortion Model Selection (None, k1, k1+k2)
+        self.dist_model_combo = QComboBox()
+        self._apply_input_style(self.dist_model_combo)
+        self.dist_model_combo.addItems(["None (0)", "Radial k1 (1)", "Radial k1+k2 (2)"])
+        self.dist_model_combo.setCurrentIndex(0)
 
         cal_form.addRow("Camera Model:", self.wand_model_combo)
         cal_form.addRow("Wand Length:", self.wand_len_spin)
-        cal_form.addRow("Dist Coeffs:", self.dist_coeff_spin)
+        cal_form.addRow("Distortion params:", self.dist_model_combo)
         cal_layout.addWidget(cal_group)
+
+        # --- Refraction Settings (shown only if Pinhole+Refraction) ---
+        self.refraction_group = QGroupBox("Refraction Settings")
+        self.refraction_group.setStyleSheet(self.GROUP_BOX_STYLE)
+        ref_layout = QVBoxLayout(self.refraction_group)
+        ref_layout.setContentsMargins(5, 15, 5, 5)
+        
+        # Window Count and Camera-Window Mapping
+        ref_top_layout = QFormLayout()
+        self.window_count_spin = QSpinBox()
+        self.window_count_spin.setRange(1, 10)
+        self.window_count_spin.setValue(1)
+        self._apply_input_style(self.window_count_spin)
+        self.window_count_spin.valueChanged.connect(self._on_window_count_changed)
+        ref_top_layout.addRow("Number of Windows:", self.window_count_spin)
+        ref_layout.addLayout(ref_top_layout)
+        
+        ref_layout.addWidget(QLabel("Camera-Window Mapping:"))
+        self.cam_window_table = QTableWidget()
+        self.cam_window_table.setColumnCount(2)
+        self.cam_window_table.setHorizontalHeaderLabels(["Camera ID", "Window"])
+        self.cam_window_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.cam_window_table.verticalHeader().setVisible(False)
+        self.cam_window_table.setFixedHeight(120)
+        self.cam_window_table.setStyleSheet("background-color: transparent; border: 1px solid #333;")
+        ref_layout.addWidget(self.cam_window_table)
+        
+        ref_layout.addSpacing(10)
+        ref_layout.addWidget(QLabel("Window Configuration (for selected type):"))
+
+        # Diagrammatic Layout (QHBoxLayout)
+        diagram_layout = QHBoxLayout()
+        diagram_layout.setSpacing(2)
+
+        # Segment 1: Camera Side (Air)
+        seg1 = QWidget()
+        seg1_layout = QVBoxLayout(seg1)
+        seg1_layout.setContentsMargins(2, 2, 2, 2)
+        seg1_layout.addWidget(QLabel("Camera side"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.media1_combo = QComboBox()
+        self.media1_combo.addItems(["Air", "Other"])
+        self.media1_index = QDoubleSpinBox()
+        self.media1_index.setRange(1.0, 2.0)
+        self.media1_index.setValue(1.0)
+        self._apply_input_style(self.media1_combo)
+        self._apply_input_style(self.media1_index)
+        seg1_layout.addWidget(self.media1_combo)
+        seg1_layout.addWidget(self.media1_index)
+        diagram_layout.addWidget(seg1)
+
+        # Segment 2: Window (Acrylic/Glass)
+        seg2 = QFrame()
+        # Blue vertical bar style: bluer background, left and right borders only
+        seg2.setStyleSheet("""
+            background-color: rgba(0, 170, 255, 60); 
+            border-left: 2px solid #00aaff; 
+            border-right: 2px solid #00aaff;
+            border-top: none;
+            border-bottom: none;
+        """)
+        seg2_layout = QVBoxLayout(seg2)
+        seg2_layout.setContentsMargins(2, 2, 2, 2)
+        
+        lbl_window = QLabel("Window")
+        lbl_window.setStyleSheet("border: none; background: transparent; font-weight: bold;")
+        seg2_layout.addWidget(lbl_window, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.media2_combo = QComboBox()
+        self.media2_combo.addItems(["Acrylic", "Glass", "Other"])
+        self.media2_index = QDoubleSpinBox()
+        self.media2_index.setRange(1.0, 2.5)
+        self.media2_index.setValue(1.49)
+        self.media2_thick = QDoubleSpinBox()
+        self.media2_thick.setRange(0.1, 100.0)
+        self.media2_thick.setValue(10.0)
+        self.media2_thick.setSuffix(" mm")
+        self._apply_input_style(self.media2_combo)
+        self._apply_input_style(self.media2_index)
+        self._apply_input_style(self.media2_thick)
+        seg2_layout.addWidget(self.media2_combo)
+        seg2_layout.addWidget(self.media2_index)
+        
+        lbl_thick = QLabel("Thickness:")
+        lbl_thick.setStyleSheet("border: none; background: transparent;")
+        seg2_layout.addWidget(lbl_thick, alignment=Qt.AlignmentFlag.AlignCenter)
+        seg2_layout.addWidget(self.media2_thick)
+        diagram_layout.addWidget(seg2)
+
+        # Segment 3: Object Side (Water)
+        seg3 = QWidget()
+        seg3_layout = QVBoxLayout(seg3)
+        seg3_layout.setContentsMargins(2, 2, 2, 2)
+        seg3_layout.addWidget(QLabel("Object side"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.media3_combo = QComboBox()
+        self.media3_combo.addItems(["Water", "Other"])
+        self.media3_index = QDoubleSpinBox()
+        self.media3_index.setRange(1.0, 2.0)
+        self.media3_index.setValue(1.33)
+        self._apply_input_style(self.media3_combo)
+        self._apply_input_style(self.media3_index)
+        seg3_layout.addWidget(self.media3_combo)
+        seg3_layout.addWidget(self.media3_index)
+        diagram_layout.addWidget(seg3)
+
+        ref_layout.addLayout(diagram_layout)
+        cal_layout.addWidget(self.refraction_group)
+        self.refraction_group.setVisible(False) # Hidden by default
+
+        # Connect Refraction Logic
+        self.media1_combo.currentIndexChanged.connect(self._on_refraction_media_changed)
+        self.media2_combo.currentIndexChanged.connect(self._on_refraction_media_changed)
+        self.media3_combo.currentIndexChanged.connect(self._on_refraction_media_changed)
+        self._on_refraction_media_changed() # Initialize read-only states
+        
+        # Initial population of refraction camera table
+        self._update_refraction_cam_table(4)
         
         cal_layout.addStretch()
         
@@ -957,6 +1512,7 @@ class CameraCalibrationView(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to load points:\n{msg}")
     def __init__(self):
         super().__init__()
+        self._busy_tokens = {}
         
         # Style Constants
         self.GROUP_BOX_STYLE = """
@@ -979,14 +1535,42 @@ class CameraCalibrationView(QWidget):
         
         self.setup_ui()
 
+    def _busy_begin(self, key, task_name):
+        if key in self._busy_tokens:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'begin_busy'):
+            self._busy_tokens[key] = wnd.begin_busy(task_name)
+
+    def _busy_end(self, key):
+        token = self._busy_tokens.pop(key, None)
+        if token is None:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'end_busy'):
+            wnd.end_busy(token)
+
     def setup_ui(self):
         # Initialize data structures
         self.plate_images = [] # List of absolute paths
         self.wand_images = {}  # Dict {cam_idx: [paths]}
         self.wand_calibrator = WandCalibrator() # Init calibrator
+        self._refr_has_result = False
+        self._refr_params_dirty = False
+        self._refr_final_cam_params = None
+        self._refr_window_planes = None
+        self._refr_cam_to_window = None
+        self._refr_window_media = None
+        self._refr_proj_err_stats = {}
+        self._refr_tri_err_stats = {}
+        self._refr_use_proj_residuals = False
         self.plate_cam_labels = {} # Map {cam_idx: ZoomableImageLabel}
         self.plate_3d_viewer = Calibration3DViewer() # Init 3D viewer for plate
         self.all_camera_params = {} # Accumulate calibrated camera params {cam_idx: {...}}
+        self.plate_refraction_settings = {}  # Per-camera UI-only refraction settings
+        self.plate_intrinsics_settings = {}  # Per-camera intrinsic UI settings for refraction mode
+        self.plate_image_size_hints = {}  # {cam_idx: (width, height)} from loaded plate images
+        self._plate_intrinsics_autofilled_once = set()  # cam_idx set; do not auto-overwrite after first fill
         
         # New: Tracking for indexed points across images
         self.saved_calibration_data = {} # {(cam_idx, path): {'keypoints': [], 'indices': [], 'plane': int}}
@@ -1005,6 +1589,13 @@ class CameraCalibrationView(QWidget):
         # Force input field styles for this view (Style fix)
         self.setStyleSheet("""
              QComboBox::drop-down { border: none; }
+             QToolTip {
+                 background-color: #101722;
+                 color: #dbe9ff;
+                 border: none;
+                 padding: 6px 8px;
+                 border-radius: 4px;
+             }
         """)
 
         # Main Tabs
@@ -1389,7 +1980,20 @@ class CameraCalibrationView(QWidget):
         
         # --- CONTROL TAB 2: Calibration ---
         cal_tab = QWidget()
-        cal_layout = QVBoxLayout(cal_tab)
+        cal_tab_wrap_layout = QVBoxLayout(cal_tab)
+        cal_tab_wrap_layout.setContentsMargins(0, 0, 0, 0)
+
+        cal_scroll = QScrollArea()
+        cal_scroll.setWidgetResizable(True)
+        cal_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        cal_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        cal_scroll.setStyleSheet("background-color: transparent;")
+
+        cal_content = QWidget()
+        cal_content.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        cal_content.setStyleSheet("background-color: #000000;")
+
+        cal_layout = QVBoxLayout(cal_content)
         cal_layout.setSpacing(15)
         cal_layout.setContentsMargins(15, 15, 15, 15)
         
@@ -1409,7 +2013,8 @@ class CameraCalibrationView(QWidget):
         # 2. Model
         self.plate_model_combo = QComboBox()
         self._apply_input_style(self.plate_model_combo)
-        self.plate_model_combo.addItems(["Pinhole"])
+        self.plate_model_combo.addItems(["Pinhole", "Pinhole+Refraction"])
+        self.plate_model_combo.currentIndexChanged.connect(self._on_plate_model_changed)
         cal_form.addRow("Model:", self.plate_model_combo)
         
         # 3. Resolution
@@ -1420,8 +2025,10 @@ class CameraCalibrationView(QWidget):
             sb.setRange(1, 10000)
         self.cal_img_width.setValue(1280)
         self.cal_img_height.setValue(800)
-        cal_form.addRow("Image Width (px):", self.cal_img_width)
-        cal_form.addRow("Image Height (px):", self.cal_img_height)
+        self.cal_img_width_label = QLabel("Image Width (px):")
+        self.cal_img_height_label = QLabel("Image Height (px):")
+        cal_form.addRow(self.cal_img_width_label, self.cal_img_width)
+        cal_form.addRow(self.cal_img_height_label, self.cal_img_height)
         
         # 4. Sensor Width
         self.cal_sensor_width = QDoubleSpinBox()
@@ -1429,7 +2036,8 @@ class CameraCalibrationView(QWidget):
         self.cal_sensor_width.setRange(0.0001, 100.0)
         self.cal_sensor_width.setDecimals(4)
         self.cal_sensor_width.setValue(0.0200) 
-        cal_form.addRow("Sensor Width (mm/px):", self.cal_sensor_width)
+        self.cal_sensor_width_label = QLabel("Sensor Width (mm/px):")
+        cal_form.addRow(self.cal_sensor_width_label, self.cal_sensor_width)
         
         # 5. Focal Length
         self.init_focal_spin = QDoubleSpinBox()
@@ -1437,16 +2045,143 @@ class CameraCalibrationView(QWidget):
         self.init_focal_spin.setRange(0.1, 1000.0)
         self.init_focal_spin.setValue(180.0)
         self.init_focal_spin.setSuffix(" mm")
-        cal_form.addRow("Focal Length (mm):", self.init_focal_spin)
+        self.cal_focal_length_label = QLabel("Focal Length (mm):")
+        cal_form.addRow(self.cal_focal_length_label, self.init_focal_spin)
         
-        # 6. Distortion Coefficients Number
-        self.cal_dist_coeffs_num = QSpinBox()
-        self._apply_input_style(self.cal_dist_coeffs_num)
-        self.cal_dist_coeffs_num.setRange(0, 5)
-        self.cal_dist_coeffs_num.setValue(0)
-        cal_form.addRow("Distortion Coeffs Num:", self.cal_dist_coeffs_num)
-        
+        # 6. Distortion params (match Wand Calibration)
+        self.cal_dist_model_combo = QComboBox()
+        self._apply_input_style(self.cal_dist_model_combo)
+        self.cal_dist_model_combo.addItems(["None (0)", "Radial k1 (1)", "Radial k1+k2 (2)"])
+        self.cal_dist_model_combo.setCurrentIndex(0)
+        cal_form.addRow("Distortion params:", self.cal_dist_model_combo)
+
+        # Per-camera intrinsics (refraction mode, all-camera calibration)
+        self.plate_intrinsics_label = QLabel("Camera Intrinsics:")
+        self.plate_intrinsics_table = QTableWidget()
+        self.plate_intrinsics_table.setColumnCount(4)
+        self.plate_intrinsics_table.setHorizontalHeaderLabels(["Cam ID", "Focal (px)", "Width", "Height"])
+        self.plate_intrinsics_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.plate_intrinsics_table.verticalHeader().setVisible(False)
+        self.plate_intrinsics_table.setFixedHeight(140)
+        self.plate_intrinsics_table.setStyleSheet("background-color: transparent; border: 1px solid #333;")
+        self.plate_intrinsics_label.setVisible(False)
+        self.plate_intrinsics_table.setVisible(False)
+        cal_form.addRow(self.plate_intrinsics_label)
+        cal_form.addRow(self.plate_intrinsics_table)
+
+        # Target camera changed: persist/restore per-camera plate refraction settings
+        self.cal_target_cam_combo.currentIndexChanged.connect(self._on_plate_target_cam_changed)
+
         cal_layout.addWidget(cal_group)
+
+        # --- Plate Refraction Settings (UI only; per-camera) ---
+        self.plate_refraction_group = QGroupBox("Refraction Settings")
+        self.plate_refraction_group.setStyleSheet(self.GROUP_BOX_STYLE)
+        plate_ref_layout = QVBoxLayout(self.plate_refraction_group)
+        plate_ref_layout.setContentsMargins(5, 15, 5, 5)
+
+        top_row = QFormLayout()
+        self.plate_window_count_spin = QSpinBox()
+        self._apply_input_style(self.plate_window_count_spin)
+        self.plate_window_count_spin.setRange(1, 10)
+        self.plate_window_count_spin.setValue(1)
+        self.plate_window_count_spin.valueChanged.connect(self._on_plate_window_count_changed)
+        top_row.addRow("Number of Windows:", self.plate_window_count_spin)
+        plate_ref_layout.addLayout(top_row)
+
+        plate_ref_layout.addWidget(QLabel("Camera-Window Mapping:"))
+        self.plate_cam_window_table = QTableWidget()
+        self.plate_cam_window_table.setColumnCount(2)
+        self.plate_cam_window_table.setHorizontalHeaderLabels(["Camera ID", "Window"])
+        self.plate_cam_window_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.plate_cam_window_table.verticalHeader().setVisible(False)
+        self.plate_cam_window_table.setFixedHeight(120)
+        self.plate_cam_window_table.setStyleSheet("background-color: transparent; border: 1px solid #333;")
+        plate_ref_layout.addWidget(self.plate_cam_window_table)
+
+        plate_ref_layout.addSpacing(10)
+
+        plate_ref_layout.addWidget(QLabel("Window Configuration (for selected type):"))
+
+        diagram_layout = QHBoxLayout()
+        diagram_layout.setSpacing(2)
+
+        # Camera side
+        seg1 = QWidget()
+        seg1_layout = QVBoxLayout(seg1)
+        seg1_layout.setContentsMargins(2, 2, 2, 2)
+        seg1_layout.addWidget(QLabel("Camera side"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.plate_media1_combo = QComboBox()
+        self.plate_media1_combo.addItems(["Air", "Other"])
+        self.plate_media1_index = QDoubleSpinBox()
+        self.plate_media1_index.setRange(1.0, 2.5)
+        self.plate_media1_index.setValue(1.0)
+        self._apply_input_style(self.plate_media1_combo)
+        self._apply_input_style(self.plate_media1_index)
+        self.plate_media1_combo.currentIndexChanged.connect(self._on_plate_refraction_media_changed)
+        self.plate_media1_index.valueChanged.connect(self._on_plate_refraction_setting_changed)
+        seg1_layout.addWidget(self.plate_media1_combo)
+        seg1_layout.addWidget(self.plate_media1_index)
+        diagram_layout.addWidget(seg1)
+
+        # Window
+        seg2 = QFrame()
+        seg2.setStyleSheet("""
+            background-color: rgba(0, 170, 255, 60);
+            border-left: 2px solid #00aaff;
+            border-right: 2px solid #00aaff;
+            border-top: none;
+            border-bottom: none;
+        """)
+        seg2_layout = QVBoxLayout(seg2)
+        seg2_layout.setContentsMargins(2, 2, 2, 2)
+        lbl_window = QLabel("Window")
+        lbl_window.setStyleSheet("border: none; background: transparent; font-weight: bold;")
+        seg2_layout.addWidget(lbl_window, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.plate_media2_combo = QComboBox()
+        self.plate_media2_combo.addItems(["Acrylic", "Glass", "Other"])
+        self.plate_media2_index = QDoubleSpinBox()
+        self.plate_media2_index.setRange(1.0, 2.5)
+        self.plate_media2_index.setValue(1.49)
+        self.plate_media2_thick = QDoubleSpinBox()
+        self.plate_media2_thick.setRange(0.1, 100.0)
+        self.plate_media2_thick.setValue(10.0)
+        self.plate_media2_thick.setSuffix(" mm")
+        self._apply_input_style(self.plate_media2_combo)
+        self._apply_input_style(self.plate_media2_index)
+        self._apply_input_style(self.plate_media2_thick)
+        self.plate_media2_combo.currentIndexChanged.connect(self._on_plate_refraction_media_changed)
+        self.plate_media2_index.valueChanged.connect(self._on_plate_refraction_setting_changed)
+        self.plate_media2_thick.valueChanged.connect(self._on_plate_refraction_setting_changed)
+        seg2_layout.addWidget(self.plate_media2_combo)
+        seg2_layout.addWidget(self.plate_media2_index)
+        lbl_thick = QLabel("Thickness:")
+        lbl_thick.setStyleSheet("border: none; background: transparent;")
+        seg2_layout.addWidget(lbl_thick, alignment=Qt.AlignmentFlag.AlignCenter)
+        seg2_layout.addWidget(self.plate_media2_thick)
+        diagram_layout.addWidget(seg2)
+
+        # Object side
+        seg3 = QWidget()
+        seg3_layout = QVBoxLayout(seg3)
+        seg3_layout.setContentsMargins(2, 2, 2, 2)
+        seg3_layout.addWidget(QLabel("Object side"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.plate_media3_combo = QComboBox()
+        self.plate_media3_combo.addItems(["Water", "Other"])
+        self.plate_media3_index = QDoubleSpinBox()
+        self.plate_media3_index.setRange(1.0, 2.5)
+        self.plate_media3_index.setValue(1.33)
+        self._apply_input_style(self.plate_media3_combo)
+        self._apply_input_style(self.plate_media3_index)
+        self.plate_media3_combo.currentIndexChanged.connect(self._on_plate_refraction_media_changed)
+        self.plate_media3_index.valueChanged.connect(self._on_plate_refraction_setting_changed)
+        seg3_layout.addWidget(self.plate_media3_combo)
+        seg3_layout.addWidget(self.plate_media3_index)
+        diagram_layout.addWidget(seg3)
+
+        plate_ref_layout.addLayout(diagram_layout)
+        self.plate_refraction_group.setVisible(False)
+        cal_layout.addWidget(self.plate_refraction_group)
         
         # Data Import Button
         self.btn_read_csv = QPushButton("Read Plate Points (from CSV)")
@@ -1475,7 +2210,10 @@ class CameraCalibrationView(QWidget):
         cal_layout.addWidget(self.btn_save_all_cams)
         
         cal_layout.addStretch()
-        
+
+        cal_scroll.setWidget(cal_content)
+        cal_tab_wrap_layout.addWidget(cal_scroll)
+
         self.plate_ctrl_tabs.addTab(cal_tab, "Calibration")
         
         # --- CONTROL TAB 3: Tutorial ---
@@ -1510,7 +2248,9 @@ class CameraCalibrationView(QWidget):
         
         # Initialize labels
         self._update_cam_list(4)
-             
+        self._on_plate_model_changed()
+        self._load_plate_refraction_for_cam(self.cal_target_cam_combo.currentIndex())
+              
         return container
     
 
@@ -1567,7 +2307,8 @@ class CameraCalibrationView(QWidget):
         
         self.wand_model_combo = QComboBox()
         self._apply_input_style(self.wand_model_combo)
-        self.wand_model_combo.addItems(["Pinhole", "Polynomial"])
+        self.wand_model_combo.addItems(["Pinhole", "Pinhole+Refraction"])
+        self.wand_model_combo.currentIndexChanged.connect(self._on_model_changed)
         
         self.wand_len_spin = QDoubleSpinBox()
         self._apply_input_style(self.wand_len_spin)
@@ -1580,7 +2321,7 @@ class CameraCalibrationView(QWidget):
         self.wand_type_combo.addItems(["Dark on Bright", "Bright on Dark"])
         
         # New: Circle Radius Range for detection (Range Slider)
-        self.radius_range = RangeSlider(min_val=1, max_val=500, initial_min=20, initial_max=200, suffix=" px")
+        self.radius_range = RangeSlider(min_val=1, max_val=200, initial_min=20, initial_max=200, suffix=" px")
         
         # New: Sensitivity slider for detection
         from .widgets import SimpleSlider
@@ -1680,11 +2421,13 @@ class CameraCalibrationView(QWidget):
         
         # New: Update Calibration Cam Combo
         if hasattr(self, 'cal_target_cam_combo'):
-            self.cal_target_cam_combo.blockSignals(True)
-            self.cal_target_cam_combo.clear()
-            self.cal_target_cam_combo.addItems(items)
-            self.cal_target_cam_combo.setCurrentIndex(self.plate_cam_combo.currentIndex())
-            self.cal_target_cam_combo.blockSignals(False)
+            self._refresh_plate_target_camera_combo()
+
+        # Update plate refraction camera-window mapping table
+        if hasattr(self, 'plate_cam_window_table'):
+            self._update_plate_refraction_cam_table(count)
+        if hasattr(self, 'plate_intrinsics_table'):
+            self._update_plate_intrinsics_table(count)
             
         # 2. Update Visualization Tabs
         self.plate_vis_tabs.clear()
@@ -1707,6 +2450,187 @@ class CameraCalibrationView(QWidget):
             
         # Re-add 3D View tab after clearing
         self.plate_vis_tabs.addTab(self.plate_3d_viewer, "3D View")
+
+    def _refresh_plate_target_camera_combo(self):
+        """Refresh target camera list depending on plate model.
+
+        - Pinhole: per-camera selection.
+        - Pinhole+Refraction: all-camera joint mode only.
+        """
+        if not hasattr(self, 'cal_target_cam_combo') or self.cal_target_cam_combo is None:
+            return
+
+        is_refraction = hasattr(self, 'plate_model_combo') and self.plate_model_combo.currentText() == "Pinhole+Refraction"
+        cam_count = int(self.plate_num_cams.value()) if hasattr(self, 'plate_num_cams') else 0
+
+        self.cal_target_cam_combo.blockSignals(True)
+        self.cal_target_cam_combo.clear()
+        if is_refraction:
+            self.cal_target_cam_combo.addItem("All Cameras")
+            self.cal_target_cam_combo.setCurrentIndex(0)
+            self.cal_target_cam_combo.setEnabled(False)
+        else:
+            self.cal_target_cam_combo.addItems([f"Camera {i}" for i in range(cam_count)])
+            cur = self.plate_cam_combo.currentIndex() if hasattr(self, 'plate_cam_combo') else 0
+            if cur < 0:
+                cur = 0
+            self.cal_target_cam_combo.setCurrentIndex(min(cur, max(0, cam_count - 1)))
+            self.cal_target_cam_combo.setEnabled(True)
+        self.cal_target_cam_combo.blockSignals(False)
+
+    def _update_plate_refraction_cam_table(self, cam_count):
+        """Sync plate refraction camera-window mapping table."""
+        if not hasattr(self, 'plate_cam_window_table') or self.plate_cam_window_table is None:
+            return
+
+        self.plate_cam_window_table.setRowCount(int(cam_count))
+        win_count = int(self.plate_window_count_spin.value()) if hasattr(self, 'plate_window_count_spin') else 1
+        window_options = [f"Window {i}" for i in range(max(1, win_count))]
+
+        for i in range(int(cam_count)):
+            cam_id_item = QTableWidgetItem(f"{i}")
+            cam_id_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            cam_id_item.setForeground(Qt.GlobalColor.white)
+            cam_id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.plate_cam_window_table.setItem(i, 0, cam_id_item)
+
+            prev_combo = self.plate_cam_window_table.cellWidget(i, 1)
+            prev_text = prev_combo.currentText() if isinstance(prev_combo, QComboBox) else ""
+
+            win_combo = QComboBox()
+            self._apply_input_style(win_combo)
+            win_combo.addItems(window_options)
+            if prev_text in window_options:
+                win_combo.setCurrentText(prev_text)
+            self.plate_cam_window_table.setCellWidget(i, 1, win_combo)
+
+    def _on_plate_window_count_changed(self):
+        if hasattr(self, 'plate_num_cams'):
+            self._update_plate_refraction_cam_table(int(self.plate_num_cams.value()))
+
+    def _default_plate_intrinsic_setting(self):
+        f_mm = float(self.init_focal_spin.value()) if hasattr(self, 'init_focal_spin') else 180.0
+        pw_mm = float(self.cal_sensor_width.value()) if hasattr(self, 'cal_sensor_width') else 0.02
+        f_px = f_mm / max(pw_mm, 1e-12)
+        w = int(self.cal_img_width.value()) if hasattr(self, 'cal_img_width') else 1280
+        h = int(self.cal_img_height.value()) if hasattr(self, 'cal_img_height') else 800
+        return {
+            'focal_px': float(f_px),
+            'width': int(w),
+            'height': int(h),
+        }
+
+    def _save_plate_intrinsics_value(self, cam_idx: int, key: str, value):
+        if not hasattr(self, 'plate_intrinsics_settings'):
+            self.plate_intrinsics_settings = {}
+        st = self.plate_intrinsics_settings.get(int(cam_idx), self._default_plate_intrinsic_setting())
+        st = dict(st)
+        st[key] = value
+        self.plate_intrinsics_settings[int(cam_idx)] = st
+
+    def _capture_plate_image_size_hint(self, cam_idx: int, img_path) -> bool:
+        """Capture image size hint for a camera from a plate image path."""
+        try:
+            import cv2
+            img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+            if img is None or len(img.shape) < 2:
+                return False
+            h, w = int(img.shape[0]), int(img.shape[1])
+            if w <= 0 or h <= 0:
+                return False
+            self.plate_image_size_hints[int(cam_idx)] = (w, h)
+            return True
+        except Exception:
+            return False
+
+    def _build_plate_image_size_hints_from_saved_data(self):
+        """Backfill size hints using known image paths in saved calibration data."""
+        if not hasattr(self, 'saved_calibration_data') or not self.saved_calibration_data:
+            return
+        for (cam_idx, img_path), _data in self.saved_calibration_data.items():
+            cid = int(cam_idx)
+            if cid in self.plate_image_size_hints:
+                continue
+            self._capture_plate_image_size_hint(cid, img_path)
+
+    def _autofill_plate_intrinsics_once_from_hints(self):
+        """Auto-fill width/height only once per camera; user edits remain authoritative."""
+        if not hasattr(self, 'plate_num_cams'):
+            return
+        cam_count = int(self.plate_num_cams.value())
+        for cid in range(cam_count):
+            if cid in self._plate_intrinsics_autofilled_once:
+                continue
+            hint = self.plate_image_size_hints.get(cid)
+            if not hint:
+                continue
+            w, h = int(hint[0]), int(hint[1])
+            st = dict(self.plate_intrinsics_settings.get(cid, self._default_plate_intrinsic_setting()))
+            st['width'] = w
+            st['height'] = h
+            self.plate_intrinsics_settings[cid] = st
+            self._plate_intrinsics_autofilled_once.add(cid)
+
+    def _update_plate_intrinsics_table(self, cam_count):
+        if not hasattr(self, 'plate_intrinsics_table') or self.plate_intrinsics_table is None:
+            return
+        self.plate_intrinsics_table.setRowCount(int(cam_count))
+
+        for i in range(int(cam_count)):
+            st = self.plate_intrinsics_settings.get(i, self._default_plate_intrinsic_setting())
+            self.plate_intrinsics_settings[i] = dict(st)
+
+            cam_id_item = QTableWidgetItem(f"{i}")
+            cam_id_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            cam_id_item.setForeground(Qt.GlobalColor.white)
+            cam_id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.plate_intrinsics_table.setItem(i, 0, cam_id_item)
+
+            focal_spin = TrimmedDoubleSpinBox()
+            self._apply_input_style(focal_spin)
+            focal_spin.setRange(1.0, 100000.0)
+            focal_spin.setDecimals(6)
+            focal_spin.setValue(float(st.get('focal_px', 9000.0)))
+            focal_spin.valueChanged.connect(lambda v, cam=i: self._save_plate_intrinsics_value(cam, 'focal_px', float(v)))
+            self.plate_intrinsics_table.setCellWidget(i, 1, focal_spin)
+
+            w_spin = QSpinBox()
+            self._apply_input_style(w_spin)
+            w_spin.setRange(1, 10000)
+            w_spin.setValue(int(st.get('width', 1280)))
+            w_spin.valueChanged.connect(lambda v, cam=i: self._save_plate_intrinsics_value(cam, 'width', int(v)))
+            self.plate_intrinsics_table.setCellWidget(i, 2, w_spin)
+
+            h_spin = QSpinBox()
+            self._apply_input_style(h_spin)
+            h_spin.setRange(1, 10000)
+            h_spin.setValue(int(st.get('height', 800)))
+            h_spin.valueChanged.connect(lambda v, cam=i: self._save_plate_intrinsics_value(cam, 'height', int(v)))
+            self.plate_intrinsics_table.setCellWidget(i, 3, h_spin)
+
+    def _set_plate_global_intrinsic_controls_visible(self, visible: bool):
+        for label_attr, field_attr in [
+            ('cal_img_width_label', 'cal_img_width'),
+            ('cal_img_height_label', 'cal_img_height'),
+            ('cal_sensor_width_label', 'cal_sensor_width'),
+            ('cal_focal_length_label', 'init_focal_spin'),
+        ]:
+            if hasattr(self, label_attr):
+                getattr(self, label_attr).setVisible(bool(visible))
+            if hasattr(self, field_attr):
+                getattr(self, field_attr).setVisible(bool(visible))
+
+    def _plate_refraction_setting_key(self) -> int:
+        """Storage key for plate refraction settings.
+
+        Refraction mode uses one shared config for all cameras.
+        """
+        is_refraction = hasattr(self, 'plate_model_combo') and self.plate_model_combo.currentText() == "Pinhole+Refraction"
+        if is_refraction:
+            return -1
+        if hasattr(self, 'cal_target_cam_combo'):
+            return int(self.cal_target_cam_combo.currentIndex())
+        return 0
             
     def _on_template_roi_selected(self, rect, cam_idx):
         """Handle ROI selection for template matching."""
@@ -1921,6 +2845,7 @@ class CameraCalibrationView(QWidget):
             width_spin.setRange(1, 10000)
             width_spin.setValue(1280)
             width_spin.setStyleSheet("background: #222; color: white; border: none;")
+            width_spin.valueChanged.connect(lambda _v: self._refresh_wand_radius_range_limit())
             self.wand_cam_table.setCellWidget(i, 3, width_spin)
             
             # Col 4: Height (editable spinbox)
@@ -1928,7 +2853,14 @@ class CameraCalibrationView(QWidget):
             height_spin.setRange(1, 10000)
             height_spin.setValue(800)
             height_spin.setStyleSheet("background: #222; color: white; border: none;")
+            height_spin.valueChanged.connect(lambda _v: self._refresh_wand_radius_range_limit())
             self.wand_cam_table.setCellWidget(i, 4, height_spin)
+            
+        # Update refraction camera table if it exists
+        if hasattr(self, 'cam_window_table'):
+            self._update_refraction_cam_table(count)
+
+        self._refresh_wand_radius_range_limit()
 
     # --- Logic Implementation ---
 
@@ -1956,6 +2888,10 @@ class CameraCalibrationView(QWidget):
             was_empty = True
             
             self.plate_images.extend(files)
+
+            # Capture size hint from first image for current camera.
+            cam_idx = int(self.plate_cam_combo.currentIndex()) if hasattr(self, 'plate_cam_combo') else 0
+            self._capture_plate_image_size_hint(cam_idx, files[0])
             
             for f in files:
                 self.plate_img_list.addItem(Path(f).name)
@@ -1964,6 +2900,12 @@ class CameraCalibrationView(QWidget):
             if was_empty:
                 self.plate_img_list.setCurrentRow(0) # Selects first
                 self._display_plate_image(0) # Explicitly call display
+
+            # In refraction mode, auto-fill one time then keep user editable values.
+            is_refraction = hasattr(self, 'plate_model_combo') and self.plate_model_combo.currentText() == "Pinhole+Refraction"
+            if is_refraction and hasattr(self, 'plate_intrinsics_table') and hasattr(self, 'plate_num_cams'):
+                self._autofill_plate_intrinsics_once_from_hints()
+                self._update_plate_intrinsics_table(int(self.plate_num_cams.value()))
 
         else:
             QMessageBox.warning(self, "No Images", "No images found in selected folder.")
@@ -2031,7 +2973,10 @@ class CameraCalibrationView(QWidget):
         img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
         
         if img is not None:
-             # Convert to RGB for Qt
+             # Save size hint before any conversion.
+             self.plate_image_size_hints[int(cam_idx)] = (int(img.shape[1]), int(img.shape[0]))
+
+              # Convert to RGB for Qt
              if len(img.shape) == 2:  # Grayscale
                  img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
              elif img.shape[2] == 4:  # RGBA
@@ -2073,9 +3018,65 @@ class CameraCalibrationView(QWidget):
                 btn = self.wand_cam_table.cellWidget(cam_idx, 0)  # Column 0 now
                 if btn:
                     btn.setText(f"{len(files)}")
-                
+
+                self._update_wand_cam_size_from_first_image(cam_idx, files)
+                self._refresh_wand_radius_range_limit()
+                 
                 # Check consistency and update Frames Table
                 self.populate_wand_table()
+
+    def _update_wand_cam_size_from_first_image(self, cam_idx, files):
+        """Read first image size and update Width/Height columns for this camera."""
+        if not files:
+            return
+
+        try:
+            import cv2
+            img = cv2.imread(str(files[0]), cv2.IMREAD_UNCHANGED)
+            if img is None or len(img.shape) < 2:
+                return
+            h, w = int(img.shape[0]), int(img.shape[1])
+        except Exception:
+            return
+
+        width_spin = self.wand_cam_table.cellWidget(cam_idx, 3)
+        height_spin = self.wand_cam_table.cellWidget(cam_idx, 4)
+        if width_spin is not None:
+            width_spin.setValue(w)
+        if height_spin is not None:
+            height_spin.setValue(h)
+
+    def _refresh_wand_radius_range_limit(self):
+        """Set radius max to min(image side)/4 across loaded cameras; default to 200."""
+        if not hasattr(self, 'radius_range') or self.radius_range is None:
+            return
+
+        min_sides = []
+        row_count = self.wand_cam_table.rowCount() if hasattr(self, 'wand_cam_table') else 0
+        for row in range(row_count):
+            imgs = self.wand_images.get(row, []) if hasattr(self, 'wand_images') else []
+            if not imgs:
+                continue
+            width_spin = self.wand_cam_table.cellWidget(row, 3)
+            height_spin = self.wand_cam_table.cellWidget(row, 4)
+            if width_spin is None or height_spin is None:
+                continue
+            w = int(width_spin.value())
+            h = int(height_spin.value())
+            if w > 0 and h > 0:
+                min_sides.append(min(w, h))
+
+        if min_sides:
+            max_r = max(1, int(min(min_sides) // 4))
+        else:
+            max_r = 200
+
+        self.radius_range.setRange(1, max_r)
+
+    def _get_wand_detect_mode(self):
+        if hasattr(self, 'detect_mode_reliable') and self.detect_mode_reliable.isChecked():
+            return "reliable"
+        return "fast"
     
     def populate_wand_table(self):
         """Populates the frame table with filenames and status."""
@@ -2322,6 +3323,11 @@ class CameraCalibrationView(QWidget):
         1. Fix intrinsics, solve for extrinsics (Pose) via PnP.
         2. Refine both intrinsics (f, cx, cy) and extrinsics via calibrateCamera.
         """
+        self._busy_begin('plate_calibration', 'Running plate calibration')
+
+        if hasattr(self, 'plate_model_combo') and self.plate_model_combo.currentText() == "Pinhole+Refraction":
+            return self._run_plate_refraction_calibration()
+
         target_cam_idx = self.cal_target_cam_combo.currentIndex()
         print(f"Running Plate Calibration for Camera {target_cam_idx+1}...")
         
@@ -2334,6 +3340,7 @@ class CameraCalibrationView(QWidget):
         
         if not relevant_keys:
             QMessageBox.warning(self, "No Data", f"No calibration data found for Camera {target_cam_idx+1}.\nPlease add data point in detection tab or read from CSV first.")
+            self._busy_end('plate_calibration')
             return
             
         for key in relevant_keys:
@@ -2353,6 +3360,7 @@ class CameraCalibrationView(QWidget):
                 
         if not img_points:
             QMessageBox.warning(self, "No Data", "No valid point sets found.")
+            self._busy_end('plate_calibration')
             return
 
         # Image size
@@ -2373,7 +3381,7 @@ class CameraCalibrationView(QWidget):
                       [0, 0, 1]], dtype=np.float32)
         
         # Distortion initialization based on UI setting
-        dist_num = self.cal_dist_coeffs_num.value()
+        dist_num = self.cal_dist_model_combo.currentIndex() if hasattr(self, 'cal_dist_model_combo') else 0
         dist_coeffs = np.zeros(5, dtype=np.float32) # Always use 5 for standard pinhole logic
         
         # 3. Stage 1: Solve for Pose (Extrinsics) using solvePnP for initial guess
@@ -2381,6 +3389,7 @@ class CameraCalibrationView(QWidget):
         success_pnp, rvec, tvec = cv2.solvePnP(obj_points[0], img_points[0], K, dist_coeffs)
         if not success_pnp:
             QMessageBox.critical(self, "Error", "Initial pose estimation (PnP) failed.")
+            self._busy_end('plate_calibration')
             return
             
         # 4. Stage 2: Refine All (Intrinsics + Extrinsics)
@@ -2399,13 +3408,7 @@ class CameraCalibrationView(QWidget):
             flags |= cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 | cv2.CALIB_FIX_TANGENT_DIST
         elif dist_num == 2:
             flags |= cv2.CALIB_FIX_K3 | cv2.CALIB_FIX_TANGENT_DIST
-        elif dist_num == 3:
-            # k1, k2, k3 (fix p1, p2)
-            flags |= cv2.CALIB_FIX_TANGENT_DIST
-        elif dist_num == 4:
-            # k1, k2, p1, p2 (fix k3)
-            flags |= cv2.CALIB_FIX_K3
-        # if dist_num == 5, nothing is fixed
+        # dist_num only supports 0/1/2 to match Wand Calibration UI
         
         try:
             rms, K_opt, dist_opt, rvecs_opt, tvecs_opt = cv2.calibrateCamera(
@@ -2414,6 +3417,7 @@ class CameraCalibrationView(QWidget):
             )
         except Exception as e:
             QMessageBox.critical(self, "Calibration Failed", f"Optimization error: {str(e)}")
+            self._busy_end('plate_calibration')
             return
             
         # 5. Display Results
@@ -2446,6 +3450,303 @@ class CameraCalibrationView(QWidget):
         # 8. Notify user (no per-camera save prompt - use Save All button instead)
         QMessageBox.information(self, "Calibration Complete", 
                                f"Camera {target_cam_idx+1} calibrated successfully.\nRMS: {rms:.4f} px\n\nUse 'Save All Camera Parameters' to export.")
+        self._busy_end('plate_calibration')
+
+    def _collect_plate_refraction_inputs(self):
+        if not self.saved_calibration_data:
+            raise RuntimeError("No calibration data loaded for plate refraction calibration.")
+
+        cam_count = int(self.plate_num_cams.value()) if hasattr(self, 'plate_num_cams') else 0
+        cam_ids = list(range(cam_count))
+
+        # Intrinsics from per-camera table
+        cam_intrinsics = {}
+        for cid in cam_ids:
+            st = self.plate_intrinsics_settings.get(cid, self._default_plate_intrinsic_setting())
+            cam_intrinsics[cid] = {
+                'focal_px': float(st.get('focal_px', 9000.0)),
+                'width': int(st.get('width', 1280)),
+                'height': int(st.get('height', 800)),
+            }
+
+        # Camera-window mapping from table
+        cam_to_window = {}
+        if not hasattr(self, 'plate_cam_window_table'):
+            raise RuntimeError("Camera-window mapping table is missing.")
+        for r in range(self.plate_cam_window_table.rowCount()):
+            w_combo = self.plate_cam_window_table.cellWidget(r, 1)
+            if isinstance(w_combo, QComboBox):
+                txt = w_combo.currentText()
+                wid = int(txt.split()[-1]) if txt.startswith("Window") else 0
+            else:
+                wid = 0
+            cam_to_window[int(r)] = int(wid)
+
+        used_windows = sorted(set(cam_to_window.values()))
+
+        # Shared media settings for each window (UI currently one set of media controls)
+        n1 = float(self.plate_media1_index.value())
+        n2 = float(self.plate_media2_index.value())
+        n3 = float(self.plate_media3_index.value())
+        thickness = float(self.plate_media2_thick.value())
+        window_media = {
+            int(wid): {
+                'n1': n1,
+                'n2': n2,
+                'n3': n3,
+                'thickness': thickness,
+                'proj_tol': 1e-6,
+                'proj_nmax': 1000,
+                'lr': 0.1,
+            }
+            for wid in used_windows
+        }
+
+        # Build merged observations: same (image, world point) merges all cameras
+        obs_map = {}
+        for (cid, img_path), data in self.saved_calibration_data.items():
+            cid = int(cid)
+            if cid not in cam_ids:
+                continue
+            kpts = data.get('keypoints', [])
+            worlds = data.get('world_coords', [])
+            for kp, w in zip(kpts, worlds):
+                if w is None:
+                    continue
+                wx, wy, wz = float(w[0]), float(w[1]), float(w[2])
+                key = (str(img_path), round(wx, 6), round(wy, 6), round(wz, 6))
+                if key not in obs_map:
+                    obs_map[key] = {
+                        'X_world': np.array([wx, wy, wz], dtype=np.float64),
+                        'uv_by_cam': {},
+                    }
+                obs_map[key]['uv_by_cam'][cid] = np.array([float(kp.pt[0]), float(kp.pt[1])], dtype=np.float64)
+
+        observations = list(obs_map.values())
+        if len(observations) < 20:
+            raise RuntimeError(f"Insufficient observations for refraction calibration: {len(observations)}")
+
+        return observations, cam_intrinsics, cam_to_window, window_media
+
+    def _run_plate_refraction_calibration(self):
+        try:
+            from .plate_calibration.refraction_plate_calibration import RefractionPlateWorker, RefractionPlateConfig
+
+            observations, cam_intrinsics, cam_to_window, window_media = self._collect_plate_refraction_inputs()
+
+            self._plate_refr_thread = QThread()
+            self._plate_refr_worker = RefractionPlateWorker(
+                observations=observations,
+                cam_intrinsics=cam_intrinsics,
+                cam_to_window=cam_to_window,
+                window_media=window_media,
+                dist_mode=self.cal_dist_model_combo.currentIndex(),
+                cfg=RefractionPlateConfig(),
+            )
+            self._plate_refr_worker.moveToThread(self._plate_refr_thread)
+
+            self._create_plate_refractive_calibration_dialog()
+
+            self._plate_refr_thread.started.connect(self._plate_refr_worker.run)
+            self._plate_refr_worker.progress.connect(self._on_plate_refr_progress, Qt.QueuedConnection)
+            self._plate_refr_worker.finished.connect(self._on_plate_refr_finished, Qt.QueuedConnection)
+            self._plate_refr_worker.error.connect(self._on_plate_refr_error, Qt.QueuedConnection)
+
+            self._plate_refr_worker.finished.connect(self._plate_refr_thread.quit)
+            self._plate_refr_worker.finished.connect(self._plate_refr_worker.deleteLater)
+            self._plate_refr_worker.error.connect(self._plate_refr_thread.quit)
+            self._plate_refr_worker.error.connect(self._plate_refr_worker.deleteLater)
+            self._plate_refr_thread.finished.connect(self._plate_refr_thread.deleteLater)
+
+            self._plate_refr_iter_count = 0
+            self._plate_refr_last_phase = None
+            self._plate_refr_last_metrics = None
+            self._plate_refr_timer = QTimer()
+            self._plate_refr_timer.setInterval(200)
+            self._plate_refr_timer.timeout.connect(self._flush_plate_refr_progress)
+            self._plate_refr_timer.start()
+
+            self._plate_refr_thread.start()
+        except Exception as e:
+            QMessageBox.critical(self, "Refraction Calibration Error", str(e))
+            self._busy_end('plate_calibration')
+
+    def _create_plate_refractive_calibration_dialog(self):
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QApplication
+
+        self._plate_refr_dialog = QDialog(self)
+        self._plate_refr_dialog.setWindowTitle("Plate Refraction Calibration")
+        self._plate_refr_dialog.setModal(False)
+        self._plate_refr_dialog.setMinimumSize(440, 340)
+        self._plate_refr_dialog.setStyleSheet("background-color: #000000;")
+
+        layout = QVBoxLayout(self._plate_refr_dialog)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        self._plate_refr_phase_label = QLabel("Initializing...")
+        self._plate_refr_phase_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00d4ff; background: transparent;")
+        self._plate_refr_phase_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._plate_refr_phase_label.setWordWrap(True)
+        layout.addWidget(self._plate_refr_phase_label)
+
+        self._plate_refr_fig = Figure(figsize=(4.2, 2.4), facecolor='#000000')
+        self._plate_refr_canvas = FigureCanvas(self._plate_refr_fig)
+        self._plate_refr_ax = self._plate_refr_fig.add_subplot(111)
+        self._plate_refr_ax.set_facecolor('#000000')
+        self._plate_refr_ax.set_xlabel('Iteration', color='white', fontsize=9)
+        self._plate_refr_ax.set_ylabel('Proj RMSE (px)', color='#ff5bd2', fontsize=9)
+        self._plate_refr_ax.tick_params(colors='white', labelsize=8)
+        for spine in self._plate_refr_ax.spines.values():
+            spine.set_color('#444')
+        self._plate_refr_ax.set_yscale('log')
+        self._plate_refr_ax.grid(True, which="both", ls="--", color='#333', alpha=0.5)
+        self._plate_refr_proj_line, = self._plate_refr_ax.plot([], [], color='#ff5bd2', marker='o', markersize=3, linewidth=1.5, alpha=0.9, label='Proj')
+        self._plate_refr_ax.legend(loc='upper right', fontsize=8, facecolor='#222', edgecolor='#444', labelcolor='white')
+        self._plate_refr_fig.subplots_adjust(left=0.16, right=0.95, bottom=0.18, top=0.88)
+        layout.addWidget(self._plate_refr_canvas)
+
+        self._plate_refr_proj_label = QLabel("Proj: --")
+        self._plate_refr_proj_label.setStyleSheet("font-size: 14px; color: #ff5bd2; background: transparent;")
+        self._plate_refr_proj_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._plate_refr_proj_label)
+
+        self._plate_refr_iterations = []
+        self._plate_refr_proj_values = []
+
+        self._plate_refr_dialog.show()
+        QApplication.processEvents()
+
+    @Slot(str, float, float)
+    def _on_plate_refr_progress(self, phase, proj_rmse, cost):
+        self._plate_refr_last_phase = str(phase)
+        if proj_rmse is not None and proj_rmse > 0:
+            self._plate_refr_last_metrics = (float(proj_rmse), float(cost))
+
+    @Slot()
+    def _flush_plate_refr_progress(self):
+        if hasattr(self, '_plate_refr_last_phase') and self._plate_refr_last_phase is not None:
+            if hasattr(self, '_plate_refr_phase_label'):
+                self._plate_refr_phase_label.setText(f"Phase: {self._plate_refr_last_phase}")
+            self._plate_refr_last_phase = None
+
+        if hasattr(self, '_plate_refr_last_metrics') and self._plate_refr_last_metrics is not None:
+            proj_rmse, _cost = self._plate_refr_last_metrics
+            self._plate_refr_last_metrics = None
+
+            self._plate_refr_iter_count = getattr(self, '_plate_refr_iter_count', 0) + 1
+            it = self._plate_refr_iter_count
+
+            if hasattr(self, '_plate_refr_proj_label'):
+                self._plate_refr_proj_label.setText(f"Proj: {proj_rmse:.4f} px")
+
+            self._plate_refr_iterations.append(it)
+            self._plate_refr_proj_values.append(max(float(proj_rmse), 1e-12))
+            self._plate_refr_proj_line.set_data(self._plate_refr_iterations, self._plate_refr_proj_values)
+
+            x_vals = np.asarray(self._plate_refr_iterations, dtype=float)
+            y_vals = np.asarray(self._plate_refr_proj_values, dtype=float)
+            if x_vals.size > 0:
+                self._plate_refr_ax.set_xlim(max(0.0, float(np.min(x_vals)) - 0.5), float(np.max(x_vals)) + 0.5)
+            if y_vals.size > 0:
+                y_min = 10.0 ** np.floor(np.log10(max(float(np.min(y_vals)), 1e-12)))
+                y_max = 10.0 ** np.ceil(np.log10(max(float(np.max(y_vals)), 1e-12)))
+                if y_max <= y_min:
+                    y_min *= 0.1
+                    y_max *= 10.0
+                self._plate_refr_ax.set_ylim(y_min, y_max)
+            self._plate_refr_canvas.draw_idle()
+
+    @Slot(bool, object, str)
+    def _on_plate_refr_finished(self, success, result, message):
+        if hasattr(self, '_plate_refr_timer'):
+            self._plate_refr_timer.stop()
+        self._flush_plate_refr_progress()
+
+        if hasattr(self, '_plate_refr_dialog') and self._plate_refr_dialog:
+            self._plate_refr_dialog.close()
+            self._plate_refr_dialog = None
+
+        if not success:
+            QMessageBox.critical(self, "Refraction Calibration Failed", message or "Unknown error")
+            self._busy_end('plate_calibration')
+            return
+
+        self._plate_refraction_result = result
+
+        # Fill legacy all_camera_params for consistency
+        self.all_camera_params = {}
+        cams = result.get('camera_params', {})
+        for cid, cp in cams.items():
+            rv = np.asarray(cp['rvec'], dtype=np.float64).reshape(3, 1)
+            tv = np.asarray(cp['tvec'], dtype=np.float64).reshape(3, 1)
+            R, _ = cv2.Rodrigues(rv)
+            K = np.array([[cp['f'], 0.0, cp['cx']], [0.0, cp['f'], cp['cy']], [0.0, 0.0, 1.0]], dtype=np.float64)
+            dist = np.array([cp['k1'], cp['k2'], 0.0, 0.0, 0.0], dtype=np.float64).reshape(1, 5)
+            self.all_camera_params[int(cid)] = {
+                'R': R,
+                'T': tv,
+                'K': K,
+                'dist': dist,
+                'img_size': (int(cp['height']), int(cp['width'])),
+                'rms': float(result.get('stage_b', {}).get('proj_rmse', 0.0)),
+            }
+
+        # Update 3D view (include refractive window planes, same style as wand)
+        window_params = result.get('window_params', {})
+        window_planes = {
+            int(wid): {
+                'plane_pt': np.asarray(wp.get('plane_pt', [0.0, 0.0, 0.0]), dtype=np.float64),
+                'plane_n': np.asarray(wp.get('plane_n', [0.0, 0.0, 1.0]), dtype=np.float64),
+            }
+            for wid, wp in window_params.items()
+            if isinstance(wp, dict)
+        }
+
+        pts = np.asarray(result.get('aligned_points', []), dtype=np.float64)
+        if pts.ndim == 1:
+            pts = pts.reshape(-1, 3) if pts.size else np.zeros((0, 3), dtype=np.float64)
+        self.plate_3d_viewer.plot_refractive(self.all_camera_params, window_planes, pts)
+        self.plate_vis_tabs.setCurrentWidget(self.plate_3d_viewer)
+
+        s1 = result.get('stage_a', {})
+        s2 = result.get('stage_b', {})
+        print(
+            "[PlateRefr] Stage A proj RMSE: "
+            f"[{float(s1.get('proj_rmse_before', 0.0)):.6f}] -> [{float(s1.get('proj_rmse_after', 0.0)):.6f}] px"
+        )
+        print(
+            "[PlateRefr] Stage B proj RMSE: "
+            f"[{float(s2.get('proj_rmse_before', 0.0)):.6f}] -> [{float(s2.get('proj_rmse_after', 0.0)):.6f}] px"
+        )
+        print(
+            "[PlateRefr] Stop condition A: "
+            f"{s1.get('stop_reason', s1.get('message', 'N/A'))}"
+        )
+        print(
+            "[PlateRefr] Stop condition B: "
+            f"{s2.get('stop_reason', s2.get('message', 'N/A'))}"
+        )
+
+        QMessageBox.information(
+            self,
+            "Refraction Calibration Complete",
+            f"Stage A proj RMSE: [{float(s1.get('proj_rmse_before', 0.0)):.4f}] -> [{float(s1.get('proj_rmse_after', 0.0)):.4f}] px\n"
+            f"Stage B proj RMSE: [{float(s2.get('proj_rmse_before', 0.0)):.4f}] -> [{float(s2.get('proj_rmse_after', 0.0)):.4f}] px\n\n"
+            f"Stop A: {s1.get('stop_reason', s1.get('message', 'N/A'))}\n"
+            f"Stop B: {s2.get('stop_reason', s2.get('message', 'N/A'))}\n\n"
+            f"Use 'Save All Camera Parameters' to export PINPLATE files.",
+        )
+        self._busy_end('plate_calibration')
+
+    @Slot(str)
+    def _on_plate_refr_error(self, msg):
+        if hasattr(self, '_plate_refr_timer'):
+            self._plate_refr_timer.stop()
+        if hasattr(self, '_plate_refr_dialog') and self._plate_refr_dialog:
+            self._plate_refr_dialog.close()
+            self._plate_refr_dialog = None
+        QMessageBox.critical(self, "Refraction Calibration Error", msg)
+        self._busy_end('plate_calibration')
 
     def _save_plate_calibration_params(self, cam_idx, K, dist, R, T, img_size):
         """Save calibrated parameters in OpenLPT format (consistent with Wand calibration)."""
@@ -2504,6 +3805,89 @@ class CameraCalibrationView(QWidget):
 
     def _save_all_camera_params(self):
         """Save all calibrated camera parameters to a camFile folder."""
+        if hasattr(self, 'plate_model_combo') and self.plate_model_combo.currentText() == "Pinhole+Refraction":
+            result = getattr(self, '_plate_refraction_result', None)
+            if not result or not result.get('success', False):
+                QMessageBox.warning(self, "No Data", "No refraction plate calibration result available.")
+                return
+
+            folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+            if not folder:
+                return
+
+            from pathlib import Path
+            cam_folder = Path(folder) / "camFile"
+            cam_folder.mkdir(parents=True, exist_ok=True)
+
+            try:
+                from .wand_calibration.refraction_wand_calibrator import CamFileExporter
+
+                cam_params = {}
+                camera_settings = {}
+                for cid, cp in result.get('camera_params', {}).items():
+                    cid_i = int(cid)
+                    cam_params[cid_i] = np.array([
+                        float(cp['rvec'][0]), float(cp['rvec'][1]), float(cp['rvec'][2]),
+                        float(cp['tvec'][0]), float(cp['tvec'][1]), float(cp['tvec'][2]),
+                        float(cp['f']), float(cp['cx']), float(cp['cy']),
+                        float(cp['k1']), float(cp['k2'])
+                    ], dtype=np.float64)
+                    camera_settings[cid_i] = {
+                        'height': int(cp['height']),
+                        'width': int(cp['width']),
+                    }
+
+                window_media = {}
+                for wid, wp in result.get('window_params', {}).items():
+                    window_media[int(wid)] = {
+                        'n1': float(wp['n1']),
+                        'n2': float(wp['n2']),
+                        'n3': float(wp['n3']),
+                        'thickness': float(wp['thickness']),
+                        'n_air': float(wp['n1']),
+                        'n_window': float(wp['n2']),
+                        'n_object': float(wp['n3']),
+                    }
+
+                window_planes = {
+                    int(wid): {
+                        'plane_pt': np.asarray(wp['plane_pt'], dtype=np.float64),
+                        'plane_n': np.asarray(wp['plane_n'], dtype=np.float64),
+                        'initialized': True,
+                    }
+                    for wid, wp in result.get('window_params', {}).items()
+                }
+
+                cam_to_window = {int(k): int(v) for k, v in result.get('cam_to_window', {}).items()}
+                proj_stats = {int(k): tuple(v) for k, v in result.get('per_camera_proj_err_stats', {}).items()}
+                tri_stats = {int(k): tuple(v) for k, v in result.get('per_camera_tri_err_stats', {}).items()}
+
+                class _BaseStub:
+                    pass
+
+                base_stub = _BaseStub()
+                base_stub.camera_settings = camera_settings
+                base_stub.image_size = (
+                    int(next(iter(camera_settings.values()))['height']) if camera_settings else 800,
+                    int(next(iter(camera_settings.values()))['width']) if camera_settings else 1280,
+                )
+
+                CamFileExporter.export_camfile_with_refraction(
+                    base=base_stub,
+                    out_dir=str(cam_folder),
+                    cam_params=cam_params,
+                    window_media=window_media,
+                    cam_to_window=cam_to_window,
+                    window_planes=window_planes,
+                    proj_err_stats=proj_stats,
+                    tri_err_stats=tri_stats,
+                )
+
+                QMessageBox.information(self, "Success", f"Saved refraction plate camera files to:\n{cam_folder}")
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", f"Failed to save refraction plate parameters: {str(e)}")
+            return
+
         if not self.all_camera_params:
             QMessageBox.warning(self, "No Data", "No cameras have been calibrated yet.")
             return
@@ -2595,6 +3979,7 @@ class CameraCalibrationView(QWidget):
         wand_type = "dark" if "Dark" in self.wand_type_combo.currentText() else "bright"
         min_r, max_r = self.radius_range.value()
         sensitivity = self.sensitivity_slider.value()
+        detect_mode = self._get_wand_detect_mode()
         
         # Create dict for single frame
         single_frame_dict = {}
@@ -2605,11 +3990,16 @@ class CameraCalibrationView(QWidget):
         if not single_frame_dict:
             return
 
-        print(f"Detecting frame {idx}, mode='{wand_type}', radius=[{min_r},{max_r}], sensitivity={sensitivity}")
+        self._busy_begin('wand_detect_single', 'Detecting single frame')
+
+        print(
+            f"Detecting frame {idx}, mode='{wand_type}', radius=[{min_r},{max_r}], "
+            f"sensitivity={sensitivity}, detect_mode='{detect_mode}'"
+        )
         
         # Worker Setup
         self._single_detect_worker = WandDetectionSingleFrameWorker(
-            self.wand_calibrator, single_frame_dict, wand_type, min_r, max_r, sensitivity
+            self.wand_calibrator, single_frame_dict, wand_type, min_r, max_r, sensitivity, detect_mode
         )
         self._single_detect_worker.finished_signal.connect(self._on_single_detection_finished)
         
@@ -2698,6 +4088,7 @@ class CameraCalibrationView(QWidget):
                     lbl.setPixmap(scaled)
         
         self.status_label.setText(f"Frame {idx}: Found {total_points} points in {len(res)} cameras.")
+        self._busy_end('wand_detect_single')
 
     def _process_wand_frames(self, checked=False):
         from .wand_calibration.wand_calibrator import WandCalibrator, WandDetectionWorker
@@ -2744,6 +4135,7 @@ class CameraCalibrationView(QWidget):
         wand_type = "dark" if "Dark" in self.wand_type_combo.currentText() else "bright"
         min_r, max_r = self.radius_range.value()
         sensitivity = self.sensitivity_slider.value()
+        detect_mode = self._get_wand_detect_mode()
 
         # Start Worker
         self._proc_thread = WandDetectionWorker(
@@ -2751,7 +4143,8 @@ class CameraCalibrationView(QWidget):
             self.wand_images, 
             wand_type, min_r, max_r, sensitivity,
             autosave_path=autosave_path,
-            resume=resume
+            resume=resume,
+            detect_mode=detect_mode,
         )
         
         # Setup dialog
@@ -2764,12 +4157,14 @@ class CameraCalibrationView(QWidget):
         
         self._proc_thread.progress.connect(self._proc_dialog.update_progress)
         self._proc_thread.finished_signal.connect(self._on_process_finished)
+        self._busy_begin('wand_process_all', 'Processing wand frames')
         
         self._proc_thread.start()
         self._proc_dialog.exec() # Modal blocking
         
     def _on_process_finished(self, success, msg):
         self._proc_dialog.close()
+        self._busy_end('wand_process_all')
         
         if success:
              self.status_label.setText(f"Done: {msg}")
@@ -2865,32 +4260,7 @@ class CameraCalibrationView(QWidget):
              return
 
         # Read per-camera settings from table
-        num_cams = self.wand_cam_table.rowCount()
-        camera_settings = {}  # {cam_id: {'focal': int, 'width': int, 'height': int}}
-        
-        for row in range(num_cams):
-            # Read Cam ID from column 1
-            id_item = self.wand_cam_table.item(row, 1)
-            if id_item is None:
-                continue
-            try:
-                cam_id = int(id_item.text())
-            except:
-                cam_id = row
-            
-            # Read focal length from column 2
-            focal_spin = self.wand_cam_table.cellWidget(row, 2)
-            focal = focal_spin.value() if focal_spin else 9000
-            
-            # Read width from column 3
-            width_spin = self.wand_cam_table.cellWidget(row, 3)
-            width = width_spin.value() if width_spin else 1280
-            
-            # Read height from column 4
-            height_spin = self.wand_cam_table.cellWidget(row, 4)
-            height = height_spin.value() if height_spin else 800
-            
-            camera_settings[cam_id] = {'focal': focal, 'width': width, 'height': height}
+        camera_settings = self._collect_camera_settings_from_table()
         
         # Use first camera's image size for the calibrator (or largest resolution)
         if camera_settings:
@@ -2914,12 +4284,21 @@ class CameraCalibrationView(QWidget):
         # NOTE: Do NOT reset filter if frames_to_remove is empty. 
         # This allows cumulative filtering (i.e., previously removed frames stay removed).
         
-        dist_coeff_num = self.dist_coeff_spin.value()
+        dist_coeff_num = self.dist_model_combo.currentIndex()
+        print(f"[Wand] distortion_params={dist_coeff_num}")
         print(f"Running Wand Calibration with length {wand_len}mm, f0={init_focal}px, dist_coeffs={dist_coeff_num}...")
         self.status_label.setText(f"Calibrating (L={wand_len}mm, f0={init_focal}px, k={dist_coeff_num})...")
+        self._busy_begin('wand_calibration', 'Running wand calibration')
     
         # Store precalibration state
         self._is_precalibrating = precalibrate
+
+        # --- Dispatch based on Camera Model ---
+        model_name = self.wand_model_combo.currentText()
+        
+        if model_name == "Pinhole+Refraction" and not precalibrate:
+            self._run_refractive_wand_calibration(wand_len, dist_coeff_num)
+            return
         
         # Calculate num_cams based on actual data in wand_points, NOT the UI table
         # User might have 4 cameras in UI but only imported data for 2.
@@ -2951,6 +4330,41 @@ class CameraCalibrationView(QWidget):
         
         # Create custom progress dialog with cost plot
         self._create_calibration_dialog()
+
+    def _collect_camera_settings_from_table(self):
+        """Collect per-camera settings from detection table.
+
+        Returns:
+            dict[int, dict]: {cam_id: {'focal': float, 'width': int, 'height': int}}
+        """
+        camera_settings = {}
+        if not hasattr(self, 'wand_cam_table'):
+            return camera_settings
+
+        num_cams = self.wand_cam_table.rowCount()
+        for row in range(num_cams):
+            id_item = self.wand_cam_table.item(row, 1)
+            if id_item is None:
+                continue
+            try:
+                cam_id = int(id_item.text())
+            except Exception:
+                cam_id = row
+
+            focal_spin = self.wand_cam_table.cellWidget(row, 2)
+            width_spin = self.wand_cam_table.cellWidget(row, 3)
+            height_spin = self.wand_cam_table.cellWidget(row, 4)
+
+            focal = float(focal_spin.value()) if focal_spin else 9000.0
+            width = int(width_spin.value()) if width_spin else 1280
+            height = int(height_spin.value()) if height_spin else 800
+
+            camera_settings[cam_id] = {
+                'focal': focal,
+                'width': width,
+                'height': height,
+            }
+        return camera_settings
     
     def _save_filtered_points(self):
         """Save wand points to CSV. Includes all 'Raw' points and 'Filtered_Small/Large' for active frames."""
@@ -3192,6 +4606,7 @@ class CameraCalibrationView(QWidget):
             # If Pre-calibration, SKIP save prompt
             if getattr(self, '_is_precalibrating', False):
                 QMessageBox.information(self, "Check Complete", "Pre-calibration check complete.\nReview errors in the table.")
+                self._busy_end('wand_calibration')
                 return
 
             # Prompt to save with custom buttons
@@ -3219,6 +4634,7 @@ class CameraCalibrationView(QWidget):
         else:
             self.status_label.setText(f"Calibration Failed: {msg}")
             QMessageBox.critical(self, "Calibration Failed", msg)
+        self._busy_end('wand_calibration')
 
     def _update_3d_viz(self):
         """Update the 3D visualization with calibrated camera positions and wand points."""
@@ -3256,7 +4672,7 @@ class CameraCalibrationView(QWidget):
         if not errors:
             self.frozen_table.setRowCount(0)
             return
-
+        
         # Identify filtered frames to persist checkbox state
         filtered_out_frames = set()
         if getattr(self.wand_calibrator, 'wand_points_filtered', None) is not None:
@@ -3544,7 +4960,19 @@ class CameraCalibrationView(QWidget):
                 cv2.circle(img, (x, y), 3, (0, 255, 0), -1)
             
             # Draw reprojections (red cross) if calibration done
-            if pt3d_A is not None and cam_idx in self.wand_calibrator.final_params:
+            # Check for refractive per_frame_errors with pre-computed proj_pts first
+            if hasattr(self.wand_calibrator, 'per_frame_errors') and frame_id in self.wand_calibrator.per_frame_errors:
+                err_data = self.wand_calibrator.per_frame_errors[frame_id]
+                proj_pts = err_data.get('proj_pts', {})
+                
+                if cam_idx in proj_pts:
+                    proj_A, proj_B = proj_pts[cam_idx]
+                    for proj in [proj_A, proj_B]:
+                        if proj is not None:
+                            px, py = int(proj[0]), int(proj[1])
+                            cv2.drawMarker(img, (px, py), (0, 0, 255), cv2.MARKER_CROSS, 15, 2)
+            # Fallback to pinhole cv2.projectPoints (for pinhole calibration mode)
+            elif pt3d_A is not None and cam_idx in self.wand_calibrator.final_params:
                 p = self.wand_calibrator.final_params[cam_idx]
                 R, T, K, dist = p['R'], p['T'], p['K'], p['dist']
                 rvec, _ = cv2.Rodrigues(R)
@@ -4583,7 +6011,7 @@ class CameraCalibrationView(QWidget):
         self.wand_type_combo.addItems(["Dark on Bright", "Bright on Dark"])
         
         # Circle Radius Range (Range Slider)
-        self.radius_range = RangeSlider(min_val=1, max_val=500, initial_min=20, initial_max=200, suffix=" px")
+        self.radius_range = RangeSlider(min_val=1, max_val=200, initial_min=20, initial_max=200, suffix=" px")
         
         # Sensitivity slider
         from .widgets import SimpleSlider
@@ -4650,7 +6078,8 @@ class CameraCalibrationView(QWidget):
         
         self.wand_model_combo = QComboBox()
         self._apply_input_style(self.wand_model_combo)
-        self.wand_model_combo.addItems(["Pinhole", "Polynomial"])
+        self.wand_model_combo.addItems(["Pinhole", "Pinhole+Refraction"])
+        self.wand_model_combo.currentIndexChanged.connect(self._on_model_changed)
         
         self.wand_len_spin = QDoubleSpinBox()
         self._apply_input_style(self.wand_len_spin)
@@ -4751,3 +6180,825 @@ class CameraCalibrationView(QWidget):
         else:
             QMessageBox.warning(self, "Guide Not Found", 
                                f"User guide not found at:\n{guide_path}")
+
+    def _on_model_changed(self):
+        """Show/hide refraction group based on selected camera model."""
+        if not hasattr(self, 'refraction_group') or self.refraction_group is None:
+            return
+        model_name = self.wand_model_combo.currentText()
+        is_refraction = (model_name == "Pinhole+Refraction")
+        self.refraction_group.setVisible(is_refraction)
+
+    def _default_plate_refraction_setting(self):
+        return {
+            'media1_type': 'Air',
+            'media2_type': 'Acrylic',
+            'media3_type': 'Water',
+            'n1': 1.0,
+            'n2': 1.49,
+            'n3': 1.33,
+            'thickness': 10.0,
+        }
+
+    def _save_plate_refraction_for_cam(self, cam_idx: int):
+        if not hasattr(self, 'plate_refraction_settings'):
+            self.plate_refraction_settings = {}
+        if not hasattr(self, 'plate_media1_combo'):
+            return
+        key = int(self._plate_refraction_setting_key())
+        self.plate_refraction_settings[key] = {
+            'media1_type': self.plate_media1_combo.currentText(),
+            'media2_type': self.plate_media2_combo.currentText(),
+            'media3_type': self.plate_media3_combo.currentText(),
+            'n1': float(self.plate_media1_index.value()),
+            'n2': float(self.plate_media2_index.value()),
+            'n3': float(self.plate_media3_index.value()),
+            'thickness': float(self.plate_media2_thick.value()),
+        }
+
+    def _load_plate_refraction_for_cam(self, cam_idx: int):
+        if not hasattr(self, 'plate_media1_combo'):
+            return
+        key = int(self._plate_refraction_setting_key())
+        st = self.plate_refraction_settings.get(key, self._default_plate_refraction_setting())
+        self.plate_refraction_settings[key] = dict(st)
+
+        widgets = [
+            self.plate_media1_combo,
+            self.plate_media2_combo,
+            self.plate_media3_combo,
+            self.plate_media1_index,
+            self.plate_media2_index,
+            self.plate_media3_index,
+            self.plate_media2_thick,
+        ]
+        for w in widgets:
+            w.blockSignals(True)
+
+        try:
+            self.plate_media1_combo.setCurrentText(str(st.get('media1_type', 'Air')))
+            self.plate_media2_combo.setCurrentText(str(st.get('media2_type', 'Acrylic')))
+            self.plate_media3_combo.setCurrentText(str(st.get('media3_type', 'Water')))
+            self.plate_media1_index.setValue(float(st.get('n1', 1.0)))
+            self.plate_media2_index.setValue(float(st.get('n2', 1.49)))
+            self.plate_media3_index.setValue(float(st.get('n3', 1.33)))
+            self.plate_media2_thick.setValue(float(st.get('thickness', 10.0)))
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+        self._on_plate_refraction_media_changed()
+
+    def _on_plate_target_cam_changed(self, idx):
+        if idx < 0:
+            return
+        self._load_plate_refraction_for_cam(int(idx))
+
+    def _on_plate_model_changed(self):
+        if not hasattr(self, 'plate_refraction_group'):
+            return
+        is_refraction = (self.plate_model_combo.currentText() == "Pinhole+Refraction")
+        self.plate_refraction_group.setVisible(is_refraction)
+        if hasattr(self, 'plate_intrinsics_label'):
+            self.plate_intrinsics_label.setVisible(is_refraction)
+        if hasattr(self, 'plate_intrinsics_table'):
+            self.plate_intrinsics_table.setVisible(is_refraction)
+        self._set_plate_global_intrinsic_controls_visible(not is_refraction)
+        if hasattr(self, 'cal_target_cam_combo'):
+            self._refresh_plate_target_camera_combo()
+        if hasattr(self, 'plate_num_cams') and hasattr(self, 'plate_cam_window_table'):
+            self._update_plate_refraction_cam_table(int(self.plate_num_cams.value()))
+        if hasattr(self, 'plate_num_cams') and hasattr(self, 'plate_intrinsics_table'):
+            if is_refraction:
+                self._build_plate_image_size_hints_from_saved_data()
+                self._autofill_plate_intrinsics_once_from_hints()
+            self._update_plate_intrinsics_table(int(self.plate_num_cams.value()))
+        if hasattr(self, 'cal_target_cam_combo'):
+            self._load_plate_refraction_for_cam(self.cal_target_cam_combo.currentIndex())
+
+    def _on_plate_refraction_setting_changed(self, _value=None):
+        if not hasattr(self, 'cal_target_cam_combo'):
+            return
+        cam_idx = self.cal_target_cam_combo.currentIndex()
+        if cam_idx >= 0:
+            self._save_plate_refraction_for_cam(cam_idx)
+
+    def _on_plate_refraction_media_changed(self):
+        if not hasattr(self, 'plate_media1_combo'):
+            return
+        if self.plate_media1_combo.currentText() == "Air":
+            self.plate_media1_index.setValue(1.0)
+            self.plate_media1_index.setReadOnly(True)
+        else:
+            self.plate_media1_index.setReadOnly(False)
+
+        if self.plate_media2_combo.currentText() == "Acrylic":
+            self.plate_media2_index.setValue(1.49)
+            self.plate_media2_index.setReadOnly(True)
+        elif self.plate_media2_combo.currentText() == "Glass":
+            self.plate_media2_index.setValue(1.52)
+            self.plate_media2_index.setReadOnly(True)
+        else:
+            self.plate_media2_index.setReadOnly(False)
+
+        if self.plate_media3_combo.currentText() == "Water":
+            self.plate_media3_index.setValue(1.33)
+            self.plate_media3_index.setReadOnly(True)
+        else:
+            self.plate_media3_index.setReadOnly(False)
+
+        self._on_plate_refraction_setting_changed()
+
+    def _on_refraction_media_changed(self):
+        """Handle material selection and update refractive index inputs."""
+        # Media 1: Camera Side
+        if self.media1_combo.currentText() == "Air":
+            self.media1_index.setValue(1.0)
+            self.media1_index.setReadOnly(True)
+        else:
+            self.media1_index.setReadOnly(False)
+
+        # Media 2: Window
+        if self.media2_combo.currentText() == "Acrylic":
+            self.media2_index.setValue(1.49)
+            self.media2_index.setReadOnly(True)
+        elif self.media2_combo.currentText() == "Glass":
+            self.media2_index.setValue(1.52)
+            self.media2_index.setReadOnly(True)
+        else:
+            self.media2_index.setReadOnly(False)
+
+        # Media 3: Measure Side
+        if self.media3_combo.currentText() == "Water":
+            self.media3_index.setValue(1.33)
+            self.media3_index.setReadOnly(True)
+        else:
+            self.media3_index.setReadOnly(False)
+
+    def _run_refractive_wand_calibration(self, wand_len, dist_coeff_num):
+        """Extract refraction config and run RefractiveWandCalibrator (PR1)."""
+        try:
+            # 1. Extract Refraction Config from UI
+            num_windows = self.window_count_spin.value()
+            
+            # cam_to_window mapping from table
+            cam_to_window = {}
+            for row in range(self.cam_window_table.rowCount()):
+                id_item = self.cam_window_table.item(row, 0)
+                if id_item:
+                    cid = int(id_item.text())
+                    win_combo = self.cam_window_table.cellWidget(row, 1)
+                    if win_combo:
+                        # Extract "X" from "Window X"
+                        win_id = int(win_combo.currentText().split()[-1])
+                        cam_to_window[cid] = win_id
+
+            # media parameters (currently shared/per-window)
+            window_media = {}
+            for wid in range(num_windows):
+                window_media[wid] = {
+                    'n1': self.media1_index.value(),
+                    'n2': self.media2_index.value(),
+                    'n3': self.media3_index.value(),
+                    'thickness': self.media2_thick.value()
+                }
+
+            self._refr_cam_to_window = dict(cam_to_window)
+            self._refr_window_media = {wid: dict(media) for wid, media in window_media.items()}
+
+            # 2. Output Path (camFile directory)
+            parent_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Save Refraction camFile")
+            if not parent_dir:
+                print("[Refractive] Calibration cancelled: No directory selected.")
+                self._busy_end('wand_calibration')
+                return
+            
+            # Create a timestamped subfolder
+            # [MODIFIED] Use 'camFile' per user request (overwrites if exists)
+            out_folder_name = "camFile"
+            out_path = os.path.join(parent_dir, out_folder_name)
+
+            # 3. Initialize worker inputs from per-camera table values
+            camera_settings = self._collect_camera_settings_from_table()
+            active_cam_ids = sorted(self.wand_calibrator.cameras.keys())
+
+            missing_cam_settings = [cid for cid in active_cam_ids if cid not in camera_settings]
+            if missing_cam_settings:
+                raise ValueError(
+                    f"[Refractive] Missing table settings for active cameras: {missing_cam_settings}"
+                )
+
+            invalid_cam_settings = []
+            for cid in active_cam_ids:
+                cs = camera_settings[cid]
+                if cs['focal'] <= 0 or cs['width'] <= 0 or cs['height'] <= 0:
+                    invalid_cam_settings.append((cid, cs['focal'], cs['width'], cs['height']))
+            if invalid_cam_settings:
+                raise ValueError(
+                    "[Refractive] Invalid per-camera table values (cam_id, focal, width, height): "
+                    f"{invalid_cam_settings}"
+                )
+
+            # Keep this only as compatibility hint for legacy code paths.
+            first_active = active_cam_ids[0]
+            initial_focal = float(camera_settings[first_active]['focal'])
+            print("[Refractive] Per-camera settings from table:")
+            for cid in active_cam_ids:
+                cs = camera_settings[cid]
+                print(
+                    f"  Cam {cid}: focal={cs['focal']:.1f}px, "
+                    f"size=({cs['height']},{cs['width']})"
+                )
+            
+            # === CHECK FOR EXISTING CACHE ===
+            cache_path = os.path.join(parent_dir, "bundle_cache.json")
+            if os.path.exists(cache_path):
+                # Ask user if they want to use cache
+                from PySide6.QtWidgets import QMessageBox as QMB
+                reply = QMB.question(
+                    self, "Cache Found",
+                    f"Found existing calibration cache:\n{cache_path}\n\nLoad cached results and skip calibration?",
+                    QMB.Yes | QMB.No,
+                    QMB.Yes
+                )
+                
+                if reply == QMB.Yes:
+                    try:
+                        import json
+                        import traceback
+                        with open(cache_path, 'r') as f:
+                            cache_data = json.load(f)
+                        
+                        # Extract cached results (using correct keys from cache format)
+                        cam_params = {}
+                        for cid_str, params in cache_data.get('cam_params', {}).items():
+                            cid = int(cid_str)
+                            # cam_params in cache is an array (11 params), convert to dict with rvec/tvec
+                            arr = np.array(params)
+                            cam_params[cid] = {
+                                'rvec': arr[0:3].reshape(3,1),
+                                'tvec': arr[3:6].reshape(3,1),
+                                'f': arr[6] if len(arr) > 6 else 5000.0,
+                                'cx': arr[7] if len(arr) > 7 else 640.0,
+                                'cy': arr[8] if len(arr) > 8 else 400.0,
+                                'k1': arr[9] if len(arr) > 9 else 0.0,
+                                'k2': arr[10] if len(arr) > 10 else 0.0
+                            }
+                        
+                        # Window planes (cache uses 'planes' key, not 'window_planes')
+                        win_planes = {}
+                        planes_data = cache_data.get('planes', cache_data.get('window_planes', {}))
+                        for wid_str, pl in planes_data.items():
+                            wid = int(wid_str)
+                            win_planes[wid] = {k: np.array(v) if isinstance(v, list) else v 
+                                                for k, v in pl.items()}
+                        
+                        # Points (cache may not have these)
+                        pts_3d_list = cache_data.get('points_3d', [])
+                        pts_3d = np.array(pts_3d_list).reshape(-1, 3) if pts_3d_list else None
+                        
+                        # Subsample if too many
+                        if pts_3d is not None and len(pts_3d) > 3000:
+                            import random
+                            indices = sorted(random.sample(range(len(pts_3d)), 3000))
+                            pts_3d = pts_3d[indices]
+                        
+                        # Display 3D visualization
+                        if hasattr(self, 'calib_3d_view'):
+                            self.calib_3d_view.plot_refractive(cam_params, win_planes, pts_3d)
+                            self.vis_tabs.setCurrentIndex(1)  # Switch to 3D View tab
+                        
+                        QMB.information(self, "Loaded", "Calibration loaded from cache.")
+                        print(f"[Refractive] Loaded cached results from: {cache_path}")
+                        self._busy_end('wand_calibration')
+                        return  # Exit early, skip calibration
+                        
+                    except Exception as e:
+                        print(f"[Refractive] Cache load error: {e}")
+                        print(traceback.format_exc())
+                        # Continue to run calibration if cache fails
+
+            
+            # BA projection residual switch controls both objective and UI display.
+            use_proj_residuals = bool(getattr(self, '_refr_use_proj_residuals', False))
+            self._refr_show_proj = use_proj_residuals
+            self._refr_force_show_proj_for_p0 = False
+
+            # Create progress dialog for refractive calibration
+            self._create_refractive_calibration_dialog()
+            
+            # Disable start button
+            if hasattr(self, 'btn_calibrate_wand'):
+                self.btn_calibrate_wand.setEnabled(False)
+            
+            # Legacy fallback image size (should not be used when camera_settings is present)
+            c_img_size = getattr(self.wand_calibrator, 'image_size', (800, 1280))
+
+            # --- Setup Worker Thread ---
+            self._refr_thread = QThread()
+            self._refr_worker = RefractiveCalibWorker(
+                wand_points=self.wand_calibrator.wand_points,
+                wand_points_filtered=getattr(self.wand_calibrator, 'wand_points_filtered', None),
+                wand_length=wand_len,
+                initial_focal=initial_focal,
+                dist_coeff_num=dist_coeff_num,
+                active_cam_ids=active_cam_ids,
+                all_cam_ids=active_cam_ids,
+                cams_intrinsics=self.wand_calibrator.cameras,
+                image_size=c_img_size,
+                camera_settings=camera_settings,
+                precalib_provider=self.wand_calibrator,
+                use_proj_residuals=use_proj_residuals,
+                num_windows=num_windows,
+                cam_to_window=cam_to_window,
+                window_media=window_media,
+                out_path=out_path
+            )
+            
+            self._refr_worker.moveToThread(self._refr_thread)
+            
+            # Connections
+            self._refr_thread.started.connect(self._refr_worker.run)
+            self._refr_worker.progress.connect(self._on_refractive_progress, Qt.QueuedConnection)
+            self._refr_worker.finished.connect(self._on_refractive_finished, Qt.QueuedConnection)
+            self._refr_worker.error.connect(self._on_refractive_error, Qt.QueuedConnection)
+            
+            # Cleanup
+            self._refr_worker.finished.connect(self._refr_thread.quit)
+            self._refr_worker.finished.connect(self._refr_worker.deleteLater)
+            self._refr_thread.finished.connect(self._refr_thread.deleteLater)
+            self._refr_worker.error.connect(self._refr_thread.quit)
+            self._refr_worker.error.connect(self._refr_worker.deleteLater)
+            
+            # UI Throttling Buffer
+            self._refr_iter_count = 0
+            self._refr_last_phase = None
+            self._refr_last_metrics = None
+            
+            self._refr_timer = QTimer()
+            self._refr_timer.setInterval(200)
+            self._refr_timer.timeout.connect(self._flush_refr_progress)
+            self._refr_timer.start()
+            
+            # Start
+            self._refr_thread.start()
+            print("[Refractive] Calibration Thread Started.")
+            
+        except Exception as e:
+            import traceback
+            print(f"[Refractive] Setup Error:\n{traceback.format_exc()}")
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Setup Error", f"Failed to start calibration:\n{str(e)}")
+            if hasattr(self, 'btn_calibrate_wand'):
+                self.btn_calibrate_wand.setEnabled(True)
+            self._busy_end('wand_calibration')
+
+
+    def _on_window_count_changed(self):
+        """Update window options in the camera-window table."""
+        count = self.wand_cam_table.rowCount()
+        self._update_refraction_cam_table(count)
+    
+    def _create_refractive_calibration_dialog(self):
+        """Create a dialog with matplotlib cost plot for refractive calibration."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QHBoxLayout, QApplication
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+        from matplotlib.ticker import LogLocator, LogFormatterMathtext
+        show_proj = self._get_refr_show_proj()
+        
+        self._refr_calib_dialog = QDialog(self)
+        self._refr_calib_dialog.setWindowTitle("Refractive Calibration Progress")
+        self._refr_calib_dialog.setModal(False)  # Non-modal so processEvents() can work
+        self._refr_calib_dialog.setMinimumSize(450, 380)
+        self._refr_calib_dialog.setStyleSheet("background-color: #000000;")
+        
+        layout = QVBoxLayout(self._refr_calib_dialog)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Phase label (top)
+        self._refr_phase_label = QLabel("Initializing...")
+        self._refr_phase_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00d4ff; background: transparent;")
+        self._refr_phase_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._refr_phase_label.setWordWrap(True)
+        layout.addWidget(self._refr_phase_label)
+        
+        # Matplotlib figure for cost curve
+        self._refr_cost_fig = Figure(figsize=(4.5, 2.5), facecolor='#000000')
+        self._refr_cost_canvas = FigureCanvasQTAgg(self._refr_cost_fig)
+        self._refr_cost_ax = self._refr_cost_fig.add_subplot(111)
+        self._refr_cost_ax.set_facecolor('#000000')
+        self._refr_cost_ax.set_xlabel('Iteration', color='white', fontsize=9)
+        self._refr_cost_ax.set_ylabel('Cost', color='white', fontsize=9)
+        self._refr_cost_ax.tick_params(colors='white', labelsize=8)
+        for spine in self._refr_cost_ax.spines.values():
+            spine.set_color('#444')
+        self._refr_cost_ax.set_title('Optimization Error', color='white', fontsize=10)
+        self._refr_cost_ax.set_ylabel('Ray/Len (mm)', color='white')
+        self._refr_cost_ax.set_yscale('log')
+        self._refr_cost_ax.yaxis.set_label_position('left')
+        self._refr_cost_ax.yaxis.tick_left()
+        self._refr_cost_ax.yaxis.set_major_locator(LogLocator(base=10))
+        self._refr_cost_ax.yaxis.set_major_formatter(LogFormatterMathtext())
+        self._refr_cost_ax.grid(True, which="both", ls="--", color='#333', alpha=0.5)
+
+        self._refr_proj_ax = self._refr_cost_ax.twinx()
+        self._refr_proj_ax.set_facecolor('none')
+        self._refr_proj_ax.set_ylabel('Proj (px)', color='#ff5bd2', fontsize=9)
+        self._refr_proj_ax.tick_params(colors='#ff5bd2', labelsize=8)
+        self._refr_proj_ax.spines['right'].set_color('#ff5bd2')
+        self._refr_proj_ax.set_yscale('log')
+        self._refr_proj_ax.yaxis.set_label_position('right')
+        self._refr_proj_ax.yaxis.tick_right()
+        self._refr_proj_ax.yaxis.set_major_locator(LogLocator(base=10))
+        self._refr_proj_ax.yaxis.set_major_formatter(LogFormatterMathtext())
+        self._refr_proj_ax.set_visible(show_proj)
+
+        
+        # Initialize data and line
+        self._refr_cost_iterations = []
+        self._refr_cost_values = []
+        self._refr_len_values = []
+        self._refr_proj_values = []
+        self._refr_proj_iterations = []
+        self._refr_cost_line, = self._refr_cost_ax.plot([], [], color='#2196F3', marker='o', markersize=3, linewidth=1.5, alpha=0.85, label='Ray')
+        self._refr_len_line, = self._refr_cost_ax.plot([], [], 'orange', marker='s', markersize=3, linewidth=1.5, alpha=0.8, linestyle='--', label='Len')
+        self._refr_proj_line, = self._refr_proj_ax.plot([], [], color='#ff5bd2', marker='^', markersize=3, linewidth=1.5, alpha=0.85, linestyle='-.', label='Proj')
+        self._refr_proj_line.set_visible(show_proj)
+        handles = [self._refr_cost_line, self._refr_len_line] + ([self._refr_proj_line] if show_proj else [])
+        labels = [h.get_label() for h in handles]
+        self._refr_cost_ax.legend(
+            handles,
+            labels,
+            loc='upper left',
+            bbox_to_anchor=(0.01, 0.99),
+            fontsize=8,
+            facecolor='#222',
+            edgecolor='#444',
+            labelcolor='white'
+        )
+        
+        self._refr_cost_fig.subplots_adjust(left=0.16, right=0.86, bottom=0.18, top=0.88)
+        layout.addWidget(self._refr_cost_canvas)
+        
+        # Metrics row (Ray | Len | Proj)
+        metrics_layout = QHBoxLayout()
+        
+        self._refr_ray_label = QLabel("Ray: --")
+        self._refr_ray_label.setStyleSheet("font-size: 14px; color: #2196F3; background: transparent;")
+        self._refr_ray_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        metrics_layout.addWidget(self._refr_ray_label)
+        
+        self._refr_len_label = QLabel("Len: --")
+        self._refr_len_label.setStyleSheet("font-size: 14px; color: #FF9800; background: transparent;")
+        self._refr_len_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        metrics_layout.addWidget(self._refr_len_label)
+
+        self._refr_proj_label = QLabel("Proj: --")
+        self._refr_proj_label.setStyleSheet("font-size: 14px; color: #ff5bd2; background: transparent;")
+        self._refr_proj_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._refr_proj_label.setVisible(show_proj)
+        metrics_layout.addWidget(self._refr_proj_label)
+        
+        layout.addLayout(metrics_layout)
+        
+        # Reset iteration counter
+        self._refr_iter_count = 0
+
+        self._apply_refr_axes_layout_defaults()
+        
+        self._refr_calib_dialog.show()
+        QApplication.processEvents()  # Ensure dialog is visible
+
+    def _apply_refr_axes_layout_defaults(self):
+        """Apply fixed axis label positions and fixed margins for all stages."""
+        if not hasattr(self, '_refr_cost_ax') or not hasattr(self, '_refr_proj_ax'):
+            return
+        show_proj = self._get_refr_show_proj()
+
+        self._refr_cost_ax.yaxis.set_label_position('left')
+        self._refr_cost_ax.yaxis.tick_left()
+        self._refr_cost_ax.yaxis.label.set_visible(True)
+        self._refr_cost_ax.yaxis.label.set_clip_on(False)
+        self._refr_cost_ax.yaxis.set_label_coords(-0.11, 0.5)
+
+        self._refr_proj_ax.yaxis.set_label_position('right')
+        self._refr_proj_ax.yaxis.tick_right()
+        self._refr_proj_ax.yaxis.label.set_visible(show_proj)
+        self._refr_proj_ax.yaxis.label.set_clip_on(False)
+        self._refr_proj_ax.yaxis.set_label_coords(1.1, 0.5)
+        self._refr_proj_ax.tick_params(axis='y', which='both', right=show_proj, labelright=show_proj)
+        self._refr_proj_ax.spines['right'].set_visible(show_proj)
+        self._refr_proj_ax.set_visible(show_proj)
+
+    def _get_refr_show_proj(self) -> bool:
+        return bool(getattr(self, '_refr_show_proj', True) or getattr(self, '_refr_force_show_proj_for_p0', False))
+    
+    @Slot(str, float, float, float, float)
+    def _on_refractive_progress(self, phase, ray_rmse, len_rmse, proj_rmse, cost):
+        """Receive progress from worker thread."""
+        # Update phase always
+        self._refr_last_phase = phase
+
+        phase_l = str(phase).lower() if phase is not None else ""
+        is_p0 = ("p0" in phase_l) or ("pinhole model" in phase_l)
+        if is_p0:
+            self._refr_force_show_proj_for_p0 = True
+        
+        # Only update metrics buffer if it's a real cost update (not evaluating placeholder)
+        if cost > 0:
+            self._refr_last_metrics = (ray_rmse, len_rmse, proj_rmse, cost)
+    
+    @Slot()
+    def _flush_refr_progress(self):
+        """Update UI from buffered progress data (Timer driven)."""
+        # 1. Update Phase (status text)
+        if hasattr(self, '_refr_last_phase') and self._refr_last_phase is not None:
+            if hasattr(self, '_refr_phase_label'):
+                self._refr_phase_label.setText(f"Phase: {self._refr_last_phase}")
+            self._refr_last_phase = None # Clear to avoid redundant updates
+
+        # 2. Update Metrics & Plot (if a real optimization step occurred)
+        if hasattr(self, '_refr_last_metrics') and self._refr_last_metrics is not None:
+            ray_rmse, len_rmse, proj_rmse, cost = self._refr_last_metrics
+            self._refr_last_metrics = None # Clear after processing
+            show_proj = self._get_refr_show_proj()
+
+            if hasattr(self, '_refr_proj_ax'):
+                self._refr_proj_ax.set_visible(show_proj)
+            if hasattr(self, '_refr_proj_line'):
+                self._refr_proj_line.set_visible(show_proj)
+            if hasattr(self, '_refr_proj_label'):
+                self._refr_proj_label.setVisible(show_proj)
+            
+            # Increment iteration
+            if hasattr(self, '_refr_iter_count'):
+                self._refr_iter_count += 1
+            else:
+                self._refr_iter_count = 1
+            iteration = self._refr_iter_count
+            
+            # Update labels
+            if hasattr(self, '_refr_ray_label'):
+                if ray_rmse is None or ray_rmse <= 0:
+                    self._refr_ray_label.setText("Ray: N.A.")
+                else:
+                    self._refr_ray_label.setText(f"Ray: {ray_rmse:.4f} mm")
+            
+            if hasattr(self, '_refr_len_label'):
+                self._refr_len_label.setText(f"Len: {len_rmse:.4f} mm")
+
+            if show_proj and hasattr(self, '_refr_proj_label'):
+                if proj_rmse is None or proj_rmse <= 0:
+                    self._refr_proj_label.setText("Proj: N.A.")
+                else:
+                    self._refr_proj_label.setText(f"Proj: {proj_rmse:.4f} px")
+
+            # Update plot
+            if hasattr(self, '_refr_cost_iterations'):
+                self._refr_cost_iterations.append(iteration)
+                ray_valid = not (ray_rmse is None or ray_rmse <= 0)
+                if not ray_valid:
+                    self._refr_cost_values.append(np.nan)
+                else:
+                    self._refr_cost_values.append(ray_rmse)
+                self._refr_len_values.append(len_rmse)
+                if show_proj:
+                    proj_valid = not (proj_rmse is None or proj_rmse <= 0)
+                    if proj_valid:
+                        self._refr_proj_iterations.append(iteration)
+                        self._refr_proj_values.append(float(proj_rmse))
+
+                if hasattr(self, '_refr_cost_line'):
+                    self._refr_cost_line.set_visible(bool(ray_valid))
+
+                self._refr_cost_line.set_data(self._refr_cost_iterations, self._refr_cost_values)
+                self._refr_len_line.set_data(self._refr_cost_iterations, self._refr_len_values)
+                if show_proj:
+                    self._refr_proj_line.set_data(self._refr_proj_iterations, self._refr_proj_values)
+
+                # Keep axis styling stable across redraws.
+                self._refr_cost_ax.set_xlabel('Iteration', color='white', fontsize=9)
+                self._refr_cost_ax.set_ylabel('Ray/Len (mm)', color='white')
+                self._refr_cost_ax.tick_params(colors='white', labelsize=8)
+                self._refr_cost_ax.set_yscale('log')
+                self._refr_cost_ax.yaxis.set_label_position('left')
+                self._refr_cost_ax.yaxis.tick_left()
+                self._refr_cost_ax.yaxis.set_visible(True)
+                self._refr_cost_ax.spines['left'].set_visible(True)
+                if show_proj:
+                    self._refr_proj_ax.set_ylabel('Proj (px)', color='#ff5bd2', fontsize=9)
+                    self._refr_proj_ax.tick_params(colors='#ff5bd2', labelsize=8)
+                    self._refr_proj_ax.set_yscale('log')
+                    self._refr_proj_ax.yaxis.set_label_position('right')
+                    self._refr_proj_ax.yaxis.tick_right()
+                    self._refr_proj_ax.yaxis.set_visible(True)
+                    self._refr_proj_ax.spines['right'].set_visible(True)
+
+                # Robust autoscale: only use positive finite values for log axes.
+                x_vals = np.asarray(self._refr_cost_iterations, dtype=float)
+                left_vals = []
+                left_vals.extend([v for v in self._refr_len_values if np.isfinite(v) and v > 0])
+                left_vals.extend([v for v in self._refr_cost_values if np.isfinite(v) and v > 0])
+                right_vals = [v for v in self._refr_proj_values if np.isfinite(v) and v > 0] if show_proj else []
+
+                if x_vals.size > 0:
+                    x_min = max(0.0, float(np.min(x_vals)) - 0.5)
+                    x_max = float(np.max(x_vals)) + 0.5
+                    self._refr_cost_ax.set_xlim(x_min, x_max)
+                    if show_proj:
+                        self._refr_proj_ax.set_xlim(x_min, x_max)
+
+                if left_vals:
+                    left_vals_np = np.asarray(left_vals, dtype=float)
+                    lv_min = float(np.min(left_vals_np[left_vals_np > 0]))
+                    lv_max = float(np.max(left_vals_np))
+                    y_min = 10.0 ** np.floor(np.log10(max(lv_min, 1e-12)))
+                    y_max = 10.0 ** np.ceil(np.log10(max(lv_max, 1e-12)))
+                    if y_max <= y_min:
+                        y_min = y_min * 0.1
+                        y_max = y_max * 10.0
+                    self._refr_cost_ax.set_ylim(y_min, y_max)
+
+                if show_proj and right_vals:
+                    right_vals_np = np.asarray(right_vals, dtype=float)
+                    rv_min = float(np.min(right_vals_np[right_vals_np > 0]))
+                    rv_max = float(np.max(right_vals_np))
+                    y2_min = 10.0 ** np.floor(np.log10(max(rv_min, 1e-12)))
+                    y2_max = 10.0 ** np.ceil(np.log10(max(rv_max, 1e-12)))
+                    if y2_max <= y2_min:
+                        y2_min = y2_min * 0.1
+                        y2_max = y2_max * 10.0
+                    self._refr_proj_ax.set_ylim(y2_min, y2_max)
+
+                self._apply_refr_axes_layout_defaults()
+                self._refr_cost_canvas.draw_idle()
+
+    @Slot(bool, object, object, object)
+    def _on_refractive_finished(self, success, cam_params, report, dataset):
+        """Handle calibration completion."""
+        # Stop timer
+        if hasattr(self, '_refr_timer'):
+            self._refr_timer.stop()
+        
+        # Final flush
+        self._flush_refr_progress()
+        
+        # Close dialog
+        if hasattr(self, '_refr_calib_dialog') and self._refr_calib_dialog:
+             self._refr_calib_dialog.close()
+             
+        # Re-enable button
+        if hasattr(self, 'btn_calibrate_wand'):
+            self.btn_calibrate_wand.setEnabled(True)
+            
+        if success and cam_params:
+            self._refr_has_result = True
+            self._refr_params_dirty = True
+            self._refr_final_cam_params = cam_params
+            self._refr_window_planes = report.get('window_planes', {}) if isinstance(report, dict) else {}
+            self._refr_proj_err_stats = dataset.get('per_camera_proj_err_stats', {}) if isinstance(dataset, dict) else {}
+            self._refr_tri_err_stats = dataset.get('per_camera_tri_err_stats', {}) if isinstance(dataset, dict) else {}
+
+            msg_lines = [
+                "Refractive Calibration Completed.",
+                "Report saved to output folder."
+            ]
+            if hasattr(self, 'status_label'):
+                self.status_label.setText("Refractive Calibration Successful")
+            
+            # [FIX] Inject computed errors into main calibrator for table display
+            errors = dataset.get('per_frame_errors', {})
+            if errors:
+                self.wand_calibrator.per_frame_errors = errors
+                print(f"[Refractive] Injected {len(errors)} frames of error data into UI calibrator.")
+
+                cam_errs = {}
+                len_errs = []
+                per_camera_mean = dataset.get('per_camera_mean_proj_err', {})
+                for err in errors.values():
+                    if 'len_error' in err:
+                        len_errs.append(float(err['len_error']))
+                    for cid, e in err.get('cam_errors', {}).items():
+                        cam_errs.setdefault(int(cid), []).append(float(e))
+
+                if len_errs:
+                    wand_rmse = float(np.sqrt(np.mean(np.square(len_errs))))
+                    msg_lines.append(f"Wand Length RMSE: {wand_rmse:.4f} mm")
+
+                if per_camera_mean:
+                    msg_lines.append("Per-Camera Mean Projection Error:")
+                    for cid in sorted(per_camera_mean.keys()):
+                        mean_err = float(per_camera_mean[cid])
+                        msg_lines.append(f"  Cam {cid}: {mean_err:.3f} px")
+                elif cam_errs:
+                    msg_lines.append("Per-Camera Mean Projection Error:")
+                    for cid in sorted(cam_errs.keys()):
+                        vals = cam_errs[cid]
+                        if vals:
+                            mean_err = float(np.mean(vals))
+                            msg_lines.append(f"  Cam {cid}: {mean_err:.3f} px")
+
+            QMessageBox.information(self, "Success", "\n".join(msg_lines))
+            
+            # 3D Visualization
+            try:
+                # Add window planes and 3D points
+                # 1. Extract Window Planes from report
+                win_planes = report.get('window_planes', {})
+                
+                # 2. Extract 3D Points from dataset
+                pts_3d_list = dataset.get('points_3d', [])
+                pts_3d = None
+                if pts_3d_list:
+                    pts_3d = np.array(pts_3d_list).reshape(-1, 3)
+                    # Subsample if too many points for Matplotlib (e.g., > 5000)
+                    if len(pts_3d) > 3000:
+                        import random
+                        indices = sorted(random.sample(range(len(pts_3d)), 3000))
+                        pts_3d = pts_3d[indices]
+                
+                if hasattr(self, 'calib_3d_view'):
+                    self.calib_3d_view.plot_refractive(cam_params, win_planes, pts_3d)
+                    if hasattr(self, 'vis_tabs'):
+                        self.vis_tabs.setCurrentIndex(1)
+                    
+            except Exception as e:
+                print(f"[Refractive] Visualization Error: {e}")
+            
+            # Populate Error Analysis table (per_frame_errors was computed in calibrator)
+            try:
+                self._populate_error_table()
+            except Exception as e:
+                print(f"[Refractive] Error table population failed: {e}")
+        else:
+            QMessageBox.warning(self, "Result", "Calibration finished but no params returned.")
+        self._busy_end('wand_calibration')
+
+    def export_refractive_camfiles_to_dir(self, out_dir):
+        """Export latest refractive calibration result into target camFile directory."""
+        if not out_dir:
+            return False
+        if not self._refr_has_result or not self._refr_final_cam_params:
+            return False
+        if not self._refr_cam_to_window or not self._refr_window_media:
+            return False
+
+        try:
+            exporter = RefractiveWandCalibrator(self.wand_calibrator)
+            exporter.export_camfile_with_refraction(
+                out_dir=out_dir,
+                cam_params=self._refr_final_cam_params,
+                window_media=self._refr_window_media,
+                cam_to_window=self._refr_cam_to_window,
+                window_planes=self._refr_window_planes,
+                proj_err_stats=self._refr_proj_err_stats,
+                tri_err_stats=self._refr_tri_err_stats,
+            )
+            self._refr_params_dirty = False
+            return True
+        except Exception as e:
+            print(f"[Refractive] Export to project camFile failed: {e}")
+            return False
+            
+    @Slot(str)
+    def _on_refractive_error(self, traceback_str):
+        """Handle worker error."""
+        if hasattr(self, '_refr_timer'):
+            self._refr_timer.stop()
+            
+        if hasattr(self, '_refr_calib_dialog') and self._refr_calib_dialog:
+             self._refr_calib_dialog.close()
+             
+        if hasattr(self, 'btn_calibrate_wand'):
+            self.btn_calibrate_wand.setEnabled(True)
+            
+        print(f"[Refractive] Worker Error:\n{traceback_str}")
+        QMessageBox.critical(self, "Calibration Error", f"Worker thread failed:\n{traceback_str}")
+        if hasattr(self, 'status_label'):
+            self.status_label.setText("Refractive Calibration Failed")
+        self._busy_end('wand_calibration')
+
+    def _update_refraction_cam_table(self, cam_count):
+        """Sync refraction camera table with current cameras and window options."""
+        if not hasattr(self, 'cam_window_table') or self.cam_window_table is None:
+            return
+            
+        self.cam_window_table.setRowCount(cam_count)
+        win_count = self.window_count_spin.value()
+        window_options = [f"Window {i}" for i in range(win_count)]
+        
+        for i in range(cam_count):
+            # Col 0: Camera ID
+            cam_id_item = QTableWidgetItem(f"{i}")
+            cam_id_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            cam_id_item.setForeground(Qt.GlobalColor.white)
+            cam_id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.cam_window_table.setItem(i, 0, cam_id_item)
+            
+            # Col 1: Window Selection
+            win_combo = QComboBox()
+            self._apply_input_style(win_combo)
+            win_combo.addItems(window_options)
+            self.cam_window_table.setCellWidget(i, 1, win_combo)

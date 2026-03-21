@@ -37,7 +37,7 @@
 #include <vector>
 
 // Project headers - order matters for proper type resolution
-#include "Camera.h"     // Uses Matrix types
+#include "Camera.h"
 #include "Config.h"     // Uses Camera, ObjectInfo
 #include "ImageIO.h"    // Uses Image
 #include "Matrix.h"     // Must come first (defines Pt2D, Pt3D, Image)
@@ -177,12 +177,13 @@ public:
    * @param frame_id Current frame index.
    * @param active_tracks List of active tracks to sample from.
    * @param images Current images from all cameras.
-   * @param cams Current camera parameters.
+   * @param camera_models Current camera parameters.
    * @param obj_cfg Current object configuration for ObjectFinder.
    */
   void accumulate(int frame_id, const std::deque<Track> &active_tracks,
                   const std::vector<Image> &images,
-                  const std::vector<Camera> &cams, const ObjectConfig &obj_cfg);
+                  const std::vector<std::shared_ptr<Camera>> &camera_models,
+                  const ObjectConfig &obj_cfg);
 
   /**
    * @brief Check if enough data has been collected to run calibration.
@@ -205,10 +206,10 @@ public:
    * 3. Iteratively updates parameters if error reduces.
    * 4. Only commits changes if final error < original error.
    *
-   * @param cams [in/out] Camera parameters to optimize.
+   * @param camera_models [in/out] Camera parameters to optimize.
    * @return true if any camera was updated.
    */
-  bool runVSC(std::vector<Camera> &cams);
+  bool runVSC(std::vector<std::shared_ptr<Camera>> &camera_models);
 
   /**
    * @brief Run OTF Calibration to optimize Tracer shape parameters.

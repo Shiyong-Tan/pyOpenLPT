@@ -2,12 +2,15 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <stdexcept>
+
 #define OPENLPT_EXPOSE_PRIVATE
 
 #include "Camera.h"
 #include "Config.h"
 #include "ObjectInfo.h"
 #include "StereoMatch.h"
+#include "py_camera_handle.h"
 #include "pybind_utils.h" // make_unique_obj2d_grid
 
 
@@ -50,14 +53,14 @@ struct DebugAccess_StereoMatch {
                                        std::vector<int> &out) {
     m.enumerateCandidatesOnCam(los3d, target_cam, chosen_cams, chosen_pts, out);
   }
-  static Line2D makeLine2DFromLOS3D(const StereoMatch &m, int cam_id,
-                                    const Line3D &los) {
-    return m.makeLine2DFromLOS3D(cam_id, los);
+  static bool makeLine2DFromLOS3D(const StereoMatch &m, int cam_id,
+                                  const Line3D &los, Line2D &out_line) {
+    return m.makeLine2DFromLOS3D(cam_id, los, out_line);
   }
-  static void buildLinesOnCam(const StereoMatch &m,
+  static bool buildLinesOnCam(const StereoMatch &m,
                               const std::vector<Line3D> &los3d, int cam_id,
                               std::vector<Line2D> &out) {
-    m.buildLinesOnCam(los3d, cam_id, out);
+    return m.buildLinesOnCam(los3d, cam_id, out);
   }
   static int
   selectSecondCameraByLineLength(const StereoMatch &m, const Line3D &los_ref,
@@ -121,26 +124,20 @@ void bind_StereoMatch(py::module_ &m) {
   py::class_<StereoMatch>(m, "StereoMatch", py::dynamic_attr())
       .def(
           "__init__",
-          [](py::handle self, const std::vector<Camera> &cams_in,
+          [](py::handle self, const std::vector<PyCameraHandle> &cams_in,
              const std::vector<std::vector<Object2D *>> &obj2d_by_cam,
              py::object obj_cfg) {
-            auto cams_keep = std::make_shared<std::vector<Camera>>(cams_in);
             auto obj2d_owned_keep = std::make_shared<
                 std::vector<std::vector<std::unique_ptr<Object2D>>>>(
                 make_unique_obj2d_grid(obj2d_by_cam));
             ObjectConfig &cfg_ref = py::cast<ObjectConfig &>(obj_cfg);
 
-            new (self.cast<StereoMatch *>())
-                StereoMatch(*cams_keep, *obj2d_owned_keep, cfg_ref);
+            auto camera_models_keep = std::make_shared<std::vector<std::shared_ptr<Camera>>>(
+                make_cam_list_from_handles(cams_in,
+                                               "StereoMatch pybind ctor"));
 
-            py::setattr(
-                self, "_keep_cams",
-                py::capsule(new std::shared_ptr<std::vector<Camera>>(
-                                std::move(cams_keep)),
-                            [](void *p) {
-                              delete static_cast<
-                                  std::shared_ptr<std::vector<Camera>> *>(p);
-                            }));
+            new (self.cast<StereoMatch *>())
+                StereoMatch(*camera_models_keep, *obj2d_owned_keep, cfg_ref);
             py::setattr(
                 self, "_keep_obj2d",
                 py::capsule(
@@ -151,9 +148,55 @@ void bind_StereoMatch(py::module_ &m) {
                       delete static_cast<std::shared_ptr<std::vector<
                           std::vector<std::unique_ptr<Object2D>>>> *>(p);
                     }));
+            py::setattr(
+                self, "_keep_cam_list",
+                py::capsule(new std::shared_ptr<std::vector<std::shared_ptr<Camera>>>(
+                                std::move(camera_models_keep)),
+                            [](void *p) {
+                              delete static_cast<std::shared_ptr<std::vector<
+                                  std::shared_ptr<Camera>>> *>(p);
+                            }));
             py::setattr(self, "_keep_cfg", obj_cfg);
           },
           py::arg("cams"), py::arg("obj2d_by_cam"), py::arg("obj_cfg"))
+      .def(
+          "__init__",
+          [](py::handle self,
+             const std::vector<std::shared_ptr<Camera>> &camera_models_in,
+             const std::vector<std::vector<Object2D *>> &obj2d_by_cam,
+             py::object obj_cfg) {
+            auto obj2d_owned_keep = std::make_shared<
+                std::vector<std::vector<std::unique_ptr<Object2D>>>>(
+                make_unique_obj2d_grid(obj2d_by_cam));
+            ObjectConfig &cfg_ref = py::cast<ObjectConfig &>(obj_cfg);
+            auto camera_models_keep =
+                std::make_shared<std::vector<std::shared_ptr<Camera>>>(
+                    camera_models_in);
+
+            new (self.cast<StereoMatch *>())
+                StereoMatch(*camera_models_keep, *obj2d_owned_keep, cfg_ref);
+            py::setattr(
+                self, "_keep_obj2d",
+                py::capsule(
+                    new std::shared_ptr<
+                        std::vector<std::vector<std::unique_ptr<Object2D>>>>(
+                        std::move(obj2d_owned_keep)),
+                    [](void *p) {
+                      delete static_cast<std::shared_ptr<std::vector<
+                          std::vector<std::unique_ptr<Object2D>>>> *>(p);
+                    }));
+            py::setattr(
+                self, "_keep_cam_list",
+                py::capsule(new std::shared_ptr<std::vector<std::shared_ptr<Camera>>>(
+                                std::move(camera_models_keep)),
+                            [](void *p) {
+                              delete static_cast<std::shared_ptr<std::vector<
+                                  std::shared_ptr<Camera>>> *>(p);
+                            }));
+            py::setattr(self, "_keep_cfg", obj_cfg);
+          },
+          py::arg("camera_models"), py::arg("obj2d_by_cam"),
+          py::arg("obj_cfg"))
 
       // public
       .def("match", &StereoMatch::match)
@@ -214,16 +257,18 @@ void bind_StereoMatch(py::module_ &m) {
           [](const StereoMatch &self, const std::vector<Line3D> &los3d,
              int cam_id) {
             std::vector<Line2D> lines;
-            DebugAccess_StereoMatch::buildLinesOnCam(self, los3d, cam_id,
-                                                     lines);
-            return lines;
+            bool ok = DebugAccess_StereoMatch::buildLinesOnCam(self, los3d,
+                                                               cam_id, lines);
+            return py::make_tuple(ok, lines);
           },
           py::arg("los3d"), py::arg("cam_id"))
       .def(
           "makeLine2DFromLOS3D",
           [](const StereoMatch &self, int cam_id, const Line3D &los) {
-            return DebugAccess_StereoMatch::makeLine2DFromLOS3D(self, cam_id,
-                                                                los);
+            Line2D line;
+            bool ok = DebugAccess_StereoMatch::makeLine2DFromLOS3D(
+                self, cam_id, los, line);
+            return py::make_tuple(ok, line);
           },
           py::arg("cam_id"), py::arg("los"))
       .def(

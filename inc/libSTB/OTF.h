@@ -54,7 +54,8 @@ public:
 
     // nx,ny,nz >= 2
     // set as default a,b,c,alpha values
-    OTF(int n_cam, int nx, int ny, int nz, AxisLimit const& boundary, std::vector<Camera> const& cam_list); 
+    OTF(int n_cam, int nx, int ny, int nz, AxisLimit const& boundary,
+        const std::vector<std::shared_ptr<Camera>>& camera_models); 
 
     // nx,ny,nz >= 2
     // use file to load a,b,c,alpha
@@ -67,7 +68,8 @@ public:
 
     ~OTF() {};
 
-    void loadParam (int n_cam, int nx, int ny, int nz, AxisLimit const& boundary, std::vector<Camera> const& cam_list);
+    void loadParam (int n_cam, int nx, int ny, int nz, AxisLimit const& boundary,
+                    const std::vector<std::shared_ptr<Camera>>& camera_models);
     void loadParam (std::string otf_file);
 
     void saveParam (std::string otf_file);

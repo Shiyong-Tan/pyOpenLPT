@@ -27,8 +27,10 @@ set(OPENLPT_INC_ROOTS
 )
 
 if (MSVC)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")         # /MD
-  set(CMAKE_MSVC_RUNTIME_LIBRARY_DEBUG "MultiThreadedDebugDLL") # /MDd
+  # Keep runtime consistent across all targets/configurations:
+  # Debug  -> /MDd
+  # Release-> /MD
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
 # If you generate a config header from a template, enable:
@@ -130,7 +132,9 @@ target_link_libraries(ImageIO
 openlpt_apply_warnings(ImageIO)
 
 # Camera
-add_library(Camera STATIC "${PROJECT_SOURCE_DIR}/src/srcMath/Camera.cpp")
+add_library(Camera STATIC
+  "${PROJECT_SOURCE_DIR}/src/srcMath/Camera.cpp"
+)
 openlpt_public_includes(Camera)
 target_link_libraries(Camera PUBLIC myMath Matrix)
 openlpt_apply_warnings(Camera)

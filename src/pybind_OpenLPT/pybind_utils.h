@@ -2,7 +2,9 @@
 #include <vector>
 #include <memory>
 #include <stdexcept>
+#include "Camera.h"
 #include "ObjectInfo.h"   // Object3D/Object2D, Bubble3D/Bubble2D, Tracer3D/Tracer2D
+#include "py_camera_handle.h"
 
 // ---------- 1D: list[Object2D] -> vector<unique_ptr<Object2D>> ----------
 // ---------- 1D: list[Object2D] -> vector<unique_ptr<Object2D>> (ALLOW nullptr) ----------

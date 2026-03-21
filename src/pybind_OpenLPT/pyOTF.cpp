@@ -30,14 +30,14 @@ void bind_OTF(py::module_& m)
 
     py::class_<OTF>(m, "OTF")
         .def(py::init<>())
-        .def(py::init<int,int,int,int, const AxisLimit&, const std::vector<Camera>&>(),
+        .def(py::init<int,int,int,int, const AxisLimit&, const std::vector<std::shared_ptr<Camera>>&>(),
              py::arg("n_cam"), py::arg("nx"), py::arg("ny"), py::arg("nz"),
-             py::arg("boundary"), py::arg("cam_list"))
+             py::arg("boundary"), py::arg("camera_models"))
         .def(py::init<const std::string&>(), py::arg("otf_file"))
         .def("loadParam",
-             py::overload_cast<int,int,int,int, const AxisLimit&, const std::vector<Camera>&>(&OTF::loadParam),
+             py::overload_cast<int,int,int,int, const AxisLimit&, const std::vector<std::shared_ptr<Camera>>&>(&OTF::loadParam),
              py::arg("n_cam"), py::arg("nx"), py::arg("ny"), py::arg("nz"),
-             py::arg("boundary"), py::arg("cam_list"))
+             py::arg("boundary"), py::arg("camera_models"))
         .def("loadParam",
              py::overload_cast<std::string>(&OTF::loadParam),
              py::arg("otf_file"))

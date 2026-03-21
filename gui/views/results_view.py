@@ -48,8 +48,24 @@ class ResultsView(QWidget):
         self.current_fig = None
         self.current_ax = None
         self.current_canvas = None
+        self._busy_tokens = {}
         
         self._setup_ui()
+
+    def _busy_begin(self, key, task_name):
+        if key in self._busy_tokens:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'begin_busy'):
+            self._busy_tokens[key] = wnd.begin_busy(task_name)
+
+    def _busy_end(self, key):
+        token = self._busy_tokens.pop(key, None)
+        if token is None:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'end_busy'):
+            wnd.end_busy(token)
     
     def showEvent(self, event):
         """Auto-fill project path from settings if available."""
@@ -452,6 +468,7 @@ class ResultsView(QWidget):
             
         self.load_btn.setEnabled(False)
         self.status_label.setText("Loading data...")
+        self._busy_begin('load_data', 'Loading results data')
         
         # Show Progress Dialog
         self.progress_dialog = QProgressDialog("Loading tracks... Please wait.", "Cancel", 0, 0, self)
@@ -487,6 +504,7 @@ class ResultsView(QWidget):
         # User requested manual "Visualize" button generally, but initial load usually shows something.
         # Let's show top N automatically on load.
         self._update_plot()
+        self._busy_end('load_data')
         
     def _on_error(self, msg):
         if hasattr(self, 'progress_dialog') and self.progress_dialog:
@@ -497,11 +515,15 @@ class ResultsView(QWidget):
         self.process_btn.setEnabled(True)
         self.export_mat_btn.setEnabled(True)
         QMessageBox.critical(self, "Error", msg)
+        self._busy_end('load_data')
+        self._busy_end('process_data')
+        self._busy_end('export_mat')
 
     def _run_optimization_analysis(self):
         """Run noise analysis curve."""
         self.analyze_btn.setEnabled(False)
         self.status_label.setText("Analyzing noise...")
+        self._busy_begin('analyze_noise', 'Analyzing noise')
         QApplication.processEvents()
         
         fps = self.fps_spin.value()
@@ -632,6 +654,7 @@ class ResultsView(QWidget):
             QMessageBox.warning(self, "Analysis Failed", str(e))
         finally:
             self.analyze_btn.setEnabled(True)
+            self._busy_end('analyze_noise')
 
     def _enable_mouse_interaction(self, canvas, ax):
         """Enable Zoom on Scroll and Pan on Right-Click Drag."""
@@ -696,6 +719,7 @@ class ResultsView(QWidget):
         """Run kinematics computation."""
         self.process_btn.setEnabled(False)
         self.status_label.setText("Processing...")
+        self._busy_begin('process_data', 'Processing results')
         
         filter_width = self.filter_width_spin.value()
         acc_filter_width = self.acc_filter_width_spin.value()
@@ -721,6 +745,7 @@ class ResultsView(QWidget):
         
         self._update_plot()
         QMessageBox.information(self, "Success", "Kinematics calculation complete.")
+        self._busy_end('process_data')
 
 
     def _on_slider_change(self):
@@ -733,6 +758,7 @@ class ResultsView(QWidget):
         """Refreshes 3D plot with Top N filtering."""
         if not self.loaded_tracks:
             return
+        self._busy_begin('plot_tracks', 'Plotting tracks')
             
         # UI Feedback for Plotting
         progress = QProgressDialog("Plotting tracks... Please wait.", None, 0, 0, self)
@@ -906,6 +932,7 @@ class ResultsView(QWidget):
             if hasattr(self, 'line_main'): self.line_main = None
         finally:
             progress.close()
+            self._busy_end('plot_tracks')
 
     def _export_mat(self):
         if not self.loaded_tracks:
@@ -954,6 +981,7 @@ class ResultsView(QWidget):
         
         if dialog.exec() == QDialog.Accepted:
             try:
+                self._busy_begin('export_mat', 'Exporting MAT')
                 options = {
                     'id': chk_id.isChecked(),
                     'frame': chk_frame.isChecked(),
@@ -966,6 +994,7 @@ class ResultsView(QWidget):
             except Exception as e:
                 import traceback
                 traceback.print_exc()
+                self._busy_end('export_mat')
     
     def _replot_check(self):
         """Update check plots with current filter width settings."""
@@ -1047,4 +1076,5 @@ class ResultsView(QWidget):
             QMessageBox.information(self, "Export", msg)
         else:
             QMessageBox.critical(self, "Export Error", msg)
+        self._busy_end('export_mat')
             

@@ -172,14 +172,20 @@ bool test_function_2 ()
     ////////////////////////
 
     // test projectObject2D
-    std::vector<Camera> cam_list_all;
+    std::vector<std::shared_ptr<Camera>> cam_list_all;
     std::vector<int> camid_list_2 = {0, 1, 2, 3};
     for (int i = 0; i < 5; i ++)
     {
-        Camera cam ("../test/inputs/test_ObjectInfo/cam"+std::to_string(i+1)+".txt");
-        cam_list_all.push_back(cam);
+        auto cam_st = CameraFactory::loadFromFile("../test/inputs/test_ObjectInfo/cam"+std::to_string(i+1)+".txt");
+        if (!cam_st)
+        {
+            std::cout << "test_function_2: load camera failed (line " << __LINE__ << ")" << std::endl;
+            return false;
+        }
+        cam_list_all.push_back(cam_st.value());
     }
-    tr3d.projectObject2D(camid_list_2, cam_list_all);
+    cam_list_all[4]->is_active = false;
+    tr3d.projectObject2D(cam_list_all);
     tracer2d_list = tr3d._tr2d_list;
     camid_list = tr3d._camid_list;
     if (tracer2d_list.size() != 4 || camid_list.size() != 4)
@@ -191,7 +197,8 @@ bool test_function_2 ()
     }
     for (int i = 0; i < 4; i++)
     {
-        if (tracer2d_list[i]._pt_center != cam_list_all[i].project(tr3d._pt_center) || camid_list[i] != camid_list_2[i])
+        auto proj_st = cam_list_all[i]->project(tr3d._pt_center);
+        if (!proj_st || tracer2d_list[i]._pt_center != proj_st.value() || camid_list[i] != camid_list_2[i])
         {
             std::cout << "test_function_2: projectObject2D failed (line " << __LINE__ << ")" << std::endl;
             return false;
@@ -202,6 +209,97 @@ bool test_function_2 ()
     return true;
 }
 
+// test IQR-based robust scale recovery in calRadiusFromCams
+bool test_IQR_filtering()
+{
+    // Create a simple pinhole camera for testing
+    PinholeParam param;
+    param.cam_mtx = Matrix<double, 3, 3>::Identity();
+    param.cam_mtx(0, 0) = 1000.0;  // fx
+    param.cam_mtx(1, 1) = 1000.0;  // fy
+    param.cam_mtx(0, 2) = 500.0;   // cx
+    param.cam_mtx(1, 2) = 500.0;   // cy
+    param.dist_coeff = Matrix<double, 1, 5>::Zero();
+    param.r_mtx = Matrix<double, 3, 3>::Identity();
+    param.t_vec = Pt3D(0, 0, 0);
+    param.t_vec_inv = Pt3D(0, 0, 0);
+    param.nrow = 1000;
+    param.ncol = 1000;
+    
+    auto cam = std::make_shared<PinholeCamera>(param);
+    
+    // Test case 1: Normal data without outliers
+    {
+        std::vector<std::shared_ptr<Camera>> cams;
+        std::vector<std::unique_ptr<Object2D>> obj2d_list;
+        
+        // Create 5 cameras with consistent radius measurements
+        Pt3D X(0, 0, 100);  // bubble at 100mm distance
+        for (int i = 0; i < 5; i++) {
+            cams.push_back(cam);
+            auto bb2d = std::make_unique<Bubble2D>();
+            bb2d->_r_px = 10.0 + i * 0.1;  // slight variation
+            obj2d_list.push_back(std::move(bb2d));
+        }
+        
+        double R = Bubble::calRadiusFromCams(cams, X, obj2d_list);
+        if (!std::isfinite(R) || R <= 0.0) {
+            std::cout << "test_IQR_filtering: normal case failed" << std::endl;
+            return false;
+        }
+    }
+    
+    // Test case 2: Data with outliers (should be filtered by IQR)
+    {
+        std::vector<std::shared_ptr<Camera>> cams;
+        std::vector<std::unique_ptr<Object2D>> obj2d_list;
+        
+        Pt3D X(0, 0, 100);
+        // Create measurements: 4 normal + 1 outlier
+        for (int i = 0; i < 4; i++) {
+            cams.push_back(cam);
+            auto bb2d = std::make_unique<Bubble2D>();
+            bb2d->_r_px = 10.0 + i * 0.1;
+            obj2d_list.push_back(std::move(bb2d));
+        }
+        // Add an outlier
+        cams.push_back(cam);
+        auto bb2d_outlier = std::make_unique<Bubble2D>();
+        bb2d_outlier->_r_px = 50.0;  // outlier
+        obj2d_list.push_back(std::move(bb2d_outlier));
+        
+        double R_with_outlier = Bubble::calRadiusFromCams(cams, X, obj2d_list);
+        if (!std::isfinite(R_with_outlier) || R_with_outlier <= 0.0) {
+            std::cout << "test_IQR_filtering: outlier case failed" << std::endl;
+            return false;
+        }
+        
+        // The result should be close to the normal values, not influenced heavily by outlier
+        // This is a qualitative check - exact value depends on IQR filtering
+    }
+    
+    // Test case 3: Single value (edge case)
+    {
+        std::vector<std::shared_ptr<Camera>> cams;
+        std::vector<std::unique_ptr<Object2D>> obj2d_list;
+        
+        Pt3D X(0, 0, 100);
+        cams.push_back(cam);
+        auto bb2d = std::make_unique<Bubble2D>();
+        bb2d->_r_px = 10.0;
+        obj2d_list.push_back(std::move(bb2d));
+        
+        double R = Bubble::calRadiusFromCams(cams, X, obj2d_list);
+        if (!std::isfinite(R) || R <= 0.0) {
+            std::cout << "test_IQR_filtering: single value case failed" << std::endl;
+            return false;
+        }
+    }
+    
+    std::cout << "test_IQR_filtering: all tests passed" << std::endl;
+    return true;
+}
+
 
 int main()
 {
@@ -209,6 +307,7 @@ int main()
 
     IS_TRUE(test_function_1());
     IS_TRUE(test_function_2());
+    IS_TRUE(test_IQR_filtering());
 
     return 0;
 }

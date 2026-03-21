@@ -3,6 +3,7 @@
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <stdexcept>
 
 
 #include "Camera.h"
@@ -10,6 +11,7 @@
 #include "ObjectInfo.h"
 #include "STBCommons.h"
 #include "Shake.h"
+#include "py_camera_handle.h"
 #include "pybind_utils.h"
 
 
@@ -19,7 +21,6 @@ using namespace pybind11::literals;
 // ========== Debug 访问器（方案 1 的 friend）==========
 #ifdef OPENLPT_EXPOSE_PRIVATE
 struct DebugAccess_Shake {
-  static const std::vector<Camera> &cams(Shake &s) { return s._cams; }
   static const ObjectConfig &obj_cfg(Shake &s) { return s._obj_cfg; }
   static std::vector<Image> &img_res_list(Shake &s) { return s._img_res_list; }
   static std::vector<double> &score_list(Shake &s) { return s._score_list; }
@@ -107,14 +108,12 @@ void bind_Shake(py::module_ &m) {
       .def("selectShakeCam", &ShakeStrategy::selectShakeCam);
 
   py::class_<TracerShakeStrategy, ShakeStrategy>(m, "TracerShakeStrategy")
-      .def(py::init<const std::vector<Camera> &, const ObjectConfig &>())
       .def("gaussIntensity", &TracerShakeStrategy::gaussIntensity)
       .def("project2DInt", &TracerShakeStrategy::project2DInt)
       .def("calROISize", &TracerShakeStrategy::calROISize)
       .def("calShakeResidue", &TracerShakeStrategy::calShakeResidue);
 
   py::class_<BubbleShakeStrategy, ShakeStrategy>(m, "BubbleShakeStrategy")
-      .def(py::init<const std::vector<Camera> &, const ObjectConfig &>())
       .def("project2DInt", &BubbleShakeStrategy::project2DInt)
       .def("calROISize", &BubbleShakeStrategy::calROISize)
       .def("selectShakeCam", &BubbleShakeStrategy::selectShakeCam)
@@ -123,40 +122,56 @@ void bind_Shake(py::module_ &m) {
 
   // -------- Shake 主类 --------
   py::class_<Shake>(m, "Shake", py::dynamic_attr())
-      // 这里不能直接用下面的 init，因为 cams/cfg 可能是临时变量，引用会悬空
-      // .def(py::init<const std::vector<Camera>&, const ObjectConfig&>(),
-      //      py::arg("cams"), py::arg("obj_cfg"), py::keep_alive<1,2>(),
-      //      py::keep_alive<1,3>())
-
       .def(
           "__init__",
           [](py::handle self,
-             const std::vector<Camera> &cams_in, // 支持直接传 Python list
+             const std::vector<PyCameraHandle> &cams_in, // 支持直接传 Python list
              py::object cfg_obj) // 接收 Python 的具体 ObjectConfig 派生对象
           {
-            // 1) 在堆上做相机的持久副本；_cams 引用它
-            auto cams_keep = std::make_shared<std::vector<Camera>>(cams_in);
+            auto camera_models_keep = std::make_shared<std::vector<std::shared_ptr<Camera>>>(
+                make_cam_list_from_handles(cams_in, "Shake pybind ctor"));
 
             // 2) 从 Python 对象中取出“底层 C++”的 ObjectConfig&（派生类实例）
             ObjectConfig &cfg_ref = py::cast<ObjectConfig &>(cfg_obj);
 
             // 3) placement-new：在 self 的存储上就地构造 C++ Shake
-            new (self.cast<Shake *>()) Shake(*cams_keep, cfg_ref);
+            new (self.cast<Shake *>()) Shake(*camera_models_keep, cfg_ref);
 
             // 4) 保活：
             //    - 把相机副本的 shared_ptr 挂到 Python 实例上（随实例一起析构）
             //    - 把原始的 cfg Python 对象也挂上，确保其底层 C++ 实例不被销毁
             py::setattr(
-                self, "_keep_cams",
-                py::capsule(new std::shared_ptr<std::vector<Camera>>(
-                                std::move(cams_keep)),
+                self, "_keep_cam_list",
+                py::capsule(new std::shared_ptr<std::vector<std::shared_ptr<Camera>>>(
+                                std::move(camera_models_keep)),
                             [](void *p) {
-                              delete static_cast<
-                                  std::shared_ptr<std::vector<Camera>> *>(p);
+                              delete static_cast<std::shared_ptr<std::vector<
+                                  std::shared_ptr<Camera>>> *>(p);
                             }));
             py::setattr(self, "_keep_cfg", cfg_obj);
           },
           py::arg("cams"), py::arg("obj_cfg"))
+      .def(
+          "__init__",
+          [](py::handle self,
+             const std::vector<std::shared_ptr<Camera>> &camera_models_in,
+             py::object cfg_obj)
+          {
+            auto camera_models_keep = std::make_shared<std::vector<std::shared_ptr<Camera>>>(camera_models_in);
+            ObjectConfig &cfg_ref = py::cast<ObjectConfig &>(cfg_obj);
+            new (self.cast<Shake *>()) Shake(*camera_models_keep, cfg_ref);
+
+            py::setattr(
+                self, "_keep_cam_list",
+                py::capsule(new std::shared_ptr<std::vector<std::shared_ptr<Camera>>>(
+                                std::move(camera_models_keep)),
+                            [](void *p) {
+                              delete static_cast<std::shared_ptr<std::vector<
+                                  std::shared_ptr<Camera>>> *>(p);
+                            }));
+            py::setattr(self, "_keep_cfg", cfg_obj);
+          },
+          py::arg("camera_models"), py::arg("obj_cfg"))
 
       // ⚠️ runShake：避免直接绑定 vector<unique_ptr<Object3D>>&
       // 改为 Python 传 list[Object3D]（或其派生），C++ 里深拷贝成 unique_ptr
@@ -208,12 +223,6 @@ void bind_Shake(py::module_ &m) {
 
 #ifdef OPENLPT_EXPOSE_PRIVATE
       // ===== Debug-only：私有成员与私有函数桥接 =====
-      .def_property_readonly(
-          "cams",
-          [](Shake &s) -> const std::vector<Camera> & {
-            return DebugAccess_Shake::cams(s);
-          },
-          py::return_value_policy::reference_internal)
       .def_property_readonly(
           "obj_cfg",
           [](Shake &s) -> const ObjectConfig & {

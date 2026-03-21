@@ -12,19 +12,32 @@
 
 #define CORR_INIT -100
 
+namespace {
+inline bool isInvalidProjectedCenter(const Pt2D &center) {
+  constexpr double kProjectFailSentinel = -1e9;
+  const double x = center[0];
+  const double y = center[1];
+  if (!std::isfinite(x) || !std::isfinite(y)) {
+    return true;
+  }
+  return (x <= kProjectFailSentinel || y <= kProjectFailSentinel);
+}
+} // namespace
+
 // ---------------------------------------------------
-Shake::Shake(const std::vector<Camera> &cams, const ObjectConfig &obj_cfg)
-    : _cams(cams), _obj_cfg(obj_cfg)
+Shake::Shake(const std::vector<std::shared_ptr<Camera>> &camera_models,
+             const ObjectConfig &obj_cfg)
+    : _cam_list(camera_models), _obj_cfg(obj_cfg)
 
 {
   // Ensure strategy exists (construct elsewhere or plug in before calling)
   // Resolve by ObjectConfig::kind() only
   switch (_obj_cfg.kind()) {
   case ObjectKind::Tracer:
-    _strategy = std::make_unique<TracerShakeStrategy>(_cams, _obj_cfg);
+    _strategy = std::make_unique<TracerShakeStrategy>(_cam_list, _obj_cfg);
     break;
   case ObjectKind::Bubble:
-    _strategy = std::make_unique<BubbleShakeStrategy>(_cams, _obj_cfg);
+    _strategy = std::make_unique<BubbleShakeStrategy>(_cam_list, _obj_cfg);
     break;
   default:
     THROW_FATAL(
@@ -37,7 +50,7 @@ std::vector<ObjFlag>
 Shake::runShake(std::vector<std::unique_ptr<Object3D>> &objs,
                 const std::vector<Image> &img_orig) {
   // Basic sanity checks
-  const int n_cam = static_cast<int>(_cams.size());
+  const int n_cam = static_cast<int>(_cam_list.size());
   assert(n_cam == static_cast<int>(img_orig.size()) &&
          "cams/img_orig size mismatch");
 
@@ -61,7 +74,7 @@ Shake::runShake(std::vector<std::unique_ptr<Object3D>> &objs,
   for (auto &up : objs) {
     if (!up)
       continue;
-    up->projectObject2D(_cams);
+    up->projectObject2D(_cam_list);
   }
 
   for (int it = 0; it < n_loop; ++it) {
@@ -165,7 +178,7 @@ Shake::runShake(std::vector<std::unique_ptr<Object3D>> &objs,
 void Shake::calResidueImage(const std::vector<std::unique_ptr<Object3D>> &objs,
                             const std::vector<Image> &img_orig, bool output_ipr,
                             const std::vector<ObjFlag> *flags) {
-  const int n_cam = static_cast<int>(_cams.size());
+  const int n_cam = static_cast<int>(_cam_list.size());
   // std::cout << n_cam << std::endl;
 
   REQUIRE(n_cam == static_cast<int>(img_orig.size()),
@@ -187,7 +200,7 @@ void Shake::calResidueImage(const std::vector<std::unique_ptr<Object3D>> &objs,
   for (int k = 0; k < n_cam; ++k) {
     // 4.1 Skip inactive cameras, but keep slot alignment (residual stays as
     // original) for IPR output, we need to calculate all cameras
-    if (!_cams[k]._is_active && !output_ipr)
+    if (!_cam_list[k]->is_active && !output_ipr)
       continue;
 
     Image &res = _img_res_list[k]; // get the reference
@@ -245,8 +258,8 @@ void Shake::calResidueImage(const std::vector<std::unique_ptr<Object3D>> &objs,
 
 PixelRange Shake::calROIBound(int id_cam, double cx, double cy, double dx,
                               double dy) const {
-  const int H = _cams[id_cam].getNRow();
-  const int W = _cams[id_cam].getNCol();
+  const int H = _cam_list[id_cam]->getNRow();
+  const int W = _cam_list[id_cam]->getNCol();
 
   if (H <= 0 || W <= 0 || dx <= 0.0 || dy <= 0.0 || cx <= 0 || cy <= 0 ||
       cx >= W || cy >= H) {        // for points that are out of range
@@ -279,13 +292,13 @@ PixelRange Shake::calROIBound(int id_cam, double cx, double cy, double dx,
 std::vector<ROIInfo>
 Shake::buildROIInfo(const Object3D &obj,
                     const std::vector<Image> &img_orig) const {
-  const int n_cam = static_cast<int>(_cams.size());
+  const int n_cam = static_cast<int>(_cam_list.size());
   std::vector<ROIInfo> roi_info;
   roi_info.resize(n_cam);
 
   for (int k = 0; k < n_cam; ++k) {
     // keep slot alignment
-    if (!_cams[k]._is_active || k >= static_cast<int>(obj._obj2d_list.size()) ||
+    if (!_cam_list[k]->is_active || k >= static_cast<int>(obj._obj2d_list.size()) ||
         !obj._obj2d_list[k]) {
       continue; // do not initialize ROI info
     }
@@ -359,7 +372,7 @@ shaking
             obj3d_temp->_pt_center[i] = array_list[j];
 
             // update 2D information
-            obj3d_temp->projectObject2D(_cams);
+            obj3d_temp->projectObject2D(_cam_list);
 
             residue_list[j] = _strategy->calShakeResidue(*obj3d_temp, ROI_info,
 shake_cam); residue_list_fit[j] = residue_list[j];
@@ -373,7 +386,7 @@ shake_cam); residue_list_fit[j] = residue_list[j];
         if (coeff[2] != 0.0) {
             array_list[3] = - coeff[1] / (2.0 * coeff[2]);
             if (array_list[3] > array_list[0] && array_list[3] < array_list[2])
-{ obj3d_temp->_pt_center[i] = array_list[3]; obj3d_temp->projectObject2D(_cams);
+{ obj3d_temp->_pt_center[i] = array_list[3]; obj3d_temp->projectObject2D(_cam_list);
                 residue_list[3] = _strategy->calShakeResidue(*obj3d_temp,
 ROI_info, shake_cam); has_star = true; } else { residue_list[3] =
 std::numeric_limits<double>::infinity(); // safer than "+1"
@@ -400,7 +413,7 @@ t; }
     // TODO: remove camera with residue > thredshold, and redo shakeoneobject
 
     // update 2D information for next loop of shaking
-    obj.projectObject2D(_cams);
+    obj.projectObject2D(_cam_list);
 
     return residue;
 }
@@ -454,18 +467,18 @@ double Shake::shakeOneObject(Object3D &obj, std::vector<ROIInfo> &ROI_info,
     };
     std::vector<UV> uv[3]; // uv[0]=at -Δ, uv[1]=at 0, uv[2]=at +Δ
     for (int j = 0; j < 3; ++j)
-      uv[j].resize(_cams.size());
+      uv[j].resize(_cam_list.size());
 
     // ---- evaluate (-Δ, 0, +Δ) in a tight loop (no repetition) ----
     for (int j = 0; j < 3; ++j) {
       const double x_abs = x0 + sample_rel[j];
       obj_tmp->_pt_center[ax] = x_abs;
-      obj_tmp->projectObject2D(_cams);
+      obj_tmp->projectObject2D(_cam_list);
       f[j] = _strategy->calShakeResidue(*obj_tmp, ROI_info, shake_cam);
 
       // record UV for each camera at this sample (used to estimate Jx and
       // margins later)
-      for (size_t k = 0; k < _cams.size(); ++k) {
+      for (size_t k = 0; k < _cam_list.size(); ++k) {
         if (!shake_cam[k])
           continue;
         const auto &o2d = obj_tmp->_obj2d_list[k];
@@ -531,9 +544,9 @@ double Shake::shakeOneObject(Object3D &obj, std::vector<ROIInfo> &ROI_info,
       // Estimate Jx (px/mm) from ±Δ samples (reuse uv cache); estimate pixel
       // margin at center.
       std::vector<double> Jvals, margins;
-      Jvals.reserve(_cams.size());
-      margins.reserve(_cams.size());
-      for (size_t k = 0; k < _cams.size(); ++k) {
+      Jvals.reserve(_cam_list.size());
+      margins.reserve(_cam_list.size());
+      for (size_t k = 0; k < _cam_list.size(); ++k) {
         if (!shake_cam[k])
           continue;
 
@@ -583,9 +596,9 @@ double Shake::shakeOneObject(Object3D &obj, std::vector<ROIInfo> &ROI_info,
       if (Delta_prime > 0.0) {
         const double dx_exp = (s >= 0 ? +Delta_prime : -Delta_prime);
         obj_tmp->_pt_center[ax] = x0 + dx_exp;
-        obj_tmp->projectObject2D(_cams);
+        obj_tmp->projectObject2D(_cam_list);
         bool out = false;
-        for (size_t k = 0; k < _cams.size(); ++k) {
+        for (size_t k = 0; k < _cam_list.size(); ++k) {
           if (!shake_cam[k])
             continue;
           const auto &o2d = obj_tmp->_obj2d_list[k];
@@ -621,9 +634,9 @@ double Shake::shakeOneObject(Object3D &obj, std::vector<ROIInfo> &ROI_info,
       }
       if (x_hat >= xmin && x_hat <= xmax) {
         obj_tmp->_pt_center[ax] = x0 + x_hat;
-        obj_tmp->projectObject2D(_cams);
+        obj_tmp->projectObject2D(_cam_list);
         bool out = false;
-        for (size_t k = 0; k < _cams.size(); ++k) {
+        for (size_t k = 0; k < _cam_list.size(); ++k) {
           if (!shake_cam[k])
             continue;
           const auto &o2d = obj_tmp->_obj2d_list[k];
@@ -656,11 +669,11 @@ double Shake::shakeOneObject(Object3D &obj, std::vector<ROIInfo> &ROI_info,
     // Update this axis and refresh 2D before next axis
     obj._pt_center[ax] = cand_abs[best_id];
     residue_axis = best_f;
-    obj.projectObject2D(_cams);
+    obj.projectObject2D(_cam_list);
   }
 
   // Final projection for next outer iteration
-  obj.projectObject2D(_cams);
+  obj.projectObject2D(_cam_list);
   return residue_axis;
 }
 
@@ -671,7 +684,7 @@ double Shake::calObjectScore(Object3D &obj, std::vector<ROIInfo> &ROI_info,
   if (!_strategy->additionalObjectCheck(obj, ROI_info, shake_cam)) {
     return 0.0;
   }
-  const int n_cam = static_cast<int>(_cams.size());
+  const int n_cam = static_cast<int>(_cam_list.size());
   constexpr double kTiny = 1e-12; // avoid 0
   constexpr double kDown =
       kTiny; // if camera number is less than 2, return this
@@ -685,7 +698,7 @@ double Shake::calObjectScore(Object3D &obj, std::vector<ROIInfo> &ROI_info,
 
   int n_used = 0;
   for (int k = 0; k < n_cam; ++k) {
-    if (!_cams[k]._is_active)
+    if (!_cam_list[k]->is_active)
       continue;
 
     // region: one object size
@@ -976,12 +989,12 @@ TracerShakeStrategy::calShakeResidue(const Object3D &obj_candidate,
   // intensity comes from project2DInt(obj_candidate, cam, row, col) (≥0; 3σ
   // cutoff inside). If no usable camera exists, return a large sentinel cost.
 
-  const int n_cam = static_cast<int>(_cams.size());
+  const int n_cam = static_cast<int>(_cam_list.size());
   int cams_used = 0;
   double cost_acc = 0.0;
 
   for (int cam = 0; cam < n_cam; ++cam) {
-    if (!_cams[cam]._is_active)
+    if (!_cam_list[cam]->is_active)
       continue;
     if (!shake_cam[cam])
       continue;
@@ -1000,6 +1013,9 @@ TracerShakeStrategy::calShakeResidue(const Object3D &obj_candidate,
     Object2D *obj2d = obj_candidate._obj2d_list[cam].get();
     auto *tr = static_cast<Tracer2D *>(obj2d);
     Pt2D obj2d_center = tr->_pt_center;
+    if (isInvalidProjectedCenter(obj2d_center)) {
+      continue;
+    }
     double r_px = tr->_r_px;
     int pred_row_min = std::floor(obj2d_center[1] - r_px),
         pred_row_max = std::ceil(obj2d_center[1] + r_px + 1);
@@ -1056,7 +1072,7 @@ double BubbleShakeStrategy::project2DInt(const Object3D &obj, int id_cam,
   double dist = (xc - col) * (xc - col) + (yc - row) * (yc - row);
   double int_val = 0.0;
   if (dist < r_px * r_px) {
-    int_val = _cams[id_cam]._max_intensity;
+    int_val = _cam_list[id_cam]->max_intensity;
   }
 
   return int_val;
@@ -1077,12 +1093,12 @@ std::vector<bool>
 BubbleShakeStrategy::selectShakeCam(const Object3D &obj,
                                     const std::vector<ROIInfo> &roi_info,
                                     const std::vector<Image> &imgOrig) const {
-  const int n_cam = _cams.size();
+  const int n_cam = static_cast<int>(_cam_list.size());
   std::vector<bool> shake_cam;
   shake_cam.assign(n_cam, true);
 
   for (int cam = 0; cam < n_cam; ++cam) {
-    if (!_cams[cam]._is_active) {
+    if (!_cam_list[cam]->is_active) {
       shake_cam[cam] = false;
       continue;
     }
@@ -1133,7 +1149,8 @@ BubbleShakeStrategy::selectShakeCam(const Object3D &obj,
       const int img_size = 2 * npix;
       BubbleResize bb_resizer;
       const Image img_up =
-          bb_resizer.ResizeBubble(img_ref, img_size, _cams[cam]._max_intensity);
+          bb_resizer.ResizeBubble(img_ref, img_size,
+                                  _cam_list[cam]->max_intensity);
 
       // 4.c) detect circles on upsampled image
       CircleIdentifier circle_id(img_up);
@@ -1229,12 +1246,12 @@ double
 BubbleShakeStrategy::calShakeResidue(const Object3D &obj_candidate,
                                      std::vector<ROIInfo> &roi_info,
                                      const std::vector<bool> &shake_cam) const {
-  const int n_cam = static_cast<int>(_cams.size());
+  const int n_cam = static_cast<int>(_cam_list.size());
   int cams_used = 0;
   double residue = 0;
 
   for (int cam = 0; cam < n_cam; ++cam) {
-    if (!_cams[cam]._is_active)
+    if (!_cam_list[cam]->is_active)
       continue;
     if (!shake_cam[cam])
       continue;
@@ -1243,6 +1260,9 @@ BubbleShakeStrategy::calShakeResidue(const Object3D &obj_candidate,
     const auto *bb2d = static_cast<const Bubble2D *>(obj2d);
     double xc = bb2d->_pt_center[0], yc = bb2d->_pt_center[1];
     double r_px = bb2d->_r_px;
+    if (isInvalidProjectedCenter(bb2d->_pt_center)) {
+      continue;
+    }
     const PixelRange &range_corrmap = roi_info[cam]._ROI_range;
 
     // the candidate bubble can be partly within the augmented image
@@ -1281,8 +1301,9 @@ BubbleShakeStrategy::calShakeResidue(const Object3D &obj_candidate,
     const auto &bb_cfg = static_cast<const BubbleConfig &>(
         _obj_cfg); // to get the bubble reference image
     BubbleResize bb_resizer;
-    const Image ref_img = bb_resizer.ResizeBubble(bb_cfg._bb_ref_img[cam], npix,
-                                                  _cams[cam]._max_intensity);
+    const Image ref_img =
+        bb_resizer.ResizeBubble(bb_cfg._bb_ref_img[cam], npix,
+                                _cam_list[cam]->max_intensity);
 
     // calculate cross-correlation
     std::vector<double> corr_interp(4, 0);
@@ -1312,13 +1333,16 @@ bool BubbleShakeStrategy::additionalObjectCheck(
   constexpr double CORR_TH = 0.1;
 
   for (size_t cam = 0; cam < shake_cam.size(); ++cam) {
-    if (!_cams[cam]._is_active)
+    if (!_cam_list[cam]->is_active)
       continue;
     if (!shake_cam[cam])
       continue;
 
     Object2D *obj2d = obj._obj2d_list[cam].get();
     const auto *bb2d = static_cast<const Bubble2D *>(obj2d);
+    if (isInvalidProjectedCenter(bb2d->_pt_center)) {
+      return false;
+    }
     double xc = bb2d->_pt_center[0], yc = bb2d->_pt_center[1];
     double r_px = bb2d->_r_px;
     const PixelRange &range_corrmap = roi_info[cam]._ROI_range;
@@ -1329,8 +1353,9 @@ bool BubbleShakeStrategy::additionalObjectCheck(
     const auto &bb_cfg = static_cast<const BubbleConfig &>(
         _obj_cfg); // to get the bubble reference image
     BubbleResize bb_resizer;
-    const Image ref_img = bb_resizer.ResizeBubble(bb_cfg._bb_ref_img[cam], npix,
-                                                  _cams[cam]._max_intensity);
+    const Image ref_img =
+        bb_resizer.ResizeBubble(bb_cfg._bb_ref_img[cam], npix,
+                                _cam_list[cam]->max_intensity);
 
     // ====== 你原来 calShakeResidue 里那套插值 ======
     int x_low = static_cast<int>(std::floor(xc));

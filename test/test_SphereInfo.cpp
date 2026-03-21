@@ -160,14 +160,20 @@ bool test_function_2 ()
     ////////////////////////
 
     // test projectObject2D
-    std::vector<Camera> cam_list_all;
+    std::vector<std::shared_ptr<Camera>> cam_list_all;
     std::vector<int> camid_list_2 = {0, 1, 2, 3};
     for (int i = 0; i < 5; i ++)
     {
-        Camera cam ("../test/inputs/test_ObjectInfo/cam"+std::to_string(i+1)+".txt");
-        cam_list_all.push_back(cam);
+        auto cam_st = CameraFactory::loadFromFile("../test/inputs/test_ObjectInfo/cam"+std::to_string(i+1)+".txt");
+        if (!cam_st)
+        {
+            std::cout << "test_function_2: load camera failed (line " << __LINE__ << ")" << std::endl;
+            return false;
+        }
+        cam_list_all.push_back(cam_st.value());
     }
-    sphere.projectObject2D(camid_list_2, cam_list_all);
+    cam_list_all[4]->is_active = false;
+    sphere.projectObject2D(cam_list_all);
     circle_list = sphere._circle_list;
     camid_list = sphere._camid_list;
     if (circle_list.size() != 4 || camid_list.size() != 4)
@@ -179,7 +185,8 @@ bool test_function_2 ()
     }
     for (int i = 0; i < 4; i++)
     {
-        if (circle_list[i]._pt_center != cam_list_all[i].project(sphere._pt_center) || camid_list[i] != camid_list_2[i])
+        auto proj_st = cam_list_all[i]->project(sphere._pt_center);
+        if (!proj_st || circle_list[i]._pt_center != proj_st.value() || camid_list[i] != camid_list_2[i])
         {
             std::cout << "test_function_2: projectObject2D failed (line " << __LINE__ << ")" << std::endl;
             return false;

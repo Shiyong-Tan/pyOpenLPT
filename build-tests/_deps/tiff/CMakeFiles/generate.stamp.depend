@@ -1,0 +1,4 @@
+# CMake generation dependency list for this directory.
+D:/0.Code/OpenLPTGUI/OpenLPT/inc/libtiff/CMakeLists.txt
+D:/0.Code/OpenLPTGUI/OpenLPT/inc/libtiff/tif_config.h.cmake.in
+D:/0.Code/OpenLPTGUI/OpenLPT/inc/libtiff/tiffconf.h.cmake.in

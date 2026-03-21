@@ -5,6 +5,7 @@ Handles reading and writing camera parameters in OpenLPT format.
 import numpy as np
 import cv2
 import os
+import re
 
 
 def parse_camera_file(file_path: str) -> dict:
@@ -23,6 +24,7 @@ def parse_camera_file(file_path: str) -> dict:
     
     with open(file_path, 'r') as f:
         lines = f.readlines()
+    text = "".join(lines)
     
     for line in lines:
         line = line.strip()
@@ -43,12 +45,20 @@ def parse_camera_file(file_path: str) -> dict:
     if current_section and section_lines:
         result.update(_parse_section(current_section, section_lines))
     
+    # Parse optional refraction metadata block (exported by refractive calibrator).
+    # This is comment-only metadata and is safe to ignore when absent.
+    result.update(_parse_refraction_meta(text))
+
     return result
 
 
 def _parse_section(section_name: str, lines: list) -> dict:
     """Parse a single section from camera file."""
     result = {}
+
+    def _to_floats(line: str):
+        vals = [v for v in re.split(r'[\s,]+', line.strip()) if v]
+        return [float(v) for v in vals]
     
     if 'Camera Model' in section_name:
         result['model'] = lines[0].strip()
@@ -72,46 +82,101 @@ def _parse_section(section_name: str, lines: list) -> dict:
             result['pose_error'] = None
     
     elif 'Image Size' in section_name:
-        parts = lines[0].split(',')
+        parts = [v for v in re.split(r'[\s,]+', lines[0].strip()) if v]
         result['img_size'] = (int(parts[0]), int(parts[1]))  # (n_row, n_col)
     
     elif 'Camera Matrix' in section_name and 'not' not in section_name.lower():
         K = np.zeros((3, 3))
         for i, row_line in enumerate(lines[:3]):
-            vals = [float(x) for x in row_line.split(',')]
+            vals = _to_floats(row_line)
             K[i] = vals[:3]
         result['K'] = K
     
     elif 'Distortion Coefficients' in section_name:
-        vals = [float(x) for x in lines[0].split(',')]
+        vals = _to_floats(lines[0])
         result['dist'] = np.array(vals)
     
     elif 'Rotation Vector' in section_name:
-        vals = [float(x) for x in lines[0].split(',')]
+        vals = _to_floats(lines[0])
         result['rvec'] = np.array(vals)
     
     elif 'Rotation Matrix' in section_name and 'Inverse' not in section_name:
         R = np.zeros((3, 3))
         for i, row_line in enumerate(lines[:3]):
-            vals = [float(x) for x in row_line.split(',')]
+            vals = _to_floats(row_line)
             R[i] = vals[:3]
         result['R'] = R
     
     elif 'Inverse of Rotation Matrix' in section_name:
         R_inv = np.zeros((3, 3))
         for i, row_line in enumerate(lines[:3]):
-            vals = [float(x) for x in row_line.split(',')]
+            vals = _to_floats(row_line)
             R_inv[i] = vals[:3]
         result['R_inv'] = R_inv
     
     elif 'Translation Vector' in section_name and 'Inverse' not in section_name:
-        vals = [float(x) for x in lines[0].split(',')]
+        vals = _to_floats(lines[0])
         result['tvec'] = np.array(vals)
     
     elif 'Inverse of Translation Vector' in section_name:
-        vals = [float(x) for x in lines[0].split(',')]
+        vals = _to_floats(lines[0])
         result['tvec_inv'] = np.array(vals)
+
+    elif 'Refractive plane reference point' in section_name:
+        vals = _to_floats(lines[0])
+        if len(vals) >= 3:
+            result['plane_pt'] = np.array(vals[:3], dtype=np.float64)
+
+    elif 'Refractive plane normal' in section_name:
+        vals = _to_floats(lines[0])
+        if len(vals) >= 3:
+            result['plane_n'] = np.array(vals[:3], dtype=np.float64)
     
+    return result
+
+
+def _parse_refraction_meta(text: str) -> dict:
+    """Parse optional BEGIN/END_REFRACTION_META comment block."""
+    result = {}
+    m = re.search(
+        r"#\s*---\s*BEGIN_REFRACTION_META\s*---(?P<body>.*?)#\s*---\s*END_REFRACTION_META\s*---",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not m:
+        return result
+
+    body = m.group("body")
+
+    def _get_int(key: str):
+        mm = re.search(rf"#\s*{re.escape(key)}\s*=\s*([-+]?\d+)", body, flags=re.IGNORECASE)
+        return int(mm.group(1)) if mm else None
+
+    def _get_vec3(key: str):
+        mm = re.search(rf"#\s*{re.escape(key)}\s*=\s*\[([^\]]+)\]", body, flags=re.IGNORECASE)
+        if not mm:
+            return None
+        vals = [v for v in re.split(r"[\s,]+", mm.group(1).strip()) if v]
+        if len(vals) < 3:
+            return None
+        return np.array([float(vals[0]), float(vals[1]), float(vals[2])], dtype=np.float64)
+
+    meta = {}
+    wid = _get_int("WINDOW_ID")
+    cid = _get_int("CAM_ID")
+    plane_pt = _get_vec3("PLANE_PT_EXPORT")
+    plane_n = _get_vec3("PLANE_N")
+    if cid is not None:
+        meta["cam_id"] = cid
+    if wid is not None:
+        meta["window_id"] = wid
+    if plane_pt is not None:
+        meta["plane_pt_export"] = plane_pt
+    if plane_n is not None:
+        meta["plane_n"] = plane_n
+
+    if meta:
+        result["ref_meta"] = meta
     return result
 
 

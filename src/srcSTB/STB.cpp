@@ -90,8 +90,7 @@ void STB::processFrame(int frame_id, std::vector<Image> &img_list) {
 
 void STB::runInitPhase(int frame, std::vector<Image> &img_list) {
 
-  std::vector<Camera> &cam_list = _basic_setting._cam_list;
-  IPR ipr(cam_list);
+  IPR ipr(_basic_setting._cam_list);
   // IPR
   std::vector<std::unique_ptr<Object3D>> obj3d_list =
       ipr.runIPR(*_obj_config, img_list);
@@ -616,9 +615,18 @@ void STB::runConvPhase(int frame, std::vector<Image> &img_list) {
   // --------------------------- //
   // ----- VSC: Only accumulate every N frames and only if not already
   // calibrated -----
-  bool skip_vsc = _obj_config->_vsc_param._camera_calibrated &&
-                  (!_obj_config->_vsc_param._enable_otf ||
-                   _obj_config->_vsc_param._otf_calibrated);
+  bool has_active_pinhole = false;
+  for (const auto &cam : _basic_setting._cam_list) {
+    if (cam && cam->is_active && cam->type() == CameraType::Pinhole) {
+      has_active_pinhole = true;
+      break;
+    }
+  }
+
+  bool skip_vsc = !has_active_pinhole ||
+                  (_obj_config->_vsc_param._camera_calibrated &&
+                   (!_obj_config->_vsc_param._enable_otf ||
+                    _obj_config->_vsc_param._otf_calibrated));
 
   bool is_accumulate_frame =
       (frame % _obj_config->_vsc_param._accumulate_interval == 0);

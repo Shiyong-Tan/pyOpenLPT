@@ -1,9 +1,9 @@
 """
 Custom Range Slider Widget with two visual draggable handles.
 """
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel
-from PySide6.QtCore import Qt, Signal, QPoint
-from PySide6.QtGui import QPainter, QColor, QPen, QLinearGradient
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QSpinBox, QAbstractSpinBox
+from PySide6.QtCore import Qt, Signal, QPoint, QEvent
+from PySide6.QtGui import QPainter, QColor, QPen, QLinearGradient, QFontMetrics
 
 
 class SimpleSlider(QWidget):
@@ -146,35 +146,85 @@ class RangeSlider(QWidget):
         self._track_height = 6
         self._dragging_min = False
         self._dragging_max = False
-        
-        self.setMinimumHeight(30)
+
+        self.setMinimumHeight(32)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        
-        # Layout: [min_label] [slider] [max_label]
+
+        # Layout: [Min SpinBox] [Slider Canvas] [Max SpinBox]
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(3)
-        
-        # Narrow labels to minimize misalignment
-        self.min_label = QLabel(f"{initial_min}")
-        self.min_label.setFixedWidth(25)
-        self.min_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.min_label.setStyleSheet("color: #00d4ff; font-size: 10px;")
-        
-        self.max_label = QLabel(f"{initial_max}")
-        self.max_label.setFixedWidth(25)
-        self.max_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.max_label.setStyleSheet("color: #00d4ff; font-size: 10px;")
-        
+        layout.setSpacing(8)
+
+        widest_text = max(
+            str(min_val),
+            str(max_val),
+            str(initial_min),
+            str(initial_max),
+            key=len,
+        )
+        text_width = QFontMetrics(self.font()).horizontalAdvance(widest_text)
+        spin_w = max(38, int((text_width + 14) * 0.9))
+
+        spin_style = """
+            QSpinBox {
+                background-color: #121924;
+                color: #00d4ff;
+                border: 1px solid #2f3e57;
+                border-radius: 4px;
+                padding: 1px 4px;
+                font-size: 10px;
+                font-weight: 500;
+            }
+        """
+
+        self.min_spin = QSpinBox()
+        self.min_spin.setRange(min_val, max_val)
+        self.min_spin.setValue(initial_min)
+        self.min_spin.setFixedWidth(spin_w)
+        self.min_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.min_spin.setKeyboardTracking(False)
+        self.min_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.min_spin.setStyleSheet(spin_style)
+        self.min_spin.editingFinished.connect(self._on_min_spin_changed)
+        self.min_spin.installEventFilter(self)
+
+        self.max_spin = QSpinBox()
+        self.max_spin.setRange(min_val, max_val)
+        self.max_spin.setValue(initial_max)
+        self.max_spin.setFixedWidth(spin_w)
+        self.max_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.max_spin.setKeyboardTracking(False)
+        self.max_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.max_spin.setStyleSheet(spin_style)
+        self.max_spin.editingFinished.connect(self._on_max_spin_changed)
+        self.max_spin.installEventFilter(self)
+
         self.slider_canvas = _SliderCanvas(self)
-        
-        layout.addWidget(self.min_label)
+
+        layout.addWidget(self.min_spin)
         layout.addWidget(self.slider_canvas, 1)
-        layout.addWidget(self.max_label)
-    
-    def _update_label(self):
-        self.min_label.setText(str(self._min_val))
-        self.max_label.setText(str(self._max_val))
+        layout.addWidget(self.max_spin)
+
+    def _sync_spinboxes(self):
+        if self.min_spin.value() != self._min_val:
+            self.min_spin.blockSignals(True)
+            self.min_spin.setValue(self._min_val)
+            self.min_spin.blockSignals(False)
+        if self.max_spin.value() != self._max_val:
+            self.max_spin.blockSignals(True)
+            self.max_spin.setValue(self._max_val)
+            self.max_spin.blockSignals(False)
+
+    def _on_min_spin_changed(self):
+        self.setMinValue(self.min_spin.value())
+
+    def _on_max_spin_changed(self):
+        self.setMaxValue(self.max_spin.value())
+
+    def eventFilter(self, obj, event):
+        if obj in (self.min_spin, self.max_spin) and event.type() == QEvent.Type.FocusIn:
+            obj.selectAll()
+        return super().eventFilter(obj, event)
     
     def value(self):
         return (self._min_val, self._max_val)
@@ -186,16 +236,42 @@ class RangeSlider(QWidget):
         return self._max_val
     
     def setMinValue(self, val):
+        old_val = self._min_val
         self._min_val = max(self._min_range, min(val, self._max_val))
-        self._update_label()
+        self._sync_spinboxes()
         self.slider_canvas.update()
-        self.rangeChanged.emit(self._min_val, self._max_val)
+        if old_val != self._min_val:
+            self.rangeChanged.emit(self._min_val, self._max_val)
     
     def setMaxValue(self, val):
+        old_val = self._max_val
         self._max_val = min(self._max_range, max(val, self._min_val))
-        self._update_label()
+        self._sync_spinboxes()
         self.slider_canvas.update()
-        self.rangeChanged.emit(self._min_val, self._max_val)
+        if old_val != self._max_val:
+            self.rangeChanged.emit(self._min_val, self._max_val)
+
+    def setRange(self, min_val, max_val):
+        min_val = int(min_val)
+        max_val = int(max_val)
+        if min_val > max_val:
+            min_val, max_val = max_val, min_val
+
+        self._min_range = min_val
+        self._max_range = max_val
+        self.min_spin.setRange(min_val, max_val)
+        self.max_spin.setRange(min_val, max_val)
+
+        old_min, old_max = self._min_val, self._max_val
+        self._min_val = max(self._min_range, min(self._min_val, self._max_range))
+        self._max_val = max(self._min_range, min(self._max_val, self._max_range))
+        if self._min_val > self._max_val:
+            self._min_val = self._max_val
+
+        self._sync_spinboxes()
+        self.slider_canvas.update()
+        if old_min != self._min_val or old_max != self._max_val:
+            self.rangeChanged.emit(self._min_val, self._max_val)
 
 
 class _SliderCanvas(QWidget):
@@ -212,15 +288,25 @@ class _SliderCanvas(QWidget):
     def _val_to_x(self, val):
         margin = self._parent._handle_radius
         width = self.width() - 2 * margin
-        ratio = (val - self._parent._min_range) / (self._parent._max_range - self._parent._min_range)
+        if width <= 0:
+            return margin
+        denom = self._parent._max_range - self._parent._min_range
+        if denom <= 0:
+            return margin
+        ratio = (val - self._parent._min_range) / denom
         return int(margin + ratio * width)
     
     def _x_to_val(self, x):
         margin = self._parent._handle_radius
         width = self.width() - 2 * margin
+        if width <= 0:
+            return self._parent._min_range
+        denom = self._parent._max_range - self._parent._min_range
+        if denom <= 0:
+            return self._parent._min_range
         ratio = (x - margin) / width
         ratio = max(0, min(1, ratio))
-        return int(self._parent._min_range + ratio * (self._parent._max_range - self._parent._min_range))
+        return int(self._parent._min_range + ratio * denom)
     
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -246,7 +332,8 @@ class _SliderCanvas(QWidget):
         gradient.setColorAt(0, QColor(0, 180, 220))
         gradient.setColorAt(1, QColor(0, 220, 255))
         painter.setBrush(gradient)
-        painter.drawRoundedRect(min_x, track_y, max_x - min_x, track_h, track_h//2, track_h//2)
+        if max_x > min_x:
+            painter.drawRoundedRect(min_x, track_y, max_x - min_x, track_h, track_h//2, track_h//2)
         
         # Draw handles
         painter.setBrush(QColor(0, 212, 255))
@@ -274,20 +361,11 @@ class _SliderCanvas(QWidget):
     
     def mouseMoveEvent(self, event):
         x = event.pos().x()
-        val = self._x_to_val(x)
-        
+
         if self._dragging_min:
-            new_min = min(val, self._parent._max_val - 1)
-            self._parent._min_val = max(self._parent._min_range, new_min)
-            self._parent._update_label()
-            self.update()
-            self._parent.rangeChanged.emit(self._parent._min_val, self._parent._max_val)
+            self._parent.setMinValue(self._x_to_val(x))
         elif self._dragging_max:
-            new_max = max(val, self._parent._min_val + 1)
-            self._parent._max_val = min(self._parent._max_range, new_max)
-            self._parent._update_label()
-            self.update()
-            self._parent.rangeChanged.emit(self._parent._min_val, self._parent._max_val)
+            self._parent.setMaxValue(self._x_to_val(x))
     
     
     def mouseReleaseEvent(self, event):

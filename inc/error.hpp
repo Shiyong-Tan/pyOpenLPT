@@ -45,6 +45,12 @@ enum class ErrorCode : int {
   UnsupportedType    = 3,
   IOfailure          = 4,
   NoEnoughData       = 5,
+  GeometryFailure    = 6,
+  ParallelGeometry   = 7,
+  TotalInternalReflection = 8,
+  NonConverged       = 9,
+  NumericFailure     = 10,
+  InvalidCameraState = 11,
 };
 
 // ==============================

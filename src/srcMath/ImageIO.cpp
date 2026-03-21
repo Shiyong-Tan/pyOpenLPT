@@ -1,5 +1,7 @@
 #include "ImageIO.h"
 
+#include <filesystem>
+
 
 ImageIO::ImageIO (const ImageIO& img)
     : _n_row(img._n_row), _n_col(img._n_col), _bits_per_sample(img._bits_per_sample), _n_channel(img._n_channel), _is_tiled(img._is_tiled), _tile_height0(img._tile_height0), _tile_width0(img._tile_width0), _img_orientation(img._img_orientation), _img_id(img._img_id), _img_path(img._img_path)
@@ -27,21 +29,69 @@ void ImageIO::init ()
 
 void ImageIO::loadImgPath (std::string folder_path, std::string file_img_path)
 {
-    std::ifstream infile(folder_path + file_img_path, std::ios::in);
+    namespace fs = std::filesystem;
+
+    fs::path base_dir;
+    if (!folder_path.empty())
+    {
+        base_dir = fs::path(folder_path);
+    }
+    else
+    {
+        std::error_code ec;
+        base_dir = fs::current_path(ec);
+        if (ec)
+        {
+            base_dir.clear();
+        }
+    }
+
+    fs::path list_path(file_img_path);
+    if (!list_path.is_absolute())
+    {
+        list_path = base_dir / list_path;
+    }
+    list_path = list_path.lexically_normal();
+
+    std::ifstream infile(list_path.string(), std::ios::in);
 
     if (!infile.is_open())
     {
-        std::cerr << "ImageIO::LoadImgPath: Could not open image path file!" << std::endl;
+        std::cerr << "ImageIO::LoadImgPath: Could not open image path file: "
+                  << list_path.string() << std::endl;
         throw error_io;
     }
 
     // Initialize image path
     init();
 
+    const fs::path list_dir = list_path.parent_path();
+    const fs::path image_base_dir = base_dir.empty() ? list_dir : base_dir;
+
     std::string line;
     while (std::getline(infile, line)) 
     {
-        _img_path.push_back(folder_path + line);
+        // trim spaces/tabs and CR
+        const size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos)
+        {
+            continue;
+        }
+        const size_t last = line.find_last_not_of(" \t\r\n");
+        line = line.substr(first, last - first + 1);
+        if (line.empty())
+        {
+            continue;
+        }
+
+        fs::path img_path(line);
+        if (!img_path.is_absolute())
+        {
+            // Project convention: relative image paths are resolved from project root.
+            // Here, folder_path is expected to be project/config root.
+            img_path = image_base_dir / img_path;
+        }
+        _img_path.push_back(img_path.lexically_normal().string());
     }
     infile.close();
 

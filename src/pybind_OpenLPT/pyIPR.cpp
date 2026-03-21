@@ -2,11 +2,14 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <stdexcept>
+
 #include "IPR.h"
 #include "Config.h"
 #include "Camera.h"
 #include "ImageIO.h"
 #include "ObjectInfo.h"     // Object3D / Bubble3D / ...
+#include "py_camera_handle.h"
 #include "pybind_utils.h"   // make_unique_obj3d_list (我们刚建的工具头)
 
 namespace py = pybind11;
@@ -16,21 +19,38 @@ void bind_IPR(py::module_& m) {
         .def(
             "__init__",
             [](py::handle self,
-               const std::vector<Camera>&                                   cams_in)
+               const std::vector<PyCameraHandle>&                           cams_in)
             {
-                auto cams_keep = std::make_shared<std::vector<Camera>>(cams_in);
+                auto camera_models_keep = std::make_shared<std::vector<std::shared_ptr<Camera>>>(
+                    make_cam_list_from_handles(cams_in, "IPR pybind ctor"));
 
-                new (self.cast<IPR*>()) IPR(*cams_keep);
-
+                new (self.cast<IPR*>()) IPR(*camera_models_keep);
                 py::setattr(
-                    self, "_keep_cams",
+                    self, "_keep_cam_list",
                     py::capsule(
-                        new std::shared_ptr<std::vector<Camera>>(std::move(cams_keep)),
-                        [](void* p){ delete static_cast<std::shared_ptr<std::vector<Camera>>*>(p); }
+                        new std::shared_ptr<std::vector<std::shared_ptr<Camera>>>(std::move(camera_models_keep)),
+                        [](void* p){ delete static_cast<std::shared_ptr<std::vector<std::shared_ptr<Camera>>>*>(p); }
                     )
                 );
             },
             py::arg("cams")
+        )
+        .def(
+            "__init__",
+            [](py::handle self,
+               const std::vector<std::shared_ptr<Camera>>& camera_models_in)
+            {
+                auto camera_models_keep = std::make_shared<std::vector<std::shared_ptr<Camera>>>(camera_models_in);
+                new (self.cast<IPR*>()) IPR(*camera_models_keep);
+                py::setattr(
+                    self, "_keep_cam_list",
+                    py::capsule(
+                        new std::shared_ptr<std::vector<std::shared_ptr<Camera>>>(std::move(camera_models_keep)),
+                        [](void* p){ delete static_cast<std::shared_ptr<std::vector<std::shared_ptr<Camera>>>*>(p); }
+                    )
+                );
+            },
+            py::arg("camera_models")
         )
         
         .def("runIPR",

@@ -139,9 +139,19 @@ double dist(Pt2D const &pt, Line2D const &line);
 // Calculate the distance between point and plane
 double dist(Pt3D const &pt, Plane3D const &plane);
 
+// Calculate signed distance from point to plane.
+// Positive sign means point is along plane normal direction.
+double pointPlaneSignedDistance(Pt3D const &pt, Plane3D const &plane);
+
+// Project point onto plane along plane normal direction.
+Pt3D projectPointToPlaneAlongNormal(Pt3D const &pt, Plane3D const &plane);
+
 // Triangulation
 void triangulation(Pt3D &pt_world, double &error,
                    std::vector<Line3D> const &line_of_sight_list);
+
+// Cross product of two 3d vectors
+Pt3D cross (Pt3D const& vec1, Pt3D const& vec2);
 
 // Find cross points of two 2d lines
 bool crossPoint(Pt2D &pt2d, Line2D const &line1, Line2D const &line2);

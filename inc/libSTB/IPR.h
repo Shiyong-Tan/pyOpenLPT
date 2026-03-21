@@ -31,7 +31,8 @@ class IPR
 {
 public:
     // Cameras are referenced (non-owning). Their is_active flags will be toggled in runIPR().
-    explicit IPR(std::vector<Camera>& cam_list) : _cam_list(cam_list) {}
+    explicit IPR(std::vector<std::shared_ptr<Camera>>& camera_models)
+        : _cam_list(camera_models) {}
 
     ~IPR() = default;
     NONCOPYABLE_MOVABLE(IPR)
@@ -52,8 +53,7 @@ public:
                      const ObjectConfig& cfg) const;
 
 private:
-    // Non-owning reference to the camera set (runIPR will toggle is_active).
-    std::vector<Camera>& _cam_list;
+    std::vector<std::shared_ptr<Camera>>& _cam_list;
 };
 
 #endif // IPR_H

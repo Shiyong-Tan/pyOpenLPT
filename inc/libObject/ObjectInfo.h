@@ -80,10 +80,12 @@ public:
   }
 
   // calculate the 2D information (_obj2d_list)
-  void projectObject2D(const std::vector<Camera> &cam_list);
+  void projectObject2D(
+      const std::vector<std::shared_ptr<Camera>> &camera_models);
 
   // to check whether the object is seen by more than 2 cameras;
-  bool isReconstructable(const std::vector<Camera> &cam_list);
+  bool isReconstructable(
+      const std::vector<std::shared_ptr<Camera>> &camera_models);
 
   // function to output the 3D object information
   // output: output stream to save the bubble information
@@ -107,7 +109,8 @@ protected:
                               // implemented in derived classes
 
   // additional 2D projection, for example, bubbles need to project the radius
-  virtual void additional2DProjection(const std::vector<Camera> &cam_list) = 0;
+  virtual void additional2DProjection(
+      const std::vector<std::shared_ptr<Camera>> &camera_models) = 0;
 };
 
 class Tracer3D : public Object3D {
@@ -133,7 +136,8 @@ protected:
     return std::make_unique<Tracer2D>();
   }
 
-  void additional2DProjection(const std::vector<Camera> &cam_list) override;
+  void additional2DProjection(
+      const std::vector<std::shared_ptr<Camera>> &camera_models) override;
 };
 
 class Bubble3D : public Object3D {
@@ -158,28 +162,22 @@ protected:
     return std::make_unique<Bubble2D>();
   }
 
-  void additional2DProjection(const std::vector<Camera> &cam_list) override;
+  void additional2DProjection(
+      const std::vector<std::shared_ptr<Camera>> &camera_models) override;
 };
 
 // useful functions for spherical bubbles
 namespace Bubble {
 
-// Single-view radius estimate (used by consistency checks, diagnostics)
-// Dispatch:
-//   - PINHOLE    : exact inversion with fx (pixels) and d = ||X - cam_center||.
-//   - POLYNOMIAL : Jacobian linearization at X: R ≈ r_px / sigma_max(J(X)).
-// Return NaN if unsupported or inputs invalid.
 double calRadiusFromOneCam(const Camera &cam, const Pt3D &X, double r_px);
+
+double cal2DRadius(const Camera &cam, const Pt3D &X, double R);
 
 // Forward projection (predict image radius from a 3D radius)
 // Same dispatch as above. Return NaN if unsupported/invalid.
-double cal2DRadius(const Camera &cam, const Pt3D &X, double R);
-
-// Multi-view radius estimate for a final accepted match
-// Combines per-view estimates into one robust 3D radius (e.g., median).
-// Requires cams.size() == r_px.size(); returns NaN if invalid/unsupported.
 double
-calRadiusFromCams(const std::vector<Camera> &cams, const Pt3D &X,
+calRadiusFromCams(const std::vector<std::shared_ptr<Camera>> &camera_models,
+                  const Pt3D &X,
                   const std::vector<std::unique_ptr<Object2D>> &obj2d_list);
 
 // Cross-view consistency gate (early check)

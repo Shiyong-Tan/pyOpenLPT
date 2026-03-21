@@ -110,12 +110,6 @@ void bind_Config(py::module_& m) {
         .def("set_r3d_bubble", [](CreateArgs& a, double v){ a._r3d_bubble = v; })
         .def("clear_r3d_bubble", [](CreateArgs& a){ a._r3d_bubble.reset(); })
 
-        // _cams : 只保存指针，不接管所有权
-        .def("set_cams", [](CreateArgs& a, const std::vector<Camera>& cams){
-            a._cams = &cams;
-        })
-        .def("clear_cams", [](CreateArgs& a){ a._cams = nullptr; })
-
         .def("set_compute_bubble_radius", [](CreateArgs& a, bool on){
             a._compute_bubble_radius = on;
         });

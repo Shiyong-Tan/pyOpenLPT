@@ -1,4 +1,5 @@
 #include "BubbleRefImg.h"
+#include "Camera.h"
 #include "ImageIO.h"
 #include <filesystem>
 #include <iostream>
@@ -31,12 +32,13 @@
 bool BubbleRefImg::calBubbleRefImg(
     const std::vector<std::unique_ptr<Object3D>> &objs_out,
     const std::vector<std::vector<std::unique_ptr<Object2D>>> &bb2d_list_all,
-    const std::vector<Camera> &cams, const std::vector<Image> &img_input,
+    const std::vector<std::shared_ptr<::Camera>> &camera_models,
+    const std::vector<Image> &img_input,
     std::string output_folder, double r_thres, int n_bb_thres) {
   _img_Ref_list.clear();
   _intRef_list.clear();
 
-  const int n_cam = static_cast<int>(cams.size());
+  const int n_cam = static_cast<int>(camera_models.size());
   if (n_cam == 0)
     return false;
   if (static_cast<int>(img_input.size()) != n_cam)
@@ -46,7 +48,7 @@ bool BubbleRefImg::calBubbleRefImg(
 
   // NEW: all cameras must be active
   for (int cam = 0; cam < n_cam; ++cam) {
-    if (!cams[cam]._is_active)
+    if (!camera_models[cam] || !camera_models[cam]->is_active)
       return false;
   }
 
@@ -135,7 +137,7 @@ bool BubbleRefImg::calBubbleRefImg(
 
     const int nrow = img_input[cam].getDimRow();
     const int ncol = img_input[cam].getDimCol();
-    const double intensity_max = cams[cam]._max_intensity;
+    const double intensity_max = camera_models[cam]->max_intensity;
 
     std::vector<Image> bb_img_i(n_select);
     std::vector<double> max_peak(n_select, 0.0);
@@ -299,7 +301,7 @@ bool BubbleRefImg::calBubbleRefImg(
 
   // Save reference images if output folder is provided
   if (!output_folder.empty()) {
-    if (!saveRefImg(output_folder, cams.size())) {
+    if (!saveRefImg(output_folder, n_cam)) {
       std::cerr << "Warning: Failed to save bubble reference image to "
                 << output_folder << std::endl;
     }

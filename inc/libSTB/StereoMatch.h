@@ -24,7 +24,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "Camera.h" // Camera class, used for projection and line of sight
+#include "Camera.h" // Camera model interface
 #include "Config.h"
 #include "Matrix.h"
 #include "ObjectInfo.h"
@@ -38,7 +38,7 @@ class StereoMatch {
 public:
   // Constructor
   explicit StereoMatch(
-      const std::vector<Camera> &cams,
+      const std::vector<std::shared_ptr<Camera>> &camera_models,
       const std::vector<std::vector<std::unique_ptr<Object2D>>> &obj2d_list,
       const ObjectConfig
           &obj_cfg); // All reference variable should be initialized first
@@ -48,7 +48,7 @@ public:
 
 private:
   // ---- bound per-call inputs (read-only during a match) ----
-  const std::vector<Camera> &_cams;
+  const std::vector<std::shared_ptr<Camera>> &_cam_list;
   const ObjectConfig &_obj_cfg;
   std::vector<std::vector<const Object2D *>> _obj2d_list;
 
@@ -91,9 +91,9 @@ private:
       const std::vector<int> &remaining_cams) const;
 
   // ---- LOS→image line helpers ----
-  Line2D makeLine2DFromLOS3D(int cam_id, const Line3D &los) const;
+  bool makeLine2DFromLOS3D(int cam_id, const Line3D &los, Line2D &out_line) const;
 
-  void buildLinesOnCam(const std::vector<Line3D> &los3d, int cam_id,
+  bool buildLinesOnCam(const std::vector<Line3D> &los3d, int cam_id,
                        std::vector<Line2D> &out_lines) const;
 
   // ---- early checks & tolerances (decl only; you已有实现或后续实现) ----

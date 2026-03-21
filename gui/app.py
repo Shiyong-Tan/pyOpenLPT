@@ -46,6 +46,7 @@ class OpenLPTMainWindow(QMainWindow):
         self._setup_ui()
         # self._setup_toolbar() # Removed as requested
         self._setup_statusbar()
+        self._busy_tokens = set()
         
         # Apply Windows Dark Title Bar
         self._apply_dark_title_bar()
@@ -333,6 +334,22 @@ class OpenLPTMainWindow(QMainWindow):
         color = "#00ff88" if is_success else "#e63946"
         self.status_label.setStyleSheet(f"color: {color};")
         self.status_label.setText(message)
+
+    def begin_busy(self, task_name: str = ""):
+        """Mark app status as busy and return a token."""
+        token = object()
+        self._busy_tokens.add(token)
+        self.status_label.setStyleSheet("color: #ff9800;")
+        self.status_label.setText("Busy")
+        return token
+
+    def end_busy(self, token):
+        """Release busy token and restore ready state when idle."""
+        if token in self._busy_tokens:
+            self._busy_tokens.remove(token)
+        if not self._busy_tokens:
+            self.status_label.setStyleSheet("color: #00ff88;")
+            self.status_label.setText("Ready")
     
     
     def _check_for_updates(self):
