@@ -709,6 +709,139 @@ def apply_coordinate_rotation(
     return new_cam_params, new_window_planes, new_points_3d
 
 
+def align_world_to_axis_directions(
+    axis_direction_map,
+    triangulate_fn,
+    cam_params,
+    points_3d,
+    window_planes=None,
+    validate_coverage=True,
+):
+    """
+    Compute and apply rigid world-coordinate alignment to user-detected axis directions.
+
+    Triangulates 4 landmarks (center, +X, +Y, +Z), computes closest orthonormal basis
+    via SVD polar decomposition, and applies a rigid transform.
+
+    Args:
+        axis_direction_map: {cam_idx: {"center":[x,y], "+X":[x,y], "+Y":[x,y], "+Z":[x,y]}}
+        triangulate_fn: callable(obs_by_landmark) -> {"center": arr(3), "+X": arr(3), "+Y": arr(3), "+Z": arr(3)}
+            obs_by_landmark format: {landmark_name: {cam_idx: [px, py]}}
+        cam_params: camera parameters (passed to apply_coordinate_rotation)
+        points_3d: (N,3) array of 3D wand points to transform
+        window_planes: optional refraction planes dict
+        validate_coverage: if True, require 2+ cameras per landmark
+
+    Returns:
+        (True, R_world, t_shift, transformed_state_dict) on success
+        (False, None, None, None) on any failure
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    if window_planes is None:
+        window_planes = {}
+
+    landmark_names = ["center", "+X", "+Y", "+Z"]
+
+    # Reorganize axis_direction_map into per-landmark observation dict
+    obs_by_landmark = {lm: {} for lm in landmark_names}
+    for cam_idx, cam_data in axis_direction_map.items():
+        for lm in landmark_names:
+            if lm in cam_data:
+                obs_by_landmark[lm][cam_idx] = cam_data[lm]
+
+    # Validate coverage (need 2+ cameras per landmark)
+    if validate_coverage:
+        for lm in landmark_names:
+            n_cams = len(obs_by_landmark[lm])
+            if n_cams < 2:
+                logger.warning(
+                    "Axis alignment failed: landmark '%s' has only %d camera obs (need 2+)", lm, n_cams
+                )
+                return False, None, None, None
+
+    # Triangulate landmarks
+    try:
+        landmark_3d = triangulate_fn(obs_by_landmark)
+    except Exception as exc:
+        logger.warning("Axis alignment failed during triangulation: %s", exc)
+        return False, None, None, None
+
+    # Validate triangulated results
+    for lm in landmark_names:
+        if lm not in landmark_3d or landmark_3d[lm] is None:
+            logger.warning("Axis alignment failed: triangulation returned None for '%s'", lm)
+            return False, None, None, None
+        pt = np.asarray(landmark_3d[lm]).reshape(3)
+        if not np.isfinite(pt).all():
+            logger.warning("Axis alignment failed: non-finite point for landmark '%s'", lm)
+            return False, None, None, None
+
+    center = np.asarray(landmark_3d["center"]).reshape(3)
+    pt_x = np.asarray(landmark_3d["+X"]).reshape(3)
+    pt_y = np.asarray(landmark_3d["+Y"]).reshape(3)
+    pt_z = np.asarray(landmark_3d["+Z"]).reshape(3)
+
+    # Compute direction vectors
+    dir_X = pt_x - center
+    dir_Y = pt_y - center
+    dir_Z = pt_z - center
+
+    norms = np.array([np.linalg.norm(d) for d in [dir_X, dir_Y, dir_Z]])
+    if np.any(norms < 1e-10):
+        logger.warning("Axis alignment failed: degenerate direction vectors (near-zero norm: %s)", norms)
+        return False, None, None, None
+
+    dir_X /= norms[0]
+    dir_Y /= norms[1]
+    dir_Z /= norms[2]
+
+    # Build orientation matrix M with direction vectors as columns
+    M = np.column_stack([dir_X, dir_Y, dir_Z])
+
+    # SVD polar decomposition: R_new = U @ Vt is closest orthonormal matrix to M
+    U, S, Vt = np.linalg.svd(M)
+    logger.debug("SVD singular values: %s, condition: %.4e", S, S[0] / max(S[-1], 1e-20))
+
+    if S[-1] < 1e-12 or (S[0] / max(S[-1], 1e-20)) > 1e12:
+        logger.warning("Axis alignment failed: SVD ill-conditioned (S=%s)", S)
+        return False, None, None, None
+
+    R_new = U @ Vt
+
+    # Ensure right-handed system (det = +1)
+    det = np.linalg.det(R_new)
+    logger.debug("det(R_new) = %.8f", det)
+    if det < 0:
+        U_fix = U.copy()
+        U_fix[:, -1] *= -1
+        R_new = U_fix @ Vt
+        det = np.linalg.det(R_new)
+
+    if abs(det - 1.0) > 1e-6:
+        logger.warning("Axis alignment failed: det(R)=%.8f (expected +1)", det)
+        return False, None, None, None
+
+    # Translation: shift world origin to axis center
+    t_shift = -center
+
+    # Apply rigid transform
+    logger.debug("Applying axis alignment: |t_shift|=%.4f mm", np.linalg.norm(t_shift))
+    new_cam_params, new_window_planes, new_points_3d = apply_coordinate_rotation(
+        R_new, cam_params, window_planes, points_3d, t_shift=t_shift
+    )
+
+    transformed_state = {
+        "cam_params": new_cam_params,
+        "window_planes": new_window_planes,
+        "points_3d": new_points_3d,
+    }
+
+    return True, R_new, t_shift, transformed_state
+
+
 def align_world_y_to_plane_intersection(
     window_planes: dict,
     cam_params: dict,

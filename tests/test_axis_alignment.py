@@ -3,6 +3,14 @@ import cv2
 from scipy.optimize import OptimizeResult
 
 from modules.camera_calibration.wand_calibration.wand_calibrator import WandCalibrator
+from tests.test_utils_axis_alignment import (
+    generate_synthetic_pinhole_setup,
+    project_points,
+    compute_orthogonality_metrics,
+)
+from modules.camera_calibration.wand_calibration.refractive_geometry import (
+    align_world_to_axis_directions,
+)
 
 
 def _build_pinhole_finalize_fixture():
@@ -103,3 +111,76 @@ def test_pinhole_finalize_consistency():
         T = calibrator.final_params[cam_id]["T"]
         center = (-R.T @ T).reshape(3)
         assert np.isfinite(center).all()
+
+
+def test_align_world_to_axis_directions_happy():
+    """Happy path: alignment computes valid orthonormal R and correct t_shift."""
+    K_list, R_list, T_list, points_3d = generate_synthetic_pinhole_setup(num_cams=2, num_points=20)
+
+    # Known landmarks (3D)
+    axis_center_3d = np.array([0.0, 0.0, 600.0])
+    axis_x_3d = np.array([10.0, 0.0, 600.0])
+    axis_y_3d = np.array([0.0, 10.0, 600.0])
+    axis_z_3d = np.array([0.0, 0.0, 610.0])
+    landmark_3d = {
+        "center": axis_center_3d,
+        "+X": axis_x_3d,
+        "+Y": axis_y_3d,
+        "+Z": axis_z_3d,
+    }
+
+    # Create 2D observations by projecting landmarks
+    axis_direction_map = {}
+    for cam_idx in range(2):
+        cam_landmarks = {}
+        for lm_name, pt3d in landmark_3d.items():
+            obs_2d = project_points(K_list[cam_idx], R_list[cam_idx], T_list[cam_idx], pt3d.reshape(1, 3))
+            cam_landmarks[lm_name] = obs_2d[0].tolist()
+        axis_direction_map[cam_idx] = cam_landmarks
+
+    # Mock triangulate_fn that returns known landmarks (simulating perfect triangulation)
+    def mock_triangulate_fn(obs_by_landmark):
+        return landmark_3d
+
+    success, R_new, t_shift, state = align_world_to_axis_directions(
+        axis_direction_map,
+        mock_triangulate_fn,
+        {},
+        points_3d,
+    )
+
+    assert success is True
+    assert R_new is not None
+    metrics = compute_orthogonality_metrics(R_new)
+    assert metrics["frob_norm_error"] < 1e-10
+    assert abs(metrics["det"] - 1.0) < 1e-10
+    # t_shift should be -center
+    np.testing.assert_allclose(t_shift, -axis_center_3d, atol=1e-10)
+    assert isinstance(state, dict)
+
+
+def test_align_world_to_axis_directions_coverage_fail():
+    """Failure case: only 1 camera per landmark -> should fail with success=False."""
+    # axis_direction_map with only 1 camera
+    axis_direction_map = {
+        0: {
+            "center": [100.0, 200.0],
+            "+X": [150.0, 200.0],
+            "+Y": [100.0, 250.0],
+            "+Z": [100.0, 200.0],
+        }
+    }
+
+    def mock_triangulate_fn(obs_by_landmark):
+        return {}
+
+    success, R_new, t_shift, state = align_world_to_axis_directions(
+        axis_direction_map,
+        mock_triangulate_fn,
+        {},
+        np.zeros((4, 3)),
+        validate_coverage=True,
+    )
+
+    assert success is False
+    assert R_new is None
