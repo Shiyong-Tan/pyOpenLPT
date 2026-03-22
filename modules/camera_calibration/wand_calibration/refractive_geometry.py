@@ -842,6 +842,103 @@ def align_world_to_axis_directions(
     return True, R_new, t_shift, transformed_state
 
 
+def triangulate_pinhole_landmarks(obs_by_landmark, cam_params_dict):
+    """
+    Triangulate axis landmarks from 2D pinhole observations using N-view SVD.
+
+    Args:
+        obs_by_landmark: {landmark_name: {cam_id: [px, py]}}
+            e.g. {"center": {0: [100, 200], 1: [110, 210]}, "+X": {...}, ...}
+        cam_params_dict: {cam_id: {"K": np.ndarray(3,3), "R": np.ndarray(3,3), "T": np.ndarray(3,1), "dist": ...}}
+            (This is the `final_params` format from wand_calibrator)
+
+    Returns:
+        dict {landmark_name: np.ndarray(3,)} or raises ValueError if any landmark fails
+    """
+    landmark_names = ["center", "+X", "+Y", "+Z"]
+    out = {}
+
+    for lm in landmark_names:
+        obs_by_cam = obs_by_landmark.get(lm, {})
+        if len(obs_by_cam) < 2:
+            raise ValueError(f"insufficient cameras for landmark {lm}")
+
+        A_rows = []
+        for cam_id, uv in obs_by_cam.items():
+            if cam_id not in cam_params_dict:
+                raise ValueError(f"missing camera parameters for camera {cam_id}")
+
+            cam = cam_params_dict[cam_id]
+            K = np.asarray(cam["K"], dtype=np.float64).reshape(3, 3)
+            R = np.asarray(cam["R"], dtype=np.float64).reshape(3, 3)
+            T = np.asarray(cam["T"], dtype=np.float64).reshape(3, 1)
+
+            P = K @ np.hstack((R, T))
+
+            u = float(uv[0])
+            v = float(uv[1])
+            A_rows.append(u * P[2, :] - P[0, :])
+            A_rows.append(v * P[2, :] - P[1, :])
+
+        A = np.asarray(A_rows, dtype=np.float64)
+        _, _, vt = np.linalg.svd(A)
+        X_h = vt[-1, :]
+
+        if abs(X_h[3]) > 1e-12:
+            X = X_h[:3] / X_h[3]
+        else:
+            X = X_h[:3]
+
+        X = np.asarray(X, dtype=np.float64).reshape(3)
+        if not np.isfinite(X).all():
+            raise ValueError(f"triangulation failed for landmark {lm}: non-finite result")
+
+        out[lm] = X
+
+    return out
+
+
+def triangulate_refractive_landmarks(obs_by_landmark, cams_cpp):
+    """
+    Triangulate axis landmarks from 2D observations using refractive ray casting.
+
+    Args:
+        obs_by_landmark: {landmark_name: {cam_id: [px, py]}}
+        cams_cpp: {cam_id: pyopenlpt.Camera} — C++ camera objects with refractive model
+
+    Returns:
+        dict {landmark_name: np.ndarray(3,)} or raises ValueError if any landmark fails
+    """
+    landmark_names = ["center", "+X", "+Y", "+Z"]
+    out = {}
+
+    for lm in landmark_names:
+        obs_by_cam = obs_by_landmark.get(lm, {})
+        rays_list = []
+
+        for cam_id, uv in obs_by_cam.items():
+            cam = cams_cpp.get(cam_id)
+            if cam is None:
+                continue
+
+            px, py = float(uv[0]), float(uv[1])
+            rays = build_pinplate_rays_cpp_batch(cam, [(px, py)])
+            if rays and rays[0].valid:
+                rays_list.append(rays[0])
+
+        if len(rays_list) < 2:
+            raise ValueError(f"triangulation failed for landmark {lm}: insufficient_valid_rays")
+
+        X, _, success, reason = triangulate_point(rays_list)
+        if (not success) or (not np.isfinite(np.asarray(X)).all()):
+            fail_reason = reason if reason else "unknown"
+            raise ValueError(f"triangulation failed for landmark {lm}: {fail_reason}")
+
+        out[lm] = np.asarray(X, dtype=np.float64).reshape(3)
+
+    return out
+
+
 def align_world_y_to_plane_intersection(
     window_planes: dict,
     cam_params: dict,

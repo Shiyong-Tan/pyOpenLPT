@@ -10,6 +10,7 @@ from tests.test_utils_axis_alignment import (
 )
 from modules.camera_calibration.wand_calibration.refractive_geometry import (
     align_world_to_axis_directions,
+    triangulate_pinhole_landmarks,
 )
 
 
@@ -184,3 +185,41 @@ def test_align_world_to_axis_directions_coverage_fail():
 
     assert success is False
     assert R_new is None
+
+
+def test_triangulate_pinhole_landmarks_happy():
+    K_list, R_list, T_list, _ = generate_synthetic_pinhole_setup(num_cams=2, num_points=4)
+
+    landmark_names = ["center", "+X", "+Y", "+Z"]
+    gt_landmarks = {
+        "center": np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        "+X": np.array([0.25, 0.0, 0.0], dtype=np.float64),
+        "+Y": np.array([0.0, 0.25, 0.0], dtype=np.float64),
+        "+Z": np.array([0.0, 0.0, 0.25], dtype=np.float64),
+    }
+
+    obs_by_landmark = {lm: {} for lm in landmark_names}
+    for cam_id in range(2):
+        cam_pts = np.vstack([gt_landmarks[lm] for lm in landmark_names])
+        uv = project_points(K_list[cam_id], R_list[cam_id], T_list[cam_id], cam_pts)
+        for i, lm in enumerate(landmark_names):
+            obs_by_landmark[lm][cam_id] = uv[i].tolist()
+
+    cam_params_dict = {
+        cam_id: {
+            "K": K_list[cam_id],
+            "R": R_list[cam_id],
+            "T": T_list[cam_id],
+            "dist": np.zeros(2, dtype=np.float64),
+        }
+        for cam_id in range(2)
+    }
+
+    out = triangulate_pinhole_landmarks(obs_by_landmark, cam_params_dict)
+
+    assert list(out.keys()) == landmark_names
+    for lm in landmark_names:
+        pt = np.asarray(out[lm], dtype=np.float64).reshape(3)
+        assert pt.shape == (3,)
+        assert np.isfinite(pt).all()
+        assert np.linalg.norm(pt - gt_landmarks[lm]) < 1.0
