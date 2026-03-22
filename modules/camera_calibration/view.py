@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import os
+import csv
 from datetime import datetime
 
 import matplotlib
@@ -15,13 +16,13 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                               QDoubleSpinBox, QListWidget, QGroupBox, QFormLayout,
                               QCheckBox, QFileDialog, QScrollArea, QFrame,
                               QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
-                              QSizePolicy, QGridLayout, QRadioButton, QButtonGroup)
+                              QSizePolicy, QGridLayout, QRadioButton, QButtonGroup, QProgressDialog, QApplication)
 from PySide6.QtCore import Qt
 from .widgets import RangeSlider
 from .wand_calibration.wand_calibrator import WandCalibrator
 from .wand_calibration.refraction_wand_calibrator import RefractiveWandCalibrator
 from PySide6.QtGui import QPainter, QPen, QColor, QPixmap, QPainterPath
-from PySide6.QtCore import QRect, Signal, QPoint, QThread, QTimer, Slot, QObject
+from PySide6.QtCore import QRect, Signal, QPoint, QThread, QTimer, Slot, QObject, QEvent
 
 class ZoomableImageLabel(QLabel):
     """
@@ -957,10 +958,10 @@ class CameraCalibrationView(QWidget):
         # I need to ensure they are created.
         # I'll create 4 default labels.
         for i in range(4):
-            lbl = QLabel(f"Cam {i} (No Image)")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl = ZoomableImageLabel(f"Cam {i} (No Image)")
             lbl.setStyleSheet("background: #111; border: 1px dashed #333; color: #555;")
             lbl.setMinimumHeight(200)
+            lbl.axis_point_selected.connect(lambda pt, axis_idx, idx=i: self._on_wand_axis_point_selected(pt, axis_idx, idx))
             self.vis_grid_layout.addRow(f"Cam {i}:", lbl)
             self.cam_vis_labels[i] = lbl
         
@@ -1009,10 +1010,10 @@ class CameraCalibrationView(QWidget):
         """
 
         # --- Tab 1: Detection (with Scroll Area) ---
-        det_scroll = QScrollArea()
-        det_scroll.setWidgetResizable(True)
-        det_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        det_scroll.setStyleSheet("background-color: transparent;")
+        self.det_scroll = QScrollArea()
+        self.det_scroll.setWidgetResizable(True)
+        self.det_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.det_scroll.setStyleSheet("background-color: transparent;")
         
         det_content = QWidget()
         det_layout = QVBoxLayout(det_content)
@@ -1142,14 +1143,74 @@ class CameraCalibrationView(QWidget):
         self.btn_process_wand.setStyleSheet(btn_style)
         self.btn_process_wand.clicked.connect(self._process_wand_frames)
         det_layout.addWidget(self.btn_process_wand)
+
+        axis_mode_row = QHBoxLayout()
+        axis_mode_row.setContentsMargins(0, 0, 0, 0)
+        axis_mode_row.setSpacing(14)
+        axis_mode_row.addWidget(QLabel("Axis direction"))
+
+        self.axis_mode_group = QButtonGroup(self)
+        self.axis_mode_default = QRadioButton("Default")
+        self.axis_mode_custom = QRadioButton("Custom")
+        self.axis_mode_default.setChecked(True)
+        self.axis_mode_default.setStyleSheet(detect_mode_radio_style)
+        self.axis_mode_custom.setStyleSheet(detect_mode_radio_style)
+        self.axis_mode_group.addButton(self.axis_mode_default)
+        self.axis_mode_group.addButton(self.axis_mode_custom)
+        self.axis_mode_default.toggled.connect(self._on_axis_mode_changed)
+        self.axis_mode_custom.toggled.connect(self._on_axis_mode_changed)
+
+        axis_mode_row.addWidget(self.axis_mode_default)
+        axis_mode_row.addWidget(self.axis_mode_custom)
+        axis_mode_row.addStretch()
+        det_layout.addLayout(axis_mode_row)
+
+        self.axis_custom_container = QWidget()
+        axis_custom_layout = QVBoxLayout(self.axis_custom_container)
+        axis_custom_layout.setContentsMargins(0, 0, 0, 0)
+        axis_custom_layout.setSpacing(8)
+
+        self.axis_cam_table = QTableWidget()
+        self.axis_cam_table.setColumnCount(3)
+        self.axis_cam_table.setHorizontalHeaderLabels(["", "Cam ID", "Select Direction"])
+        axis_header = self.axis_cam_table.horizontalHeader()
+        axis_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        axis_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        axis_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.axis_cam_table.verticalHeader().setVisible(False)
+        self.axis_cam_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.axis_cam_table.setShowGrid(True)
+        self.axis_cam_table.setStyleSheet("background-color: transparent; border: 1px solid #333;")
+        self.axis_cam_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.axis_cam_table.cellClicked.connect(self._on_axis_cam_table_clicked)
+        self.axis_cam_table.setMinimumHeight(120)
+        axis_custom_layout.addWidget(self.axis_cam_table)
+
+        axis_btn_row = QHBoxLayout()
+        axis_btn_row.setContentsMargins(0, 0, 0, 0)
+        axis_btn_row.setSpacing(8)
+        self.btn_detect_axis = QPushButton("Detect")
+        self.btn_detect_axis.setStyleSheet(btn_style)
+        self.btn_detect_axis.setToolTip("Adjust the Radius Range and Sensitivity to detect all points.")
+        self.btn_detect_axis.clicked.connect(self._detect_axis_points)
+        self.btn_save_axis = QPushButton("Save")
+        self.btn_save_axis.setStyleSheet(btn_style)
+        self.btn_save_axis.clicked.connect(self._save_axis_data)
+        axis_btn_row.addWidget(self.btn_detect_axis)
+        axis_btn_row.addWidget(self.btn_save_axis)
+        axis_custom_layout.addLayout(axis_btn_row)
+
+        self.axis_custom_container.setVisible(False)
+        det_layout.addWidget(self.axis_custom_container)
+        self._update_axis_cam_table(int(self.wand_num_cams.value()))
         
         det_layout.addStretch()
         
-        det_scroll.setWidget(det_content)
+        self.det_scroll.setWidget(det_content)
         det_tab = QWidget()
         det_tab_layout = QVBoxLayout(det_tab)
         det_tab_layout.setContentsMargins(0, 0, 0, 0)
-        det_tab_layout.addWidget(det_scroll)
+        det_tab_layout.addWidget(self.det_scroll)
 
         # --- Tab 2: Calibration (with scroll area) ---
         cal_tab = QWidget()
@@ -1309,6 +1370,15 @@ class CameraCalibrationView(QWidget):
         self.btn_load_points.setStyleSheet(btn_style)
         self.btn_load_points.clicked.connect(self._load_wand_points_for_calibration)
         cal_layout.addWidget(self.btn_load_points)
+
+        self.btn_load_axis_csv = QPushButton("Load Axis Points (Optional)")
+        self.btn_load_axis_csv.setStyleSheet(btn_style)
+        self.btn_load_axis_csv.setToolTip(
+            "Load 2D axis-direction points from CSV for post-calibration world alignment.\n"
+            "CSV format: cam_id, center_x, center_y, plus_x_x, plus_x_y, plus_y_x, plus_y_y, plus_z_x, plus_z_y"
+        )
+        self.btn_load_axis_csv.clicked.connect(self._load_axis_points_csv)
+        cal_layout.addWidget(self.btn_load_axis_csv)
         
         # Precalibrate Check
         self.btn_precalibrate = QPushButton("Precalibrate to Check")
@@ -1510,6 +1580,44 @@ class CameraCalibrationView(QWidget):
             self.status_label.setText(f"Loaded {count_frames} frames. Ready to calibrate.")
         else:
             QMessageBox.critical(self, "Error", f"Failed to load points:\n{msg}")
+
+    def _load_axis_points_csv(self, file_path=None):
+        """Load 9-column axis-direction CSV and populate self.axis_direction_map.
+
+        CSV schema: cam_id, center_x, center_y, plus_x_x, plus_x_y, plus_y_x, plus_y_y, plus_z_x, plus_z_y
+        """
+        if file_path is None:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Load Axis Points CSV", "", "CSV Files (*.csv)"
+            )
+            if not file_path:
+                return
+
+        axis_direction_map = {}
+        try:
+            with open(file_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    cam_id = int(row["cam_id"])
+                    axis_direction_map[cam_id] = {
+                        "center": [float(row["center_x"]), float(row["center_y"])],
+                        "+X": [float(row["plus_x_x"]), float(row["plus_x_y"])],
+                        "+Y": [float(row["plus_y_x"]), float(row["plus_y_y"])],
+                        "+Z": [float(row["plus_z_x"]), float(row["plus_z_y"])],
+                    }
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error("Failed to load axis points CSV: %s", e)
+            QMessageBox.critical(self, "Error Loading Axis Points", str(e))
+            return
+
+        if not axis_direction_map:
+            return
+
+        self.axis_direction_map = axis_direction_map
+        if hasattr(self, "btn_load_axis_csv"):
+            self.btn_load_axis_csv.setEnabled(False)
+
     def __init__(self):
         super().__init__()
         self._busy_tokens = {}
@@ -2805,9 +2913,9 @@ class CameraCalibrationView(QWidget):
             self.vis_tabs.clear()
             self.cam_vis_labels = {}
             for i in range(count):
-                lbl = QLabel("No Image")
-                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                lbl = ZoomableImageLabel("No Image")
                 lbl.setStyleSheet("background: #1a1a1a; color: #666; font-size: 18px;")
+                lbl.axis_point_selected.connect(lambda pt, axis_idx, idx=i: self._on_wand_axis_point_selected(pt, axis_idx, idx))
                 self.cam_vis_labels[i] = lbl
                 self.vis_tabs.addTab(lbl, f"Cam {i+1}")
             
@@ -2860,7 +2968,588 @@ class CameraCalibrationView(QWidget):
         if hasattr(self, 'cam_window_table'):
             self._update_refraction_cam_table(count)
 
+        self._update_axis_cam_table(count)
+
         self._refresh_wand_radius_range_limit()
+
+    def _update_axis_cam_table(self, count):
+        if not hasattr(self, 'axis_cam_table'):
+            if not hasattr(self, 'axis_images'):
+                self.axis_images = {i: [] for i in range(count)}
+            if not hasattr(self, 'axis_detected_points'):
+                self.axis_detected_points = {i: {} for i in range(count)}
+            if not hasattr(self, 'axis_select_state'):
+                self.axis_select_state = {
+                    i: {
+                        "next_idx": 0,
+                        "in_progress": False,
+                        "points": {},
+                        "selected_image_idx": 0,
+                    }
+                    for i in range(count)
+                }
+            return
+
+        old_axis_images = self.axis_images if hasattr(self, 'axis_images') else {}
+        old_axis_detected_points = self.axis_detected_points if hasattr(self, 'axis_detected_points') else {}
+        old_axis_select_state = self.axis_select_state if hasattr(self, 'axis_select_state') else {}
+        self.axis_images = {i: old_axis_images.get(i, []) for i in range(count)}
+        self.axis_detected_points = {i: old_axis_detected_points.get(i, {}) for i in range(count)}
+        self.axis_select_state = {
+            i: old_axis_select_state.get(
+                i,
+                {
+                    "next_idx": 0,
+                    "in_progress": False,
+                    "points": {},
+                    "selected_image_idx": 0,
+                },
+            )
+            for i in range(count)
+        }
+        self.axis_cam_table.setRowCount(count)
+
+        for i in range(count):
+            btn = QPushButton("Load")
+            btn.setStyleSheet("background-color: #2a3f5f; padding: 2px 6px; font-size: 10px;")
+            btn.clicked.connect(lambda checked=False, idx=i: self._load_axis_images_for_cam(idx))
+            if self.axis_images.get(i):
+                btn.setText(f"{len(self.axis_images[i])}")
+            self.axis_cam_table.setCellWidget(i, 0, btn)
+
+            cam_id_item = QTableWidgetItem(f"{i}")
+            cam_id_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            cam_id_item.setForeground(Qt.GlobalColor.white)
+            self.axis_cam_table.setItem(i, 1, cam_id_item)
+
+            select_btn = QPushButton("Select")
+            select_btn.setStyleSheet("background-color: #2a3f5f; padding: 2px 6px; font-size: 10px;")
+            select_btn.clicked.connect(lambda checked=False, idx=i: self._on_axis_select_clicked(idx))
+            select_btn.setProperty("axis_cam_idx", i)
+            select_btn.installEventFilter(self)
+            self.axis_cam_table.setCellWidget(i, 2, select_btn)
+            self._refresh_axis_select_button(i)
+
+    def _on_axis_mode_changed(self):
+        is_custom = hasattr(self, 'axis_mode_custom') and self.axis_mode_custom.isChecked()
+        if hasattr(self, 'axis_custom_container'):
+            self.axis_custom_container.setVisible(is_custom)
+        
+        # Auto-scroll to bottom when Custom is selected
+        if is_custom and hasattr(self, 'det_scroll'):
+            QTimer.singleShot(0, lambda: self.det_scroll.verticalScrollBar().setValue(
+                self.det_scroll.verticalScrollBar().maximum()
+            ))
+
+    def _load_axis_images_for_cam(self, cam_idx):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            f"Select Axis Image Files for Camera {cam_idx+1}",
+            "",
+            "Image Files (*.png *.jpg *.bmp *.tif *.jpeg);;All Files (*)"
+        )
+        if not files:
+            return
+
+        files = sorted(files)
+        self.axis_images[cam_idx] = files
+        self.axis_detected_points[cam_idx] = {}
+        st = self.axis_select_state.get(cam_idx, {})
+        st["next_idx"] = 0
+        st["in_progress"] = False
+        st["points"] = {}
+        st["selected_image_idx"] = 0
+        self.axis_select_state[cam_idx] = st
+        self._refresh_axis_select_button(cam_idx)
+
+        btn = self.axis_cam_table.cellWidget(cam_idx, 0)
+        if btn:
+            btn.setText(f"{len(files)}" if files else "Load")
+
+        if not files:
+            QMessageBox.warning(self, "No Images", "No images selected.")
+            return
+
+        self._focus_axis_camera(cam_idx)
+
+    def _detect_axis_points(self):
+        if not hasattr(self, 'wand_calibrator'):
+            self.wand_calibrator = WandCalibrator()
+
+        min_r, max_r = self.radius_range.value()
+        sensitivity = self.sensitivity_slider.value()
+        wand_type = "dark" if "Dark" in self.wand_type_combo.currentText() else "bright"
+
+        total_images = sum(len(v) for v in self.axis_images.values()) if hasattr(self, 'axis_images') else 0
+        if total_images == 0:
+            QMessageBox.warning(self, "No Images", "Load axis images first.")
+            return
+
+        # Show progress dialog
+        progress_dialog = QProgressDialog(
+            "Detecting axis points...",
+            None,
+            0, 0,
+            self
+        )
+        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.open()
+        QApplication.processEvents()
+
+        try:
+            detected_count = 0
+            for cam_idx, files in self.axis_images.items():
+                cam_detect = {}
+                for img_idx, path in enumerate(files):
+                    res = self.wand_calibrator.detect_single_frame(
+                        {cam_idx: path},
+                        wand_type=wand_type,
+                        min_radius=min_r,
+                        max_radius=max_r,
+                        sensitivity=sensitivity,
+                        detect_mode="reliable",
+                    )
+                    pts = res.get(cam_idx)
+                    if pts is None:
+                        pts = np.empty((0, 4), dtype=float)
+                    cam_detect[img_idx] = pts
+                    detected_count += len(pts)
+                self.axis_detected_points[cam_idx] = cam_detect
+
+            if hasattr(self, 'axis_cam_table') and self.axis_cam_table.rowCount() > 0:
+                target_row = self.axis_cam_table.currentRow()
+                if target_row < 0:
+                    target_row = 0
+                self._focus_axis_camera(target_row)
+
+            # Build success message with guidance if fewer than 6 points detected
+            msg = f"Axis detection completed with reliable mode. Found {detected_count} circles in {total_images} images."
+            if detected_count < 6:
+                msg += "\n\nHint: If fewer points detected than expected, adjust the Radius Range and Sensitivity sliders to detect more points."
+
+            QMessageBox.information(self, "Axis Detection", msg)
+            progress_dialog.close()
+
+        except Exception as e:
+            progress_dialog.close()
+            QMessageBox.critical(self, "Detection Error", f"Error during axis detection: {str(e)}")
+            raise
+
+    def _refresh_axis_select_button(self, cam_idx):
+        if not hasattr(self, 'axis_cam_table') or not hasattr(self, 'axis_select_state'):
+            return
+
+        btn = self.axis_cam_table.cellWidget(cam_idx, 2)
+        if btn is None:
+            return
+
+        state = self.axis_select_state.get(cam_idx, {"next_idx": 0, "points": {}, "in_progress": False})
+        next_idx = int(state.get("next_idx", 0))
+        if state.get("in_progress", False):
+            seq = ["+X", "+Y", "+Z"]
+            if 0 <= next_idx < len(seq):
+                btn.setText(f"Selecting {seq[next_idx]}")
+            else:
+                btn.setText("Selecting")
+        elif self._is_axis_selection_complete(cam_idx):
+            btn.setText("Selected")
+        else:
+            btn.setText("Select")
+
+    def _on_axis_select_clicked(self, cam_idx):
+        if cam_idx not in self.axis_images or len(self.axis_images[cam_idx]) == 0:
+            QMessageBox.warning(self, "No Images", f"Camera {cam_idx}: load axis image files first.")
+            return
+
+        if self._is_axis_selection_complete(cam_idx):
+            self._reset_axis_selection(cam_idx)
+            return
+
+        self._focus_axis_camera(cam_idx)
+
+        state = self.axis_select_state.get(cam_idx, {
+            "next_idx": 0,
+            "in_progress": False,
+            "points": {},
+            "selected_image_idx": 0,
+        })
+        state["next_idx"] = 0
+        state["in_progress"] = True
+        state["points"] = {}
+        self.axis_select_state[cam_idx] = state
+        self._refresh_axis_select_button(cam_idx)
+
+        lbl = self.cam_vis_labels.get(cam_idx)
+        if lbl:
+            lbl.set_mode(ZoomableImageLabel.MODE_AXES)
+            lbl._current_axis_index = 0
+            lbl._hint_text = "select +X"
+            lbl.update()
+
+    def _is_axis_selection_complete(self, cam_idx):
+        state = self.axis_select_state.get(cam_idx, {}) if hasattr(self, 'axis_select_state') else {}
+        points = state.get("points", {})
+        return (not state.get("in_progress", False)) and all(k in points for k in ["+X", "+Y", "+Z"])
+
+    def _reset_axis_selection(self, cam_idx):
+        state = self.axis_select_state.get(cam_idx, {
+            "next_idx": 0,
+            "in_progress": False,
+            "points": {},
+            "selected_image_idx": 0,
+        })
+        state["next_idx"] = 0
+        state["in_progress"] = False
+        state["points"] = {}
+        self.axis_select_state[cam_idx] = state
+
+        lbl = self.cam_vis_labels.get(cam_idx)
+        if lbl:
+            lbl._hint_text = ""
+            lbl.set_mode(ZoomableImageLabel.MODE_NAV)
+
+        self._refresh_axis_select_button(cam_idx)
+        self._show_axis_image_for_cam(cam_idx)
+
+    def _save_axis_data(self):
+        axis_direction_map = {}
+        incomplete = []
+
+        cam_indices = sorted(self.axis_images.keys()) if hasattr(self, 'axis_images') else []
+        for cam_idx in cam_indices:
+            payload = self._compute_axis_output_for_cam(cam_idx)
+            if payload is None:
+                incomplete.append(cam_idx)
+                continue
+            axis_direction_map[cam_idx] = payload
+
+        if incomplete:
+            QMessageBox.warning(
+                self,
+                "Axis Direction",
+                "Missing selections or detections for camera(s): " + ", ".join(str(c) for c in incomplete)
+            )
+            return
+
+        self.axis_direction_map = axis_direction_map
+
+        default_name = "axis_directions.csv"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Axis Direction Data",
+            default_name,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+
+        if not file_path:
+            QMessageBox.information(self, "Axis Direction", "Axis direction settings saved in memory only.")
+            return
+
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "cam_id",
+                    "center_x", "center_y",
+                    "plus_x_x", "plus_x_y",
+                    "plus_y_x", "plus_y_y",
+                    "plus_z_x", "plus_z_y",
+                ])
+                for cam_idx in sorted(axis_direction_map.keys()):
+                    payload = axis_direction_map[cam_idx]
+                    center = payload["center"]
+                    px = payload["+X"]
+                    py = payload["+Y"]
+                    pz = payload["+Z"]
+                    writer.writerow([
+                        cam_idx,
+                        center[0], center[1],
+                        px[0], px[1],
+                        py[0], py[1],
+                        pz[0], pz[1],
+                    ])
+        except OSError as e:
+            QMessageBox.critical(self, "Axis Direction", f"Failed to save axis direction file:\n{e}")
+            return
+
+        QMessageBox.information(self, "Axis Direction", f"Axis direction file saved:\n{file_path}")
+
+    def _on_axis_cam_table_clicked(self, row, col):
+        if col in (1, 2):
+            self._focus_axis_camera(row)
+
+    def _focus_axis_camera(self, cam_idx):
+        if hasattr(self, 'vis_tabs'):
+            self.vis_tabs.setCurrentIndex(cam_idx)
+        self._show_axis_image_for_cam(cam_idx)
+
+    def _show_axis_image_for_cam(self, cam_idx):
+        import cv2
+        from PySide6.QtGui import QImage, QPixmap
+
+        lbl = self.cam_vis_labels.get(cam_idx)
+        if lbl is None:
+            return
+
+        files = self.axis_images.get(cam_idx, []) if hasattr(self, 'axis_images') else []
+        if not files:
+            lbl.setText("No Axis Image")
+            return
+
+        st = self.axis_select_state.get(cam_idx, {}) if hasattr(self, 'axis_select_state') else {}
+        img_idx = int(st.get("selected_image_idx", 0))
+        img_idx = max(0, min(img_idx, len(files) - 1))
+        path = files[img_idx]
+
+        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            lbl.setText("Image Load Error")
+            return
+
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        if img.dtype != np.uint8:
+            max_val = float(img.max())
+            if max_val > 0:
+                img = (img / max_val * 255).astype(np.uint8)
+            else:
+                img = np.zeros_like(img, dtype=np.uint8)
+
+        self._draw_axis_overlay(cam_idx, img_idx, img)
+
+        h, w, ch = img.shape
+        q_img = QImage(img.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(q_img)
+        lbl.setPixmap(pix)
+
+    def _draw_axis_overlay(self, cam_idx, img_idx, img_rgb):
+        pts = self.axis_detected_points.get(cam_idx, {}).get(img_idx, np.empty((0, 4), dtype=float)) if hasattr(self, 'axis_detected_points') else np.empty((0, 4), dtype=float)
+        pair_ctx = self._pair_axis_endpoints_for_points(pts)
+
+        for pt in pts:
+            x, y = int(pt[0]), int(pt[1])
+            r = int(pt[2]) if len(pt) > 2 else 10
+            self._draw_dashed_circle(img_rgb, (x, y), r + 2, (0, 100, 255), 1)
+            cv2.putText(img_rgb, f"r={r}", (x + r + 6, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.line(img_rgb, (x - 6, y), (x + 6, y), (0, 255, 255), 2)
+            cv2.line(img_rgb, (x, y - 6), (x, y + 6), (0, 255, 255), 2)
+
+        for pair in pair_ctx["pairs"]:
+            p1 = tuple(np.array(pair["p1"], dtype=int).tolist())
+            p2 = tuple(np.array(pair["p2"], dtype=int).tolist())
+            cv2.line(img_rgb, p1, p2, (130, 130, 130), 2, cv2.LINE_AA)
+
+        midpoints = pair_ctx["midpoints"]
+        if midpoints:
+            center = np.mean(np.array(midpoints, dtype=float), axis=0)
+            cx, cy = int(center[0]), int(center[1])
+            cv2.line(img_rgb, (cx - 10, cy - 10), (cx + 10, cy + 10), (255, 0, 0), 3, cv2.LINE_AA)
+            cv2.line(img_rgb, (cx - 10, cy + 10), (cx + 10, cy - 10), (255, 0, 0), 3, cv2.LINE_AA)
+
+        st = self.axis_select_state.get(cam_idx, {}) if hasattr(self, 'axis_select_state') else {}
+        points = st.get("points", {})
+        axis_color = {
+            "+X": (255, 90, 90),
+            "+Y": (90, 220, 255),
+            "+Z": (120, 255, 120),
+        }
+        for axis_name in ["+X", "+Y", "+Z"]:
+            if axis_name not in points:
+                continue
+
+            pair = self._find_pair_for_selected_axis(pair_ctx, np.array(points[axis_name], dtype=float))
+            if pair is None:
+                continue
+
+            sel = np.array(points[axis_name], dtype=float)
+            p1 = np.array(pair["p1"], dtype=float)
+            p2 = np.array(pair["p2"], dtype=float)
+            if np.linalg.norm(p1 - sel) <= np.linalg.norm(p2 - sel):
+                head = tuple(np.array(p1, dtype=int).tolist())
+                tail = tuple(np.array(p2, dtype=int).tolist())
+            else:
+                head = tuple(np.array(p2, dtype=int).tolist())
+                tail = tuple(np.array(p1, dtype=int).tolist())
+
+            color = axis_color[axis_name]
+            cv2.line(img_rgb, tail, head, color, 3, cv2.LINE_AA)
+
+            tail_arr = np.array(tail, dtype=float)
+            head_arr = np.array(head, dtype=float)
+            vec = head_arr - tail_arr
+            vec_len = float(np.linalg.norm(vec))
+            if vec_len > 1e-6:
+                dir_vec = vec / vec_len
+                arrow_seg_len = min(24.0, 0.5 * vec_len)
+                arrow_start = head_arr - dir_vec * arrow_seg_len
+                arrow_start_i = tuple(np.array(np.round(arrow_start), dtype=int).tolist())
+                cv2.arrowedLine(img_rgb, arrow_start_i, head, color, 3, cv2.LINE_AA, tipLength=0.5)
+            cv2.putText(img_rgb, axis_name, (head[0] + 10, head[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+    def _draw_dashed_circle(self, img_rgb, center, radius, color, thickness):
+        if radius <= 0:
+            return
+        for start_deg in range(0, 360, 24):
+            end_deg = start_deg + 12
+            cv2.ellipse(img_rgb, center, (radius, radius), 0.0, float(start_deg), float(end_deg), color, thickness, cv2.LINE_AA)
+
+    def _pair_axis_endpoints_for_points(self, det_pts):
+        if det_pts is None or len(det_pts) == 0:
+            return {"pairs": [], "midpoints": [], "bins": np.array([], dtype=int), "pts": np.empty((0, 4), dtype=float)}
+
+        pts = np.array(det_pts, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] < 3:
+            return {"pairs": [], "midpoints": [], "bins": np.array([], dtype=int), "pts": np.empty((0, 4), dtype=float)}
+
+        radii = pts[:, 2]
+        order = np.argsort(radii)
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(len(order))
+        bins = np.floor(3.0 * ranks / max(1, len(order))).astype(int)
+        bins = np.clip(bins, 0, 2)
+
+        pairs = []
+        midpoints = []
+        unique_bins = sorted(set(int(v) for v in bins.tolist()))
+        for b in unique_bins:
+            idxs = np.where(bins == b)[0]
+            if len(idxs) < 2:
+                continue
+
+            best_i = None
+            best_j = None
+            best_dist = -1.0
+            for ii in range(len(idxs)):
+                for jj in range(ii + 1, len(idxs)):
+                    i = int(idxs[ii])
+                    j = int(idxs[jj])
+                    dist = float(np.linalg.norm(pts[i, :2] - pts[j, :2]))
+                    if dist > best_dist:
+                        best_dist = dist
+                        best_i, best_j = i, j
+
+            if best_i is None or best_j is None:
+                continue
+
+            p1 = pts[best_i, :2]
+            p2 = pts[best_j, :2]
+            mid = 0.5 * (p1 + p2)
+            pairs.append({"bin": b, "idx1": best_i, "idx2": best_j, "p1": p1, "p2": p2})
+            midpoints.append(mid)
+
+        return {"pairs": pairs, "midpoints": midpoints, "bins": bins, "pts": pts}
+
+    def _find_pair_for_selected_axis(self, pair_ctx, selected_xy):
+        pts = pair_ctx["pts"]
+        pairs = pair_ctx["pairs"]
+        bins = pair_ctx["bins"]
+        if len(pts) == 0 or len(pairs) == 0:
+            return None
+
+        d2 = np.sum((pts[:, :2] - selected_xy.reshape(1, 2)) ** 2, axis=1)
+        idx_sel = int(np.argmin(d2))
+        target_bin = int(bins[idx_sel]) if len(bins) > idx_sel else -1
+        for pair in pairs:
+            if int(pair["bin"]) == target_bin:
+                return pair
+        return None
+
+    def eventFilter(self, watched, event):
+        cam_idx_prop = watched.property("axis_cam_idx") if isinstance(watched, QPushButton) else None
+        if cam_idx_prop is not None and event.type() in (QEvent.Type.Enter, QEvent.Type.Leave):
+            cam_idx = int(cam_idx_prop)
+            if self._is_axis_selection_complete(cam_idx):
+                if event.type() == QEvent.Type.Enter:
+                    watched.setText("Reset")
+                else:
+                    watched.setText("Selected")
+            return False
+        return super().eventFilter(watched, event)
+
+    def _on_wand_axis_point_selected(self, pt, axis_idx, cam_idx):
+        if not hasattr(self, 'axis_select_state'):
+            return
+
+        state = self.axis_select_state.get(cam_idx)
+        if not state or not state.get("in_progress", False):
+            return
+
+        seq = ["+X", "+Y", "+Z"]
+        next_idx = int(state.get("next_idx", 0))
+        if next_idx >= len(seq):
+            return
+
+        img_idx = int(state.get("selected_image_idx", 0))
+        det_pts = self.axis_detected_points.get(cam_idx, {}).get(img_idx, np.empty((0, 4), dtype=float)) if hasattr(self, 'axis_detected_points') else np.empty((0, 4), dtype=float)
+
+        selected_pt = np.array([float(pt.x()), float(pt.y())], dtype=float)
+        if len(det_pts) > 0:
+            xy = np.array(det_pts[:, :2], dtype=float)
+            d2 = np.sum((xy - selected_pt.reshape(1, 2)) ** 2, axis=1)
+            best_i = int(np.argmin(d2))
+            selected_pt = xy[best_i]
+
+        axis_name = seq[next_idx]
+        points = dict(state.get("points", {}))
+        points[axis_name] = [float(selected_pt[0]), float(selected_pt[1])]
+        state["points"] = points
+        state["next_idx"] = next_idx + 1
+
+        lbl = self.cam_vis_labels.get(cam_idx)
+        if state["next_idx"] < len(seq):
+            if lbl:
+                lbl._current_axis_index = state["next_idx"]
+                lbl._hint_text = f"select {seq[state['next_idx']]}"
+                lbl.update()
+        else:
+            state["in_progress"] = False
+            if lbl:
+                lbl._hint_text = ""
+                lbl.set_mode(ZoomableImageLabel.MODE_NAV)
+
+        self.axis_select_state[cam_idx] = state
+        self._refresh_axis_select_button(cam_idx)
+        self._show_axis_image_for_cam(cam_idx)
+
+    def _compute_axis_output_for_cam(self, cam_idx):
+        state = self.axis_select_state.get(cam_idx, {}) if hasattr(self, 'axis_select_state') else {}
+        points = state.get("points", {})
+        if not all(k in points for k in ["+X", "+Y", "+Z"]):
+            return None
+
+        img_idx = int(state.get("selected_image_idx", 0))
+        det_pts = self.axis_detected_points.get(cam_idx, {}).get(img_idx, np.empty((0, 4), dtype=float)) if hasattr(self, 'axis_detected_points') else np.empty((0, 4), dtype=float)
+        if len(det_pts) < 3:
+            return None
+
+        pair_ctx = self._pair_axis_endpoints_for_points(det_pts)
+        if len(pair_ctx["pairs"]) < 1:
+            return None
+
+        out = {}
+        for axis_name in ["+X", "+Y", "+Z"]:
+            sel = np.array(points[axis_name], dtype=float)
+            pair = self._find_pair_for_selected_axis(pair_ctx, sel)
+            if pair is None:
+                return None
+            out[axis_name] = [float(sel[0]), float(sel[1])]
+
+        midpoints = pair_ctx["midpoints"]
+        if not midpoints:
+            return None
+        center = np.mean(np.array(midpoints, dtype=float), axis=0)
+        return {
+            "center": [float(center[0]), float(center[1])],
+            "+X": out["+X"],
+            "+Y": out["+Y"],
+            "+Z": out["+Z"],
+        }
 
     # --- Logic Implementation ---
 
@@ -4776,7 +5465,6 @@ class CameraCalibrationView(QWidget):
     def _sync_frozen_table_sort(self, logical_index, order):
         """Handle sort request by manually sorting and repopulating BOTH tables."""
         from PySide6.QtWidgets import QCheckBox, QWidget, QHBoxLayout
-        from PySide6.QtCore import Qt
         
         if not hasattr(self, 'wand_calibrator') or not hasattr(self.wand_calibrator, 'per_frame_errors'):
             return
