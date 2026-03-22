@@ -2773,8 +2773,10 @@ class WandCalibrator:
         # Save points for visualization
         self.points_3d = points_3d
         
-        # Parse results
-        self._parse_results(res.x, cam_id_map)
+        # Parse results using recentered camera parameters
+        params_consistent = res.x.copy()
+        params_consistent[:n_cam_params_total] = cam_params.reshape(-1)
+        self._parse_results(params_consistent, cam_id_map)
         self.params_dirty = True  # Mark new results as dirty
         
         # Explicitly attach metrics for UI (Fixes Error Table & RMS Display)
