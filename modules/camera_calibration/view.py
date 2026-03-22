@@ -5290,6 +5290,47 @@ class CameraCalibrationView(QWidget):
             
             # Update 3D Visualization and Error Table FIRST so user can see results in background
             self._update_3d_viz()
+
+            # Axis-direction world alignment (optional post-calibration step)
+            if getattr(self, 'axis_direction_map', None):
+                try:
+                    from modules.camera_calibration.wand_calibration.refractive_geometry import (
+                        align_world_to_axis_directions,
+                        triangulate_pinhole_landmarks,
+                    )
+
+                    # Build obs_by_landmark from axis_direction_map
+                    # axis_direction_map: {cam_id: {"center": [px,py], "+X": [px,py], "+Y": [px,py], "+Z": [px,py]}}
+                    obs_by_landmark = {"center": {}, "+X": {}, "+Y": {}, "+Z": {}}
+                    for cam_id, cam_data in self.axis_direction_map.items():
+                        for lm in ["center", "+X", "+Y", "+Z"]:
+                            if lm in cam_data:
+                                obs_by_landmark[lm][cam_id] = cam_data[lm]
+
+                    def _triangulate_fn(obs):
+                        return triangulate_pinhole_landmarks(obs, self.wand_calibrator.final_params)
+
+                    cam_params = self.wand_calibrator.final_params
+                    points_3d = self.wand_calibrator.points_3d if self.wand_calibrator.points_3d is not None else []
+
+                    success_align, R_world, t_shift, aligned_state = align_world_to_axis_directions(
+                        axis_direction_map=self.axis_direction_map,
+                        triangulate_fn=_triangulate_fn,
+                        cam_params=cam_params,
+                        points_3d=points_3d,
+                    )
+
+                    if success_align and aligned_state is not None:
+                        self.wand_calibrator.final_params = aligned_state["cam_params"]
+                        if aligned_state.get("points_3d") is not None:
+                            self.wand_calibrator.points_3d = aligned_state["points_3d"]
+                        print("[Axis Alignment] World coordinate alignment applied successfully.")
+                        self._update_3d_viz()
+                    else:
+                        print("[Axis Alignment] Alignment failed or skipped; original calibration state preserved.")
+                except Exception as _ax_err:
+                    print(f"[Axis Alignment] Error during post-calibration alignment: {_ax_err}")
+
             self._populate_error_table()
             
             # If Pre-calibration, SKIP save prompt

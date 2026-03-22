@@ -223,3 +223,71 @@ def test_triangulate_pinhole_landmarks_happy():
         assert pt.shape == (3,)
         assert np.isfinite(pt).all()
         assert np.linalg.norm(pt - gt_landmarks[lm]) < 1.0
+
+
+def test_pinhole_alignment_roundtrip():
+    """Round-trip pinhole alignment path: triangulate landmarks then align world frame."""
+    K_list, R_list, T_list, points_3d = generate_synthetic_pinhole_setup(num_cams=2, num_points=12)
+
+    landmark_3d = {
+        "center": np.array([0.0, 0.0, 0.0], dtype=np.float64),
+        "+X": np.array([0.2, 0.0, 0.0], dtype=np.float64),
+        "+Y": np.array([0.0, 0.2, 0.0], dtype=np.float64),
+        "+Z": np.array([0.0, 0.0, 0.2], dtype=np.float64),
+    }
+
+    axis_direction_map = {}
+    for cam_id in range(2):
+        cam_landmarks = {}
+        for lm_name, pt3d in landmark_3d.items():
+            uv = project_points(K_list[cam_id], R_list[cam_id], T_list[cam_id], pt3d.reshape(1, 3))
+            cam_landmarks[lm_name] = uv[0].tolist()
+        axis_direction_map[cam_id] = cam_landmarks
+
+    cam_params_dict = {
+        cam_id: {
+            "K": K_list[cam_id],
+            "R": R_list[cam_id],
+            "T": T_list[cam_id],
+            "dist": np.zeros(2, dtype=np.float64),
+        }
+        for cam_id in range(2)
+    }
+
+    # align_world_to_axis_directions -> apply_coordinate_rotation expects flattened
+    # pinhole camera vectors: [rvec(3), tvec(3), f, cx, cy, k1, k2]
+    cam_params_for_align = {}
+    for cam_id in range(2):
+        rvec, _ = cv2.Rodrigues(R_list[cam_id])
+        tvec = T_list[cam_id].reshape(3)
+        fx = float(K_list[cam_id][0, 0])
+        cx = float(K_list[cam_id][0, 2])
+        cy = float(K_list[cam_id][1, 2])
+        cam_params_for_align[cam_id] = np.array(
+            [rvec[0, 0], rvec[1, 0], rvec[2, 0], tvec[0], tvec[1], tvec[2], fx, cx, cy, 0.0, 0.0],
+            dtype=np.float64,
+        )
+
+    obs_by_landmark = {"center": {}, "+X": {}, "+Y": {}, "+Z": {}}
+    for cam_id, cam_data in axis_direction_map.items():
+        for lm in ["center", "+X", "+Y", "+Z"]:
+            obs_by_landmark[lm][cam_id] = cam_data[lm]
+
+    triangulated = triangulate_pinhole_landmarks(obs_by_landmark, cam_params_dict)
+    assert set(triangulated.keys()) == {"center", "+X", "+Y", "+Z"}
+
+    def _triangulate_fn(obs):
+        return triangulate_pinhole_landmarks(obs, cam_params_dict)
+
+    success, R_new, t_shift, aligned_state = align_world_to_axis_directions(
+        axis_direction_map=axis_direction_map,
+        triangulate_fn=_triangulate_fn,
+        cam_params=cam_params_for_align,
+        points_3d=points_3d,
+    )
+
+    assert success is True
+    assert R_new is not None
+    assert t_shift is not None
+    assert isinstance(aligned_state, dict)
+    assert isinstance(aligned_state.get("cam_params"), dict)
