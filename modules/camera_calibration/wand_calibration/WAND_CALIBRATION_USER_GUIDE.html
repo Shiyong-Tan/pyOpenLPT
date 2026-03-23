@@ -165,6 +165,23 @@
             the final calibration run.</p>
 
         <div class="step-block">
+            <h3>Axis Calibrator (Endpoint Sizes)</h3>
+            <img src="axis_calibrator_endpoint_sizes.png" alt="Axis Calibrator Endpoint Size Groups">
+            <p>Use an axis calibrator with three endpoint-size groups (small, medium, and large), with one opposite
+                endpoint pair per axis.</p>
+            <p>How the axis-point workflow uses these endpoint sizes:</p>
+            <ul>
+                <li>The <strong>Detect</strong> step finds circular endpoints and estimates each circle radius in
+                    pixels.</li>
+                <li>Detected points are grouped into three size bins based on radius ranking.</li>
+                <li>In each size bin, the farthest two points are treated as one axis endpoint pair.</li>
+                <li>The world-frame <strong>center</strong> is computed as the mean of the three pair midpoints.</li>
+                <li>When you select <strong>+X</strong>, <strong>+Y</strong>, and <strong>+Z</strong>, each click snaps
+                    to the nearest detected endpoint, and the corresponding pair is used for that axis direction.</li>
+            </ul>
+        </div>
+
+        <div class="step-block">
             <h3>Step 4: Enable Custom Axis Direction</h3>
             <ol>
                 <li>In the <strong>Calibration</strong> sub-tab, locate the <strong>Axis direction</strong> setting.</li>

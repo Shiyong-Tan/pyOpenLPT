@@ -36,6 +36,19 @@ In the **Camera Images** table:
 
 If you want a physically meaningful world frame (origin and +X/+Y/+Z directions), define axis points before the final calibration run.
 
+### Axis Calibrator (Endpoint Sizes)
+
+![Axis Calibrator Endpoint Size Groups](axis_calibrator_endpoint_sizes.png)
+
+Use an axis calibrator with three endpoint-size groups (small, medium, and large), with one opposite endpoint pair per axis.
+
+How the axis-point workflow uses these endpoint sizes:
+- The **Detect** step finds circular endpoints and estimates each circle radius in pixels.
+- Detected points are grouped into three size bins based on radius ranking.
+- In each size bin, the farthest two points are treated as one axis endpoint pair.
+- The world-frame **center** is computed as the mean of the three pair midpoints.
+- When you select **+X**, **+Y**, and **+Z**, each click snaps to the nearest detected endpoint, and the corresponding pair is used for that axis direction.
+
 ### Step 4: Enable Custom Axis Direction
 1.  In the **Calibration** sub-tab, locate the **Axis direction** setting.
 2.  Switch from **Default** to **Custom**.
