@@ -5291,7 +5291,8 @@ class CameraCalibrationView(QWidget):
             # Update 3D Visualization and Error Table FIRST so user can see results in background
             self._update_3d_viz()
 
-            # Axis-direction world alignment (optional post-calibration step)
+            # NOTE: Axis alignment is applied post-calibration. It replaces final_params and points_3d
+            # with rigidly-transformed equivalents. Residuals computed above reflect pre-alignment frame.
             if getattr(self, 'axis_direction_map', None):
                 try:
                     from modules.camera_calibration.wand_calibration.refractive_geometry import (
@@ -5331,6 +5332,8 @@ class CameraCalibrationView(QWidget):
                 except Exception as _ax_err:
                     print(f"[Axis Alignment] Error during post-calibration alignment: {_ax_err}")
 
+            # NOTE: per_frame_errors reflect optimization residuals before axis alignment.
+            # They remain valid as calibration quality indicators but are not in the aligned frame.
             self._populate_error_table()
             
             # If Pre-calibration, SKIP save prompt
@@ -5367,7 +5370,11 @@ class CameraCalibrationView(QWidget):
         self._busy_end('wand_calibration')
 
     def _update_3d_viz(self):
-        """Update the 3D visualization with calibrated camera positions and wand points."""
+        """Update the 3D visualization with calibrated camera positions and wand points.
+
+        NOTE: Reads wand_calibrator.final_params which may have been axis-aligned post-calibration.
+        Per-frame residuals (per_frame_errors) are pre-alignment optimization metrics.
+        """
         import numpy as np
         
         if not hasattr(self, 'calib_3d_view'):
@@ -7656,7 +7663,8 @@ class CameraCalibrationView(QWidget):
             except Exception as e:
                 print(f"[Refractive] Visualization Error: {e}")
 
-            # Axis-direction world alignment for refractive mode (optional post-calibration)
+            # NOTE: Axis alignment is applied post-calibration. It transforms _refr_final_cam_params,
+            # _refr_window_planes in place. Optimization residuals above reflect pre-alignment frame.
             if getattr(self, 'axis_direction_map', None):
                 try:
                     from modules.camera_calibration.wand_calibration.refractive_geometry import (
@@ -7719,6 +7727,8 @@ class CameraCalibrationView(QWidget):
                     print(f"[Axis Alignment] Error during post-refractive alignment: {_ax_err}")
             
             # Populate Error Analysis table (per_frame_errors was computed in calibrator)
+            # NOTE: per_frame_errors reflect optimization residuals before axis alignment.
+            # They remain valid as calibration quality indicators but are not in the aligned frame.
             try:
                 self._populate_error_table()
             except Exception as e:
