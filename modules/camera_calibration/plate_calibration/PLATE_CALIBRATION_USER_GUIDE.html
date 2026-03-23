@@ -99,6 +99,14 @@
             with an optional <strong>Pinhole+Refraction</strong> calibration workflow for refractive setups.
         </p>
 
+        <div class="highlight" style="border-left: 3px solid #00e676;">
+            <span class="important" style="color: #00e676;">Hardware Setup Recommendation:</span>
+            <p style="margin-top: 5px;"><strong>Non-coplanar Views:</strong> It is highly recommended that the viewing
+                axes of your cameras are <strong>NOT</strong> in the same plane. An angular difference of at least
+                <strong>5 degrees</strong> relative to the central plane significantly improves 3D reconstruction
+                accuracy.</p>
+        </div>
+
         <!-- Point Detection Section -->
         <h2>1. Point Detection</h2>
         <p>First, select the <strong>Plate Calibration</strong> tab and ensure you are on the <strong>Point
@@ -295,9 +303,9 @@
         <div class="highlight">
             <span class="important">Refraction Model Notes:</span>
             <p style="margin-top: 5px;">It is highly recommended to use <strong>2 or more cameras per refraction
-                    plate/window</strong> for better calibration robustness. If your camera viewing angle is nearly
-                normal to the refraction plate, it is still recommended to use the <strong>Pinhole</strong>
-                model.</p>
+                    plate/window</strong> for better calibration robustness. <strong>Multiple plates are
+                    recommended</strong> for better calibration results. If your camera viewing angle is nearly normal
+                to the refraction plate, it is still recommended to use the <strong>Pinhole</strong> model.</p>
         </div>
 
         <div class="step-block">

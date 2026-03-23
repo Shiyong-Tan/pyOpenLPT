@@ -2,6 +2,9 @@
 
 This guide walks you through the camera calibration process using a calibration wand in OpenLPT. The process consists of three main stages: **Point Detection**, **Axis Points & Coordinate Definition**, and **Calibration**.
 
+> [!TIP]
+> **Hardware Setup Recommendation:** **Non-coplanar Views** are strongly recommended. Keep camera viewing axes out of the same plane to improve stereo matching and 3D reconstruction reliability. If cameras must be nearly coplanar, try to keep at least a **5-degree** angular difference.
+
 ## 1. Point Detection
 
 First, select the **Wand Calibration** tab and ensure you are on the **Point Detection** sub-tab.
