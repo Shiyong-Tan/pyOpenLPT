@@ -809,7 +809,8 @@ def align_world_to_axis_directions(
         logger.warning("Axis alignment failed: SVD ill-conditioned (S=%s)", S)
         return False, None, None, None
 
-    R_new = U @ Vt
+    # .T inverts M (canonical->detected) to get R (old->new frame)
+    R_new = (U @ Vt).T
 
     # Ensure right-handed system (det = +1)
     det = np.linalg.det(R_new)
@@ -817,7 +818,7 @@ def align_world_to_axis_directions(
     if det < 0:
         U_fix = U.copy()
         U_fix[:, -1] *= -1
-        R_new = U_fix @ Vt
+        R_new = (U_fix @ Vt).T
         det = np.linalg.det(R_new)
 
     if abs(det - 1.0) > 1e-6:
