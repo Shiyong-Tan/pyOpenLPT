@@ -713,28 +713,21 @@ class Calibration3DViewer(QWidget):
                         U_ax[:, -1] *= -1
                         R_orth = U_ax @ Vt_ax
                     corrected_dirs = [
-                        (map_point(R_orth[:, 0]), '#ff4040', '+X', '#ff8080'),
-                        (map_point(R_orth[:, 1]), '#40ff40', '+Y', '#80ff80'),
-                        (map_point(R_orth[:, 2]), '#4da6ff', '+Z', '#80c0ff'),
-                    ]
-                else:
-                    # Fallback: hard-coded canonical axes when landmarks are degenerate
-                    corrected_dirs = [
-                        (map_point(np.array([1.0, 0.0, 0.0])), '#ff4040', '+X', '#ff8080'),
-                        (map_point(np.array([0.0, 1.0, 0.0])), '#40ff40', '+Y', '#80ff80'),
-                        (map_point(np.array([0.0, 0.0, 1.0])), '#4da6ff', '+Z', '#80c0ff'),
+                        (R_orth[:, 0], '#ff4040', '+X', '#ff8080'),
+                        (R_orth[:, 1], '#40ff40', '+Y', '#80ff80'),
+                        (R_orth[:, 2], '#4da6ff', '+Z', '#80c0ff'),
                     ]
 
-                # Draw corrected axes first (solid), then measured on top (dashed)
-                # so the angular deviation between them is always visible.
-                for direction, color, label, label_color in corrected_dirs:
-                    tip = center + direction * axis_line_len
-                    self.ax.plot3D(
-                        [center[0], tip[0]], [center[1], tip[1]], [center[2], tip[2]],
-                        color=color, linewidth=1.5, alpha=0.95
-                    )
-                    self.ax.text(tip[0], tip[1], tip[2], f' {label}',
-                                 color=label_color, fontsize=9)
+                    # Draw corrected axes first (solid), then measured on top
+                    # (dashed) so angular deviation remains visible.
+                    for direction, color, label, label_color in corrected_dirs:
+                        tip = center + direction * axis_line_len
+                        self.ax.plot3D(
+                            [center[0], tip[0]], [center[1], tip[1]], [center[2], tip[2]],
+                            color=color, linewidth=1.5, alpha=0.95
+                        )
+                        self.ax.text(tip[0], tip[1], tip[2], f' {label}',
+                                     color=label_color, fontsize=9)
 
                 # Draw measured center->landmark directions (dashed) extended
                 # to the same length as the corrected solid lines so that
