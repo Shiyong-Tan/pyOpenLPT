@@ -95,7 +95,8 @@
     <div class="container">
         <h1>Wand Calibration User Guide</h1>
         <p>This guide walks you through the camera calibration process using a calibration wand in OpenLPT. The process
-            consists of two main stages: <strong>Point Detection</strong> and <strong>Calibration</strong>.</p>
+            consists of three main stages: <strong>Point Detection</strong>, <strong>Axis Points & Coordinate
+                Definition</strong>, and <strong>Calibration</strong>.</p>
 
         <div class="highlight">
             <span class="important">Note on Refracted Interfaces:</span>
@@ -158,15 +159,71 @@
 
         <hr style="border-color: #444; margin: 40px 0;">
 
+        <!-- Axis Points and Coordinate Definition Section -->
+        <h2>2. Axis Points & Coordinate Definition (Optional but Recommended)</h2>
+        <p>If you want a physically meaningful world frame (origin and +X/+Y/+Z directions), define axis points before
+            the final calibration run.</p>
+
+        <div class="step-block">
+            <h3>Step 4: Enable Custom Axis Direction</h3>
+            <ol>
+                <li>In the <strong>Calibration</strong> sub-tab, locate the <strong>Axis direction</strong> setting.</li>
+                <li>Switch from <strong>Default</strong> to <strong>Custom</strong>.</li>
+                <li>A per-camera axis workflow becomes available (axis image loading, detection, and point selection).</li>
+            </ol>
+        </div>
+
+        <div class="step-block">
+            <h3>Step 5: Load Axis Images and Detect Candidate Points</h3>
+            <ol>
+                <li>For each camera, load one or more axis-reference images (the images that show your axis target).</li>
+                <li>Click <strong>Detect</strong> to run reliable circle detection on the loaded axis images.</li>
+                <li>Verify that the detected circles are reasonable before selection.</li>
+            </ol>
+            <div class="highlight">
+                <strong>Tip:</strong> If too few circles are detected, adjust <strong>Radius Range</strong> and
+                <strong>Sensitivity</strong>, then run <strong>Detect</strong> again.
+            </div>
+        </div>
+
+        <div class="step-block">
+            <h3>Step 6: Select +X, +Y, +Z for Each Camera and Save</h3>
+            <ol>
+                <li>For each camera row, click <strong>Select</strong> and then click points in order:
+                    <strong>+X</strong>, <strong>+Y</strong>, <strong>+Z</strong>.</li>
+                <li>The tool computes <strong>center</strong> automatically from the detected axis pairs.</li>
+                <li>When all cameras are complete, click <strong>Save</strong> to store axis direction data.</li>
+                <li>To reuse previous selections, click <strong>Load Axis Points (Optional)</strong> and import the CSV.</li>
+            </ol>
+        </div>
+
+        <div class="step-block">
+            <h3>Step 7: Use Axis Points to Define the World Coordinate Frame</h3>
+            <ol>
+                <li>Click <strong>Precalibrate to Check</strong> (or run full calibration) after axis points are set.</li>
+                <li>The system triangulates <strong>center</strong>, <strong>+X</strong>, <strong>+Y</strong>, and
+                    <strong>+Z</strong> across cameras and applies world-frame alignment automatically.</li>
+                <li>Verify in the 3D view:
+                    <ul>
+                        <li>Axis landmarks (center, +X, +Y, +Z) are shown.</li>
+                        <li>Dashed lines show measured landmark directions.</li>
+                        <li>Solid lines show corrected orthonormal axes used for world coordinates.</li>
+                    </ul>
+                </li>
+            </ol>
+        </div>
+
+        <hr style="border-color: #444; margin: 40px 0;">
+
         <!-- Calibration Section -->
-        <h2>2. Calibration</h2>
+        <h2>3. Calibration</h2>
         <p>After extracting points, switch to the <strong>Calibration</strong> sub-tab.</p>
 
         <!-- Updated Image -->
         <img src="wand_calibration_ui_v2.png" alt="Calibration Interface">
 
         <div class="step-block">
-            <h3>Step 4: Calibration Settings</h3>
+            <h3>Step 8: Calibration Settings</h3>
             <p>Configure the physical model in <strong>Calibration Settings</strong>:</p>
             <ul>
                 <li><strong>Camera Model</strong>: Select <strong>Pinhole</strong> (standard).</li>
@@ -181,7 +238,7 @@
 
         <!-- NEW Step: Precalibration -->
         <div class="step-block">
-            <h3>Step 5: Precalibration & Data Cleaning</h3>
+            <h3>Step 9: Precalibration & Data Cleaning</h3>
             <p>Before running the full optimization, it is crucial to clean your data to remove outliers (errors in
                 detection).</p>
             <ol>
@@ -215,7 +272,7 @@
         </div>
 
         <div class="step-block">
-            <h3>Step 6: Run Full Calibration</h3>
+            <h3>Step 10: Run Full Calibration</h3>
             <ol>
                 <li>Click the blue <strong>Run Calibration</strong> button.</li>
                 <li>The system will perform the final Bundle Adjustment (BA) with 4-stage optimization (Geometry Init ->
@@ -226,7 +283,7 @@
         </div>
 
         <div class="step-block">
-            <h3>Step 7: Final Analysis</h3>
+            <h3>Step 11: Final Analysis</h3>
             <p>Review the final results in the <strong>Error Analysis</strong> table:</p>
             <ul>
                 <li><strong>Reprojection Error</strong>: Should be very low (e.g., &lt; 0.5 px).</li>
@@ -237,14 +294,14 @@
                 <ul>
                     <li>If the process takes too long or results look wrong, click the <strong>Stop</strong> button to
                         get partial results.</li>
-                    <li>If errors are still high, perform another round of cleaning (Step 5) or adjust the <em>Wand
+                    <li>If errors are still high, perform another round of cleaning (Step 9) or adjust the <em>Wand
                             Length</em> setting.</li>
                 </ul>
             </div>
         </div>
 
         <div class="step-block">
-            <h3>Step 8: Save Results</h3>
+            <h3>Step 12: Save Results</h3>
             <p>When the "Calibration Successful" message appears, your parameters are ready. You can save the intrinsic
                 and extrinsic parameters to file for use in tracking.</p>
         </div>
