@@ -625,7 +625,7 @@ class Calibration3DViewer(QWidget):
         
         # 1. Plot Wand Points (Blue)
         if points_3d is not None and len(points_3d) > 0:
-            pts = points_3d / scale
+            pts = np.asarray(points_3d) / scale
             if axis_map == 'y_up':
                 pts = pts[:, [0, 2, 1]]
             xs = pts[:, 0]
@@ -734,7 +734,7 @@ class Calibration3DViewer(QWidget):
             
             # Collect 3D point positions
             if points_3d is not None and len(points_3d) > 0:
-                pts_m = points_3d / scale
+                pts_m = np.asarray(points_3d) / scale
                 pts_center = np.mean(pts_m, axis=0)
                 pts_min = np.min(pts_m, axis=0)
                 pts_max = np.max(pts_m, axis=0)
@@ -745,7 +745,7 @@ class Calibration3DViewer(QWidget):
             
             # Reference point (mean of points if available, otherwise origin)
             if points_3d is not None and len(points_3d) > 0:
-                pts_m = points_3d / scale
+                pts_m = np.asarray(points_3d) / scale
                 x_ref = np.mean(pts_m, axis=0)
             else:
                 x_ref = np.zeros(3)
@@ -755,7 +755,7 @@ class Calibration3DViewer(QWidget):
             if cam_positions:
                 bbox_sources.extend(cam_positions.values())
             if points_3d is not None and len(points_3d) > 0:
-                bbox_sources.extend((points_3d / scale).tolist())
+                bbox_sources.extend((np.asarray(points_3d) / scale).tolist())
             else:
                 bbox_sources.append(x_ref)
 
@@ -1377,7 +1377,7 @@ class CameraCalibrationView(QWidget):
             "Load 2D axis-direction points from CSV for post-calibration world alignment.\n"
             "CSV format: cam_id, center_x, center_y, plus_x_x, plus_x_y, plus_y_x, plus_y_y, plus_z_x, plus_z_y"
         )
-        self.btn_load_axis_csv.clicked.connect(self._load_axis_points_csv)
+        self.btn_load_axis_csv.clicked.connect(lambda checked=False: self._load_axis_points_csv())
         cal_layout.addWidget(self.btn_load_axis_csv)
         
         # Precalibrate Check
@@ -1586,10 +1586,17 @@ class CameraCalibrationView(QWidget):
 
         CSV schema: cam_id, center_x, center_y, plus_x_x, plus_x_y, plus_y_x, plus_y_y, plus_z_x, plus_z_y
         """
+        if not isinstance(file_path, (str, os.PathLike, type(None))):
+            file_path = None
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"_load_axis_points_csv called with file_path={file_path!r} (type={type(file_path).__name__})")
         if file_path is None:
+            logger.info("Opening file dialog for axis direction CSV...")
             file_path, _ = QFileDialog.getOpenFileName(
                 self, "Load Axis Points CSV", "", "CSV Files (*.csv)"
             )
+            logger.info(f"File dialog returned: {file_path!r}")
             if not file_path:
                 return
 
@@ -1617,6 +1624,11 @@ class CameraCalibrationView(QWidget):
         self.axis_direction_map = axis_direction_map
         if hasattr(self, "btn_load_axis_csv"):
             self.btn_load_axis_csv.setEnabled(False)
+        QMessageBox.information(
+            self,
+            "Axis Points Loaded",
+            f"Successfully loaded axis points for {len(axis_direction_map)} camera(s).",
+        )
 
     def __init__(self):
         super().__init__()
@@ -1678,6 +1690,7 @@ class CameraCalibrationView(QWidget):
         self.plate_refraction_settings = {}  # Per-camera UI-only refraction settings
         self.plate_intrinsics_settings = {}  # Per-camera intrinsic UI settings for refraction mode
         self.plate_image_size_hints = {}  # {cam_idx: (width, height)} from loaded plate images
+        self.axis_direction_map = {}  # {cam_idx: {"center":[x,y], "+X":[x,y], "+Y":[x,y], "+Z":[x,y]}}
         self._plate_intrinsics_autofilled_once = set()  # cam_idx set; do not auto-overwrite after first fill
         
         # New: Tracking for indexed points across images
@@ -5294,6 +5307,8 @@ class CameraCalibrationView(QWidget):
             # NOTE: Axis alignment is applied post-calibration. It replaces final_params and points_3d
             # with rigidly-transformed equivalents. Residuals computed above reflect pre-alignment frame.
             if getattr(self, 'axis_direction_map', None):
+                import logging as _logging
+                _ax_logger = _logging.getLogger(__name__)
                 try:
                     import numpy as _np
                     from modules.camera_calibration.wand_calibration.refractive_geometry import (
@@ -5349,14 +5364,20 @@ class CameraCalibrationView(QWidget):
                         if points_3d is not None and len(points_3d) > 0:
                             pts = _np.asarray(points_3d).reshape(-1, 3)
                             pts_new = (R_world @ (pts + t_shift).T).T
-                            self.wand_calibrator.points_3d = pts_new.tolist()
+                            self.wand_calibrator.points_3d = pts_new
 
                         print("[Axis Alignment] World coordinate alignment applied successfully.")
                         self._update_3d_viz()
                     else:
                         print("[Axis Alignment] Alignment failed or skipped; original calibration state preserved.")
                 except Exception as _ax_err:
-                    print(f"[Axis Alignment] Error during post-calibration alignment: {_ax_err}")
+                    _ax_logger.warning(
+                        "[Axis Alignment] Error during post-calibration "
+                        "alignment: %s", _ax_err,
+                        exc_info=True,
+                    )
+                    _ax_logger.info("[Axis Alignment] Showing original calibration data instead.")
+                    self._update_3d_viz()  # Display pre-alignment 3D state on error
 
             # NOTE: per_frame_errors reflect optimization residuals before axis alignment.
             # They remain valid as calibration quality indicators but are not in the aligned frame.
