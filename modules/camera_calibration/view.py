@@ -587,7 +587,7 @@ class Calibration3DViewer(QWidget):
         
         self.canvas.draw()
         
-    def plot_calibration(self, cameras, points_3d=None, axis_map: str = None):
+    def plot_calibration(self, cameras, points_3d=None, axis_map: str = None, axis_landmarks_3d=None):
         """Plot cameras and points in 3D (MATLAB style)."""
         self.ax.clear()
         
@@ -623,6 +623,8 @@ class Calibration3DViewer(QWidget):
         
         all_x, all_y, all_z = [], [], []
         
+        point_cloud_extent_m = None
+
         # 1. Plot Wand Points (Blue)
         if points_3d is not None and len(points_3d) > 0:
             pts = np.asarray(points_3d) / scale
@@ -635,6 +637,8 @@ class Calibration3DViewer(QWidget):
             all_x.extend(xs)
             all_y.extend(ys)
             all_z.extend(zs)
+            if len(pts) > 1:
+                point_cloud_extent_m = float(max(np.ptp(xs), np.ptp(ys), np.ptp(zs)))
         
         # Collect camera positions first
         camera_data = []
@@ -650,7 +654,76 @@ class Calibration3DViewer(QWidget):
                     all_x.append(C[0])
                     all_y.append(C[1])
                     all_z.append(C[2])
-        
+
+        # 2. Plot Axis Landmarks and Direction Vectors (if available)
+        if isinstance(axis_landmarks_3d, dict) and all(k in axis_landmarks_3d for k in ('center', '+X', '+Y', '+Z')):
+            try:
+                center = np.asarray(axis_landmarks_3d['center'], dtype=float).reshape(3) / scale
+                pt_x = np.asarray(axis_landmarks_3d['+X'], dtype=float).reshape(3) / scale
+                pt_y = np.asarray(axis_landmarks_3d['+Y'], dtype=float).reshape(3) / scale
+                pt_z = np.asarray(axis_landmarks_3d['+Z'], dtype=float).reshape(3) / scale
+
+                center = map_point(center)
+                pt_x = map_point(pt_x)
+                pt_y = map_point(pt_y)
+                pt_z = map_point(pt_z)
+
+                # Add landmarks into bounds calculation
+                for p in (center, pt_x, pt_y, pt_z):
+                    all_x.append(p[0])
+                    all_y.append(p[1])
+                    all_z.append(p[2])
+
+                # Plot center and axis points
+                self.ax.scatter(center[0], center[1], center[2], c='white', s=70, marker='o',
+                                edgecolors='white', linewidths=1.2, alpha=0.95)
+                self.ax.scatter(pt_x[0], pt_x[1], pt_x[2], c='#ff4040', s=50, marker='o', alpha=0.95)
+                self.ax.scatter(pt_y[0], pt_y[1], pt_y[2], c='#40ff40', s=50, marker='o', alpha=0.95)
+                self.ax.scatter(pt_z[0], pt_z[1], pt_z[2], c='#4da6ff', s=50, marker='o', alpha=0.95)
+
+                self.ax.text(center[0], center[1], center[2], ' Center', color='white', fontsize=9)
+
+                # Draw direction lines using canonical world axes (not noisy
+                # landmark vectors) so lines align perfectly with world axes.
+                # Target length: ~1.5x wand cloud size (user requested).
+                if point_cloud_extent_m is None or point_cloud_extent_m < 1e-9:
+                    landmark_extent = max(
+                        np.linalg.norm(pt_x - center),
+                        np.linalg.norm(pt_y - center),
+                        np.linalg.norm(pt_z - center),
+                    )
+                    point_cloud_extent_m = max(landmark_extent * 2.0, 0.1)
+                axis_line_len = 1.5 * point_cloud_extent_m
+
+                # Keep measured center->landmark directions for comparison
+                # (dashed), and draw corrected canonical axes as solid lines.
+                measured_dirs = [
+                    (pt_x, '#ff4040'),
+                    (pt_y, '#40ff40'),
+                    (pt_z, '#4da6ff'),
+                ]
+                for p_end, color in measured_dirs:
+                    self.ax.plot3D(
+                        [center[0], p_end[0]], [center[1], p_end[1]], [center[2], p_end[2]],
+                        color=color, linewidth=1.0, linestyle='--', alpha=0.9
+                    )
+
+                canonical_dirs = [
+                    (map_point(np.array([1.0, 0.0, 0.0])), '#ff4040', '+X', '#ff8080'),
+                    (map_point(np.array([0.0, 1.0, 0.0])), '#40ff40', '+Y', '#80ff80'),
+                    (map_point(np.array([0.0, 0.0, 1.0])), '#4da6ff', '+Z', '#80c0ff'),
+                ]
+                for direction, color, label, label_color in canonical_dirs:
+                    tip = center + direction * axis_line_len
+                    self.ax.plot3D(
+                        [center[0], tip[0]], [center[1], tip[1]], [center[2], tip[2]],
+                        color=color, linewidth=1.5, alpha=0.95
+                    )
+                    self.ax.text(tip[0], tip[1], tip[2], f' {label}',
+                                 color=label_color, fontsize=9)
+            except Exception as e:
+                print(f"[Viz] Axis landmark overlay error: {e}")
+
         # True axis equal (like MATLAB's axis equal) - same physical scale
         max_range = 0.5  # default
         if all_x and all_y and all_z:
@@ -683,7 +756,7 @@ class Calibration3DViewer(QWidget):
         
         self.canvas.draw()
         
-    def plot_refractive(self, cameras, window_planes, points_3d=None):
+    def plot_refractive(self, cameras, window_planes, points_3d=None, axis_landmarks_3d=None):
         """Plot refractive calibration results (Cameras + Points + Window Planes)."""
         # Ensure cameras have 'R' and 'T' keys (convert from rvec/tvec if needed)
         import cv2
@@ -712,7 +785,12 @@ class Calibration3DViewer(QWidget):
 
         
         # First plot standard elements (cameras + points)
-        self.plot_calibration(converted_cams, points_3d, axis_map='y_up')
+        self.plot_calibration(
+            converted_cams,
+            points_3d,
+            axis_map='y_up',
+            axis_landmarks_3d=axis_landmarks_3d,
+        )
         
         # Now add window planes (positioned between cameras and 3D points)
         scale = 1000.0  # mm -> m
@@ -1684,6 +1762,7 @@ class CameraCalibrationView(QWidget):
         self._refr_proj_err_stats = {}
         self._refr_tri_err_stats = {}
         self._refr_use_proj_residuals = False
+        self._axis_landmarks_3d = None
         self.plate_cam_labels = {} # Map {cam_idx: ZoomableImageLabel}
         self.plate_3d_viewer = Calibration3DViewer() # Init 3D viewer for plate
         self.all_camera_params = {} # Accumulate calibrated camera params {cam_idx: {...}}
@@ -5300,6 +5379,7 @@ class CameraCalibrationView(QWidget):
         
         if success:
             self.status_label.setText("Calibration Successful!")
+            self._axis_landmarks_3d = None
             
             # Update 3D Visualization and Error Table FIRST so user can see results in background
             self._update_3d_viz()
@@ -5366,11 +5446,20 @@ class CameraCalibrationView(QWidget):
                             pts_new = (R_world @ (pts + t_shift).T).T
                             self.wand_calibrator.points_3d = pts_new
 
+                        # Store aligned axis landmarks for 3D overlay
+                        axis_landmarks_new = {}
+                        for lm, pt in landmark_3d.items():
+                            p_old = _np.asarray(pt).reshape(3,)
+                            axis_landmarks_new[lm] = (R_world @ (p_old + t_shift)).reshape(3,)
+                        self._axis_landmarks_3d = axis_landmarks_new
+
                         print("[Axis Alignment] World coordinate alignment applied successfully.")
                         self._update_3d_viz()
                     else:
+                        self._axis_landmarks_3d = None
                         print("[Axis Alignment] Alignment failed or skipped; original calibration state preserved.")
                 except Exception as _ax_err:
+                    self._axis_landmarks_3d = None
                     _ax_logger.warning(
                         "[Axis Alignment] Error during post-calibration "
                         "alignment: %s", _ax_err,
@@ -5444,7 +5533,11 @@ class CameraCalibrationView(QWidget):
             pass
             
         # Plot
-        self.calib_3d_view.plot_calibration(cameras, points_3d)
+        self.calib_3d_view.plot_calibration(
+            cameras,
+            points_3d,
+            axis_landmarks_3d=getattr(self, '_axis_landmarks_3d', None),
+        )
         
         # Switch to 3D Tab
         if hasattr(self, 'vis_tabs'):
@@ -7690,6 +7783,7 @@ class CameraCalibrationView(QWidget):
                 # Add window planes and 3D points
                 # 1. Extract Window Planes from report
                 win_planes = report.get('window_planes', {})
+                self._axis_landmarks_3d = None
                 
                 # 2. Extract 3D Points from dataset
                 pts_3d_list = dataset.get('points_3d', [])
@@ -7703,7 +7797,12 @@ class CameraCalibrationView(QWidget):
                         pts_3d = pts_3d[indices]
                 
                 if hasattr(self, 'calib_3d_view'):
-                    self.calib_3d_view.plot_refractive(cam_params, win_planes, pts_3d)
+                    self.calib_3d_view.plot_refractive(
+                        cam_params,
+                        win_planes,
+                        pts_3d,
+                        axis_landmarks_3d=self._axis_landmarks_3d,
+                    )
                     if hasattr(self, 'vis_tabs'):
                         self.vis_tabs.setCurrentIndex(1)
                     
@@ -7727,10 +7826,13 @@ class CameraCalibrationView(QWidget):
 
                     cams_cpp = getattr(self, '_refr_cams_cpp', None)
                     if not cams_cpp:
+                        self._axis_landmarks_3d = None
                         print("[Axis Alignment] Refractive C++ camera objects not available; alignment skipped.")
                     else:
+                        landmark_3d = triangulate_refractive_landmarks(obs_by_landmark, cams_cpp)
+
                         def _triangulate_fn(obs):
-                            return triangulate_refractive_landmarks(obs, cams_cpp)
+                            return landmark_3d
 
                         win_planes_for_align = self._refr_window_planes.copy() if self._refr_window_planes else {}
                         pts_3d_for_align = []
@@ -7751,11 +7853,19 @@ class CameraCalibrationView(QWidget):
                         )
 
                         if success_align and aligned_state is not None:
+                            import numpy as _np
                             self._refr_final_cam_params = aligned_state["cam_params"]
                             self._refr_window_planes = aligned_state.get("window_planes", win_planes_for_align)
+                            t_shift_arr = _np.asarray(t_shift).reshape(3,)
+
+                            axis_landmarks_new = {}
+                            for lm, pt in landmark_3d.items():
+                                p_old = _np.asarray(pt).reshape(3,)
+                                axis_landmarks_new[lm] = (R_world @ (p_old + t_shift_arr)).reshape(3,)
+                            self._axis_landmarks_3d = axis_landmarks_new
+
                             aligned_pts_3d = None
                             if aligned_state.get("points_3d"):
-                                import numpy as _np
                                 aligned_pts_3d = _np.array(aligned_state["points_3d"]).reshape(-1, 3)
                             print("[Axis Alignment] Refractive world coordinate alignment applied successfully.")
                             # Re-render 3D viewer with aligned state
@@ -7765,12 +7875,15 @@ class CameraCalibrationView(QWidget):
                                         self._refr_final_cam_params,
                                         self._refr_window_planes,
                                         aligned_pts_3d,
+                                        axis_landmarks_3d=self._axis_landmarks_3d,
                                     )
                             except Exception as _viz_err:
                                 print(f"[Axis Alignment] Re-visualization failed: {_viz_err}")
                         else:
+                            self._axis_landmarks_3d = None
                             print("[Axis Alignment] Refractive alignment failed or skipped; original state preserved.")
                 except Exception as _ax_err:
+                    self._axis_landmarks_3d = None
                     print(f"[Axis Alignment] Error during post-refractive alignment: {_ax_err}")
             
             # Populate Error Analysis table (per_frame_errors was computed in calibrator)
