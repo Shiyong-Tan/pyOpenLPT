@@ -95,7 +95,8 @@
     <div class="container">
         <h1>Plate Calibration User Guide</h1>
         <p>This guide walks you through the camera calibration process using a calibration plate (dot grid) in OpenLPT.
-            The process consists of two main stages: <strong>Point Detection</strong> and <strong>Calibration</strong>.
+            The process consists of two main stages: <strong>Point Detection</strong> and <strong>Calibration</strong>,
+            with an optional <strong>Pinhole+Refraction</strong> calibration workflow for refractive setups.
         </p>
 
         <div class="highlight">
@@ -283,6 +284,56 @@
                 <strong>Parameter File Format:</strong> The saved files are compatible with OpenLPT's tracking module
                 and contain camera matrix, distortion coefficients, rotation matrix, and translation vector.
             </div>
+        </div>
+
+        <hr style="border-color: #444; margin: 40px 0;">
+
+        <h2>3. Calibration Model: Pinhole + Refraction</h2>
+        <p>Use this model when refractive interfaces are non-negligible and you need to model camera-side medium,
+            window material/thickness, and object-side medium explicitly.</p>
+
+        <div class="highlight">
+            <span class="important">Refraction Model Notes:</span>
+            <p style="margin-top: 5px;">It is highly recommended to use <strong>2 or more cameras per refraction
+                    plate/window</strong> for better calibration robustness. If your camera viewing angle is nearly
+                normal to the refraction plate, it is still recommended to use the <strong>Pinhole</strong>
+                model.</p>
+        </div>
+
+        <div class="step-block">
+            <p style="text-align: center;">
+                <img src="refraction_settings_panel.png" alt="Refraction Settings Panel" style="max-width: 32%;">
+            </p>
+            <h3>Step 12: Select the Refraction Model</h3>
+            <ol>
+                <li>In <strong>Camera Settings</strong>, set <strong>Model</strong> to
+                    <strong>Pinhole+Refraction</strong>.</li>
+                <li>Verify image size, sensor pitch, and focal-length initialization for each camera.</li>
+            </ol>
+        </div>
+
+        <div class="step-block">
+            <h3>Step 13: Configure Refraction Settings</h3>
+            <ol>
+                <li>Set <strong>Number of Windows</strong>.</li>
+                <li>In <strong>Camera-Window Mapping</strong>, assign each camera to its corresponding window.</li>
+                <li>In <strong>Window Configuration</strong>, set media/material parameters for each layer:
+                    <ul>
+                        <li><strong>Camera side</strong> (e.g., Air, refractive index)</li>
+                        <li><strong>Window</strong> (material index and thickness)</li>
+                        <li><strong>Object side</strong> (e.g., Water, refractive index)</li>
+                    </ul>
+                </li>
+            </ol>
+        </div>
+
+        <div class="step-block">
+            <h3>Step 14: Run and Refine Calibration</h3>
+            <ol>
+                <li>Click <strong>Run Calibration</strong> and review residual errors.</li>
+                <li>Calibrate all cameras after verifying each camera's fit quality.</li>
+                <li>Save all camera parameters when results are stable.</li>
+            </ol>
         </div>
 
         <hr style="border-color: #444; margin: 40px 0;">
