@@ -4,334 +4,40 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Plate Calibration User Guide</title>
+    <title>Plate Calibration Guide Redirect</title>
+    <meta http-equiv="refresh" content="0; url=../../../modules/camera_calibration/plate_calibration/PLATE_CALIBRATION_USER_GUIDE.html">
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             line-height: 1.6;
             color: #e0e0e0;
             background-color: #1e1e1e;
-            max-width: 1000px;
+            max-width: 900px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 24px;
         }
 
-        h1 {
-            color: #00bcd4;
-            border-bottom: 2px solid #00bcd4;
-            padding-bottom: 10px;
-        }
-
-        h2 {
-            color: #4dd0e1;
-            margin-top: 40px;
-            border-bottom: 1px solid #333;
-            padding-bottom: 5px;
-        }
-
-        h3 {
-            color: #80deea;
-            margin-top: 25px;
-        }
-
-        img {
-            max-width: 100%;
-            border: 1px solid #444;
-            border-radius: 5px;
-            margin: 20px 0;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
-        }
-
-        .container {
+        .box {
             background-color: #252526;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
-        }
-
-        ul,
-        ol {
-            padding-left: 25px;
-        }
-
-        li {
-            margin-bottom: 8px;
-        }
-
-        strong {
-            color: #ffffff;
-        }
-
-        code {
-            background-color: #333;
-            padding: 2px 5px;
-            border-radius: 3px;
-            font-family: Consolas, monospace;
-            color: #ff9800;
-        }
-
-        .step-block {
-            margin-bottom: 20px;
-            padding-left: 15px;
-            border-left: 3px solid #00bcd4;
-        }
-
-        .highlight {
-            background-color: #2d2d30;
-            padding: 15px;
-            border-radius: 5px;
             border: 1px solid #3e3e42;
+            border-radius: 8px;
+            padding: 24px;
         }
 
-        .important {
-            color: #ff5252;
-            font-weight: bold;
-        }
-
-        a.back-link {
-            display: inline-block;
-            margin-bottom: 20px;
-            color: #00bcd4;
-            text-decoration: none;
-            font-weight: bold;
-        }
-
-        a.back-link:hover {
-            text-decoration: underline;
+        a {
+            color: #4dd0e1;
         }
     </style>
 </head>
 
 <body>
-
-    <div class="container">
-        <a href="../index.html" class="back-link">← Back to Home</a>
-        <h1>Plate Calibration User Guide</h1>
-        <p>This guide walks you through the camera calibration process using a calibration plate (dot grid) in OpenLPT.
-            The process consists of two main stages: <strong>Point Detection</strong> and <strong>Calibration</strong>.
+    <div class="box">
+        <h1>Plate Calibration Guide Moved</h1>
+        <p>This guide is now maintained in the module documentation.</p>
+        <p>If you are not redirected automatically, open:
+            <a href="../../../modules/camera_calibration/plate_calibration/PLATE_CALIBRATION_USER_GUIDE.html">PLATE_CALIBRATION_USER_GUIDE.html</a>
         </p>
-
-        <div class="highlight">
-            <span class="important">Note on Refracted Interfaces:</span>
-            <p style="margin-top: 5px;">The implemented calibration model assumes a homogeneous medium without
-                refractive interfaces. For experimental setups involving observation windows (e.g., glass or acrylic),
-                it is critical that the cameras are oriented as close to the surface normal (orthogonal) as possible.
-                Furthermore, it is assumed that the paraxial approximation is valid within the reconstructed volume
-                (i.e., small-angle observation) to maintain geometric accuracy.</p>
-        </div>
-
     </div>
-
-    <div class="highlight" style="border-left: 3px solid #00e676;">
-        <span class="important" style="color: #00e676;">Hardware Setup Recommendation:</span>
-        <p style="margin-top: 5px;"><strong>Non-coplanar Views:</strong> Similar to Wand Calibration, it is highly
-            recommended that the viewing axes of your cameras are <strong>NOT</strong> in the same plane. An angular
-            difference of at least <strong>5 degrees</strong> relative to the central plane significantly improves 3D
-            reconstruction accuracy.</p>
-    </div>
-
-    <!-- Point Detection Section -->
-    <h2>1. Point Detection</h2>
-    <p>First, select the <strong>Plate Calibration</strong> tab and ensure you are on the <strong>Point
-            Detection</strong> sub-tab.</p>
-
-    <img src="plate_point_detection.png" alt="Point Detection Interface">
-
-    <div class="step-block">
-        <h3>Step 1: Configure Camera Settings</h3>
-        <p>Set the camera parameters in the <strong>Camera Images</strong> panel:</p>
-        <ul>
-            <li><strong>Num Cameras</strong>: Enter the number of cameras in your setup (e.g., <code>3</code>).</li>
-            <li><strong>Target Camera</strong>: Select the camera you want to calibrate (e.g.,
-                <code>Camera 1</code>).
-            </li>
-        </ul>
-    </div>
-
-    <div class="step-block">
-        <h3>Step 2: Load Calibration Images</h3>
-        <ol>
-            <li>Click <strong>Open Files</strong> to select one or more calibration plate images for the target
-                camera.</li>
-            <li>Images will appear in the <strong>Frame List</strong> below.</li>
-            <li>Click on any frame to preview it in the left panel.</li>
-        </ol>
-    </div>
-
-    <div class="step-block">
-        <h3>Step 3: Configure Detection Settings</h3>
-        <p>In the <strong>Detection Settings</strong> panel:</p>
-        <ul>
-            <li><strong>Point Color</strong>: Choose <strong>Bright (Standard)</strong> for bright dots on dark
-                background,
-                or <strong>Dark</strong> for dark dots on bright background.</li>
-            <li><strong>Select Template</strong>: Click this button, then draw a rectangle around ONE dot in the
-                image.
-                This template will be used for template matching.</li>
-            <li><strong>Select Search ROI</strong> (Optional): Define a region of interest to limit the search area.
-            </li>
-            <li><strong>Match Threshold</strong>: Adjust the slider (default <code>0.70</code>). Lower values detect
-                more points but may include false positives.</li>
-        </ul>
-    </div>
-
-    <div class="step-block">
-        <h3>Step 4: Detect Points</h3>
-        <ol>
-            <li>Click <strong>Detect</strong> to run template matching on the current image.</li>
-            <li><em>Verification</em>: Look at the image view on the left. You should see <strong>green
-                    crosses</strong> marking all detected dots.</li>
-            <li>If detection is incorrect:
-                <ul>
-                    <li>Click <strong>Remove</strong> to clear all detected points.</li>
-                    <li>Adjust the <em>Match Threshold</em> or select a better template.</li>
-                </ul>
-            </li>
-            <li>Click <strong>Add</strong> to manually add individual points by clicking on the image.</li>
-        </ol>
-    </div>
-
-    <div class="step-block">
-        <h3>Step 5: Index Points (Assign 3D Coordinates)</h3>
-        <p>In the <strong>Indexing</strong> panel, assign world coordinates to detected points:</p>
-        <ol>
-            <li><strong>Set Origin</strong>: Click this button, then click on a detected point to mark it as the
-                origin (0, 0, 0).</li>
-            <li><strong>Fixed Axis</strong>: Select which axis is fixed for this plane:
-                <ul>
-                    <li><code>Z</code> fixed (default): For a horizontal plate at a known Z-plane.</li>
-                    <li><code>X</code> or <code>Y</code> fixed: For vertical plates.</li>
-                </ul>
-            </li>
-            <li><strong>Plane</strong>: Enter the value of the fixed axis (e.g., <code>0</code> for Z=0 plane).</li>
-            <li><strong>Set Axis Directions</strong>: Click this button, then click two points to define the
-                positive X and Y directions.
-                A hint will follow your mouse showing which axis to click.</li>
-            <li><strong>Index Points</strong>: Click to automatically assign indices to all detected points based on
-                the origin and axis directions.</li>
-        </ol>
-    </div>
-
-    <div class="step-block">
-        <h3>Step 6: Configure Physical Spacing</h3>
-        <p>Set the physical spacing between dots:</p>
-        <ul>
-            <li><strong>dx</strong>: Spacing in X direction (e.g., <code>10.00 mm</code>).</li>
-            <li><strong>dy</strong>: Spacing in Y direction (e.g., <code>10.00 mm</code>).</li>
-            <li><strong>dz</strong>: Spacing in Z direction (usually <code>0.00 mm</code> for flat plates).</li>
-        </ul>
-        <p>Click <strong>Check Position</strong> to verify the 3D world coordinates are correct by clicking on a
-            point.</p>
-    </div>
-
-    <div class="step-block">
-        <h3>Step 7: Add to Calibration Data</h3>
-        <ol>
-            <li>When satisfied with the indexing, click <strong>Add to Calibration Data</strong>.</li>
-            <li>Repeat Steps 2-7 for all calibration images and all cameras.</li>
-        </ol>
-        <div class="highlight">
-            <strong>Important:</strong> Each camera can have multiple images at different planes.
-            The more images you add, the more robust the calibration will be.
-        </div>
-    </div>
-
-    <hr style="border-color: #444; margin: 40px 0;">
-
-    <!-- Calibration Section -->
-    <h2>2. Calibration</h2>
-    <p>After adding points for all cameras, switch to the <strong>Calibration</strong> sub-tab.</p>
-
-    <img src="plate_calibration.png" alt="Calibration Interface">
-
-    <div class="step-block">
-        <h3>Step 8: Configure Camera Settings</h3>
-        <p>In the <strong>Camera Settings</strong> panel:</p>
-        <ul>
-            <li><strong>Target Camera</strong>: Select the camera to calibrate.</li>
-            <li><strong>Model</strong>: Choose <strong>Pinhole</strong> (standard camera model).</li>
-            <li><strong>Image Width/Height (px)</strong>: Verify the image resolution (e.g., <code>1280</code> x
-                <code>800</code>).
-            </li>
-            <li><strong>Sensor Width (mm/px)</strong>: Enter the sensor pixel pitch (e.g., <code>0.0200</code>
-                mm/px).</li>
-            <li><strong>Focal Length (mm)</strong>: Enter the lens focal length (e.g., <code>180.00 mm</code>).</li>
-            <li><strong>Distortion Coeffs Num</strong>: Number of distortion coefficients to optimize
-                (<code>0</code> for no distortion, <code>5</code> for full model).</li>
-        </ul>
-    </div>
-
-    <div class="step-block">
-        <h3>Step 9: Run Calibration</h3>
-        <ol>
-            <li>Click <strong>Run Calibration</strong>.</li>
-            <li>The system will perform a two-stage optimization:
-                <ul>
-                    <li>Stage 1: Estimate camera pose using <code>solvePnP</code>.</li>
-                    <li>Stage 2: Refine intrinsics and extrinsics using bundle adjustment.</li>
-                </ul>
-            </li>
-            <li>The <strong>3D View</strong> on the left will visualize the camera positions and calibration points.
-            </li>
-            <li>Check the <strong>Mean RMS Error</strong> in the Calibration Results section (should be &lt; 1.0 px
-                for good calibration).</li>
-        </ol>
-    </div>
-
-    <div class="step-block">
-        <h3>Step 10: Calibrate All Cameras</h3>
-        <ol>
-            <li>Change the <strong>Target Camera</strong> to the next camera.</li>
-            <li>Click <strong>Run Calibration</strong> again.</li>
-            <li>Repeat for all cameras.</li>
-            <li>The 3D View will accumulate all calibrated cameras, showing their relative positions.</li>
-        </ol>
-    </div>
-
-    <div class="step-block">
-        <h3>Step 11: Save Results</h3>
-        <ol>
-            <li>When all cameras are calibrated, click <strong>Save All Camera Parameters</strong>.</li>
-            <li>Select an output directory.</li>
-            <li>A <code>camFile</code> folder will be created containing:
-                <ul>
-                    <li><code>cam0.txt</code> - Camera 0 parameters</li>
-                    <li><code>cam1.txt</code> - Camera 1 parameters</li>
-                    <li><code>cam2.txt</code> - Camera 2 parameters</li>
-                    <li>...</li>
-                </ul>
-            </li>
-        </ol>
-        <div class="highlight">
-            <strong>Parameter File Format:</strong> The saved files are compatible with OpenLPT's tracking module
-            and contain camera matrix, distortion coefficients, rotation matrix, and translation vector.
-        </div>
-    </div>
-
-    <hr style="border-color: #444; margin: 40px 0;">
-
-    <h2>Troubleshooting</h2>
-    <div class="step-block">
-        <h3>High RMS Error</h3>
-        <ul>
-            <li>Check that all points are correctly indexed (no reversed axes).</li>
-            <li>Verify the physical spacing (dx, dy) is accurate.</li>
-            <li>Ensure the template matched the correct dots (not reflections or noise).</li>
-            <li>Add more images from different angles to improve calibration.</li>
-        </ul>
-    </div>
-
-    <div class="step-block">
-        <h3>Points Not Detected</h3>
-        <ul>
-            <li>Adjust the <strong>Match Threshold</strong> slider (lower = more detections).</li>
-            <li>Select a clearer template from a well-lit area of the image.</li>
-            <li>Change <strong>Point Color</strong> if dots are dark on bright background.</li>
-        </ul>
-    </div>
-
-    </div>
-
 </body>
 
 </html>

@@ -770,7 +770,7 @@ class VSCService:
             sampled = [sampled[i] for i in indices]
         
         return sampled
-    
+
     def _find_correspondences(self, sampled_points: List[Tuple]) -> List[dict]:
         """
         Find 2D correspondences for sampled 3D points by detecting in actual images.

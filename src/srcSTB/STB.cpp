@@ -623,10 +623,11 @@ void STB::runConvPhase(int frame, std::vector<Image> &img_list) {
     }
   }
 
-  bool skip_vsc = !has_active_pinhole ||
-                  (_obj_config->_vsc_param._camera_calibrated &&
-                   (!_obj_config->_vsc_param._enable_otf ||
-                    _obj_config->_vsc_param._otf_calibrated));
+  // bool skip_vsc = !has_active_pinhole ||
+  //                 (_obj_config->_vsc_param._camera_calibrated &&
+  //                  (!_obj_config->_vsc_param._enable_otf ||
+  //                   _obj_config->_vsc_param._otf_calibrated));
+  bool skip_vsc = true;
 
   bool is_accumulate_frame =
       (frame % _obj_config->_vsc_param._accumulate_interval == 0);
