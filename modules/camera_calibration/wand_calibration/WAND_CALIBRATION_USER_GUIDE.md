@@ -139,6 +139,9 @@ When the "Calibration Successful" message appears, your parameters are ready. Yo
 
 Use this model when refractive interfaces are non-negligible and you need to model camera-side medium, window material/thickness, and object-side medium explicitly.
 
+> [!IMPORTANT]
+> **Refraction Model Notes:** It is highly recommended to use **2 or more cameras per refraction plate/window** for better calibration robustness. If your camera viewing angle is nearly normal to the refraction plate, it is still recommended to use the **Pinhole** model.
+
 <p align="center">
   <img src="refraction_settings_panel.png" alt="Refraction Settings Panel" width="32%" />
 </p>
@@ -159,8 +162,3 @@ Use this model when refractive interfaces are non-negligible and you need to mod
 1. Click **Precalibrate to Check** for data cleaning and outlier removal.
 2. Iterate filtering based on error metrics.
 3. Click **Run Calibration** for final optimization with refraction enabled.
-
-### Step 16: Refraction Model Notes
-
-> [!IMPORTANT]
-> **Refraction Model Notes:** It is highly recommended to use **2 or more cameras per refraction plate/window** for better calibration robustness. If your camera viewing angle is nearly normal to the refraction plate, it is still recommended to use the **Pinhole** model.

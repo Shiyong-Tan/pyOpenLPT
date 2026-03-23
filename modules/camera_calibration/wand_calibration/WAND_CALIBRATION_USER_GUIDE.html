@@ -340,6 +340,14 @@
         <p>Use this model when refractive interfaces are non-negligible and you need to model camera-side medium,
             window material/thickness, and object-side medium explicitly.</p>
 
+        <div class="highlight">
+            <span class="important">Refraction Model Notes:</span>
+            <p style="margin-top: 5px;">It is highly recommended to use <strong>2 or more cameras per refraction
+                    plate/window</strong> for better calibration robustness. If your camera viewing angle is nearly
+                normal to the refraction plate, it is still recommended to use the <strong>Pinhole</strong>
+                model.</p>
+        </div>
+
         <div class="step-block">
             <p style="text-align: center;">
                 <img src="refraction_settings_panel.png" alt="Refraction Settings Panel" style="max-width: 32%;">
@@ -374,17 +382,6 @@
                 <li>Iterate filtering based on error metrics.</li>
                 <li>Click <strong>Run Calibration</strong> for final optimization with refraction enabled.</li>
             </ol>
-        </div>
-
-        <div class="step-block">
-            <h3>Step 16: Refraction Model Notes</h3>
-            <div class="highlight">
-                <span class="important">Refraction Model Notes:</span>
-                <p style="margin-top: 5px;">It is highly recommended to use <strong>2 or more cameras per refraction
-                        plate/window</strong> for better calibration robustness. If your camera viewing angle is nearly
-                    normal to the refraction plate, it is still recommended to use the <strong>Pinhole</strong>
-                    model.</p>
-            </div>
         </div>
 
     </div>
