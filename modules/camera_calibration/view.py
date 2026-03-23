@@ -683,8 +683,10 @@ class Calibration3DViewer(QWidget):
 
                 self.ax.text(center[0], center[1], center[2], ' Center', color='white', fontsize=9)
 
-                # Draw direction lines using canonical world axes (not noisy
-                # landmark vectors) so lines align perfectly with world axes.
+                # Draw direction lines.
+                # Dashed: measured center→landmark vectors (may be noisy).
+                # Solid:  nearest orthonormal right-handed basis via SVD
+                #         (same algorithm as align_world_to_axis_directions).
                 # Target length: ~1.5x wand cloud size (user requested).
                 if point_cloud_extent_m is None or point_cloud_extent_m < 1e-9:
                     landmark_extent = max(
@@ -708,12 +710,35 @@ class Calibration3DViewer(QWidget):
                         color=color, linewidth=1.0, linestyle='--', alpha=0.9
                     )
 
-                canonical_dirs = [
-                    (map_point(np.array([1.0, 0.0, 0.0])), '#ff4040', '+X', '#ff8080'),
-                    (map_point(np.array([0.0, 1.0, 0.0])), '#40ff40', '+Y', '#80ff80'),
-                    (map_point(np.array([0.0, 0.0, 1.0])), '#4da6ff', '+Z', '#80c0ff'),
-                ]
-                for direction, color, label, label_color in canonical_dirs:
+                # Compute nearest orthonormal right-handed basis from
+                # measured landmark vectors using the same SVD polar
+                # decomposition as refractive_geometry.align_world_to_axis_directions.
+                #   M = [dir_X  dir_Y  dir_Z]  (unit cols in *aligned* frame)
+                #   U S Vt = svd(M)  →  R_orth = U @ Vt  (closest rotation to M)
+                #   Columns of R_orth are the corrected axis directions.
+                raw_dirs = [pt_x - center, pt_y - center, pt_z - center]
+                raw_norms = [np.linalg.norm(d) for d in raw_dirs]
+                if all(n > 1e-12 for n in raw_norms):
+                    M_ax = np.column_stack([d / n for d, n in zip(raw_dirs, raw_norms)])
+                    U_ax, _S_ax, Vt_ax = np.linalg.svd(M_ax)
+                    R_orth = U_ax @ Vt_ax
+                    if np.linalg.det(R_orth) < 0:
+                        U_ax[:, -1] *= -1
+                        R_orth = U_ax @ Vt_ax
+                    corrected_dirs = [
+                        (map_point(R_orth[:, 0]), '#ff4040', '+X', '#ff8080'),
+                        (map_point(R_orth[:, 1]), '#40ff40', '+Y', '#80ff80'),
+                        (map_point(R_orth[:, 2]), '#4da6ff', '+Z', '#80c0ff'),
+                    ]
+                else:
+                    # Fallback: hard-coded canonical axes when landmarks are degenerate
+                    corrected_dirs = [
+                        (map_point(np.array([1.0, 0.0, 0.0])), '#ff4040', '+X', '#ff8080'),
+                        (map_point(np.array([0.0, 1.0, 0.0])), '#40ff40', '+Y', '#80ff80'),
+                        (map_point(np.array([0.0, 0.0, 1.0])), '#4da6ff', '+Z', '#80c0ff'),
+                    ]
+
+                for direction, color, label, label_color in corrected_dirs:
                     tip = center + direction * axis_line_len
                     self.ax.plot3D(
                         [center[0], tip[0]], [center[1], tip[1]], [center[2], tip[2]],
