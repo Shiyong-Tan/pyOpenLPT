@@ -2,9 +2,6 @@
 
 This guide walks you through the camera calibration process using a calibration wand in OpenLPT. The process consists of three main stages: **Point Detection**, **Axis Points & Coordinate Definition**, and **Calibration**.
 
-> [!IMPORTANT]
-> **Refractive Interfaces:** The implemented calibration model assumes a homogeneous medium without refractive interfaces. For experimental setups involving observation windows (e.g., glass or acrylic), it is critical that the cameras are oriented as close to the surface normal (perpendicular) as possible. Furthermore, it is assumed that the paraxial approximation is valid within the reconstructed volume (i.e., small-angle observation) to maintain geometric accuracy.
-
 ## 1. Point Detection
 
 First, select the **Wand Calibration** tab and ensure you are on the **Point Detection** sub-tab.
@@ -13,7 +10,9 @@ First, select the **Wand Calibration** tab and ensure you are on the **Point Det
 
 ### Wand Calibrator Target
 
-<img src="wand_calibrator_target.png" alt="Wand Calibrator Target" width="40%" />
+<p align="center">
+  <img src="wand_calibrator_target.png" alt="Wand Calibrator Target" width="25%" />
+</p>
 
 The wand calibrator is a two-endpoint rigid target. During wand calibration, the two endpoint centers are detected in each frame and used with the known wand length constraint.
 
@@ -44,7 +43,9 @@ If you want a physically meaningful world frame (origin and +X/+Y/+Z directions)
 
 ### Axis Calibrator (Endpoint Sizes)
 
-<img src="axis_calibrator_endpoint_sizes.png" alt="Axis Calibrator Endpoint Size Groups" width="25%" />
+<p align="center">
+  <img src="axis_calibrator_endpoint_sizes.png" alt="Axis Calibrator Endpoint Size Groups" width="25%" />
+</p>
 
 Use an axis calibrator with three endpoint-size groups (small, medium, and large), with one opposite endpoint pair per axis.
 
@@ -87,6 +88,11 @@ How the axis-point workflow uses these endpoint sizes:
 
 After extracting points, switch to the **Calibration** sub-tab.
 
+### Pinhole Model Introduction
+
+> [!IMPORTANT]
+> **Note on Refracted Interfaces (for Pinhole model):** The pinhole calibration model assumes a homogeneous medium without refractive interfaces. For setups with observation windows (e.g., glass or acrylic), orient cameras as close to the window normal as possible and keep viewing angles small (paraxial condition). If your camera views are nearly normal to the plate, it is still recommended to use the **Pinhole** model.
+
 ![Calibration Interface](wand_calibration_ui_v2.png)
 
 ### Step 8: Calibration Settings
@@ -126,3 +132,34 @@ Review the final results in the **Error Analysis** table:
 
 ### Step 12: Save Results
 When the "Calibration Successful" message appears, your parameters are ready. You can save the intrinsic and extrinsic parameters to file for use in tracking.
+
+---
+
+## 4. Calibration Model: Pinhole + Refraction
+
+Use this model when refractive interfaces are non-negligible and you need to model camera-side medium, window material/thickness, and object-side medium explicitly.
+
+<p align="center">
+  <img src="refraction_settings_panel.png" alt="Refraction Settings Panel" width="32%" />
+</p>
+
+### Step 13: Select the Refraction Model
+1. In **Calibration Settings**, set **Camera Model** to **Pinhole+Refraction**.
+2. Enter a valid **Wand Length** and the number of **Dist Coeffs**.
+
+### Step 14: Configure Refraction Settings
+1. Set **Number of Windows**.
+2. In **Camera-Window Mapping**, assign each camera to its corresponding window.
+3. In **Window Configuration**, set media/material parameters for each layer:
+   - **Camera side** (e.g., Air, refractive index)
+   - **Window** (material index and thickness)
+   - **Object side** (e.g., Water, refractive index)
+
+### Step 15: Run and Refine
+1. Click **Precalibrate to Check** for data cleaning and outlier removal.
+2. Iterate filtering based on error metrics.
+3. Click **Run Calibration** for final optimization with refraction enabled.
+
+### Step 16: Refraction Model Notes
+- It is highly recommended to use **2 or more cameras per refraction plate/window** for better calibration robustness.
+- If your camera viewing angle is nearly normal to the refraction plate, it is still recommended to use the **Pinhole** model.
