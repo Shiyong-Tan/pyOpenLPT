@@ -1,0 +1,18 @@
+Command: C:\Users\tan_s\miniconda3\envs\OpenLPT\python.exe -m py_compile modules/camera_calibration/view.py
+Result: exit 0 (no stdout/stderr)
+
+Command: C:\Users\tan_s\miniconda3\envs\OpenLPT\python.exe -m pytest tests/test_axis_alignment.py -v
+============================= test session starts =============================
+platform win32 -- Python 3.11.14, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\tan_s\miniconda3\envs\OpenLPT\python.exe
+cachedir: .pytest_cache
+rootdir: D:\0.Code\OpenLPTGUI\OpenLPT
+configfile: pyproject.toml
+collecting ... collected 5 items
+
+tests/test_axis_alignment.py::test_pinhole_finalize_consistency PASSED   [ 20%]
+tests/test_axis_alignment.py::test_align_world_to_axis_directions_happy PASSED [ 40%]
+tests/test_axis_alignment.py::test_align_world_to_axis_directions_coverage_fail PASSED [ 60%]
+tests/test_axis_alignment.py::test_triangulate_pinhole_landmarks_happy PASSED [ 80%]
+tests/test_axis_alignment.py::test_pinhole_alignment_roundtrip PASSED    [100%]
+
+============================== 5 passed in 0.93s ==============================

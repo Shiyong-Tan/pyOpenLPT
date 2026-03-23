@@ -7655,6 +7655,68 @@ class CameraCalibrationView(QWidget):
                     
             except Exception as e:
                 print(f"[Refractive] Visualization Error: {e}")
+
+            # Axis-direction world alignment for refractive mode (optional post-calibration)
+            if getattr(self, 'axis_direction_map', None):
+                try:
+                    from modules.camera_calibration.wand_calibration.refractive_geometry import (
+                        align_world_to_axis_directions,
+                        triangulate_refractive_landmarks,
+                    )
+
+                    obs_by_landmark = {"center": {}, "+X": {}, "+Y": {}, "+Z": {}}
+                    for cam_id, cam_data in self.axis_direction_map.items():
+                        for lm in ["center", "+X", "+Y", "+Z"]:
+                            if lm in cam_data:
+                                obs_by_landmark[lm][cam_id] = cam_data[lm]
+
+                    cams_cpp = getattr(self, '_refr_cams_cpp', None)
+                    if not cams_cpp:
+                        print("[Axis Alignment] Refractive C++ camera objects not available; alignment skipped.")
+                    else:
+                        def _triangulate_fn(obs):
+                            return triangulate_refractive_landmarks(obs, cams_cpp)
+
+                        win_planes_for_align = self._refr_window_planes.copy() if self._refr_window_planes else {}
+                        pts_3d_for_align = []
+                        try:
+                            pts_3d_list_align = dataset.get('points_3d', [])
+                            if pts_3d_list_align:
+                                import numpy as _np
+                                pts_3d_for_align = _np.array(pts_3d_list_align).reshape(-1, 3).tolist()
+                        except Exception:
+                            pts_3d_for_align = []
+
+                        success_align, R_world, t_shift, aligned_state = align_world_to_axis_directions(
+                            axis_direction_map=self.axis_direction_map,
+                            triangulate_fn=_triangulate_fn,
+                            cam_params=self._refr_final_cam_params,
+                            points_3d=pts_3d_for_align,
+                            window_planes=win_planes_for_align,
+                        )
+
+                        if success_align and aligned_state is not None:
+                            self._refr_final_cam_params = aligned_state["cam_params"]
+                            self._refr_window_planes = aligned_state.get("window_planes", win_planes_for_align)
+                            aligned_pts_3d = None
+                            if aligned_state.get("points_3d"):
+                                import numpy as _np
+                                aligned_pts_3d = _np.array(aligned_state["points_3d"]).reshape(-1, 3)
+                            print("[Axis Alignment] Refractive world coordinate alignment applied successfully.")
+                            # Re-render 3D viewer with aligned state
+                            try:
+                                if hasattr(self, 'calib_3d_view'):
+                                    self.calib_3d_view.plot_refractive(
+                                        self._refr_final_cam_params,
+                                        self._refr_window_planes,
+                                        aligned_pts_3d,
+                                    )
+                            except Exception as _viz_err:
+                                print(f"[Axis Alignment] Re-visualization failed: {_viz_err}")
+                        else:
+                            print("[Axis Alignment] Refractive alignment failed or skipped; original state preserved.")
+                except Exception as _ax_err:
+                    print(f"[Axis Alignment] Error during post-refractive alignment: {_ax_err}")
             
             # Populate Error Analysis table (per_frame_errors was computed in calibrator)
             try:
