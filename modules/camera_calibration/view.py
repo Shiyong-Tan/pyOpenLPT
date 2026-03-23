@@ -697,19 +697,6 @@ class Calibration3DViewer(QWidget):
                     point_cloud_extent_m = max(landmark_extent * 2.0, 0.1)
                 axis_line_len = 1.5 * point_cloud_extent_m
 
-                # Keep measured center->landmark directions for comparison
-                # (dashed), and draw corrected canonical axes as solid lines.
-                measured_dirs = [
-                    (pt_x, '#ff4040'),
-                    (pt_y, '#40ff40'),
-                    (pt_z, '#4da6ff'),
-                ]
-                for p_end, color in measured_dirs:
-                    self.ax.plot3D(
-                        [center[0], p_end[0]], [center[1], p_end[1]], [center[2], p_end[2]],
-                        color=color, linewidth=1.0, linestyle='--', alpha=0.9
-                    )
-
                 # Compute nearest orthonormal right-handed basis from
                 # measured landmark vectors using the same SVD polar
                 # decomposition as refractive_geometry.align_world_to_axis_directions.
@@ -738,6 +725,8 @@ class Calibration3DViewer(QWidget):
                         (map_point(np.array([0.0, 0.0, 1.0])), '#4da6ff', '+Z', '#80c0ff'),
                     ]
 
+                # Draw corrected axes first (solid), then measured on top (dashed)
+                # so the angular deviation between them is always visible.
                 for direction, color, label, label_color in corrected_dirs:
                     tip = center + direction * axis_line_len
                     self.ax.plot3D(
@@ -746,6 +735,25 @@ class Calibration3DViewer(QWidget):
                     )
                     self.ax.text(tip[0], tip[1], tip[2], f' {label}',
                                  color=label_color, fontsize=9)
+
+                # Draw measured center->landmark directions (dashed) extended
+                # to the same length as the corrected solid lines so that
+                # the angular deviation is clearly visible at the line tips.
+                measured_dirs = [
+                    (pt_x, '#ff4040'),
+                    (pt_y, '#40ff40'),
+                    (pt_z, '#4da6ff'),
+                ]
+                for p_end, color in measured_dirs:
+                    vec = p_end - center
+                    nrm = np.linalg.norm(vec)
+                    if nrm < 1e-12:
+                        continue
+                    tip_m = center + (vec / nrm) * axis_line_len
+                    self.ax.plot3D(
+                        [center[0], tip_m[0]], [center[1], tip_m[1]], [center[2], tip_m[2]],
+                        color=color, linewidth=1.0, linestyle='--', alpha=0.7
+                    )
             except Exception as e:
                 print(f"[Viz] Axis landmark overlay error: {e}")
 
