@@ -11,6 +11,12 @@ First, select the **Wand Calibration** tab and ensure you are on the **Point Det
 
 ![Point Detection Interface](wand_detection_ui.png)
 
+### Wand Calibrator Target
+
+<img src="wand_calibrator_target.png" alt="Wand Calibrator Target" width="40%" />
+
+The wand calibrator is a two-endpoint rigid target. During wand calibration, the two endpoint centers are detected in each frame and used with the known wand length constraint.
+
 ### Step 1: Configure Settings
 Set the detection parameters in the **Detection Settings** panel on the right:
 - **Num Cameras**: Enter the number of cameras in your setup (e.g., `2`).
@@ -38,7 +44,7 @@ If you want a physically meaningful world frame (origin and +X/+Y/+Z directions)
 
 ### Axis Calibrator (Endpoint Sizes)
 
-![Axis Calibrator Endpoint Size Groups](axis_calibrator_endpoint_sizes.png)
+<img src="axis_calibrator_endpoint_sizes.png" alt="Axis Calibrator Endpoint Size Groups" width="25%" />
 
 Use an axis calibrator with three endpoint-size groups (small, medium, and large), with one opposite endpoint pair per axis.
 
