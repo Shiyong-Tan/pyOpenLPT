@@ -5295,6 +5295,7 @@ class CameraCalibrationView(QWidget):
             # with rigidly-transformed equivalents. Residuals computed above reflect pre-alignment frame.
             if getattr(self, 'axis_direction_map', None):
                 try:
+                    import numpy as _np
                     from modules.camera_calibration.wand_calibration.refractive_geometry import (
                         align_world_to_axis_directions,
                         triangulate_pinhole_landmarks,
@@ -5308,23 +5309,48 @@ class CameraCalibrationView(QWidget):
                             if lm in cam_data:
                                 obs_by_landmark[lm][cam_id] = cam_data[lm]
 
-                    def _triangulate_fn(obs):
-                        return triangulate_pinhole_landmarks(obs, self.wand_calibrator.final_params)
+                    # Triangulate once in pinhole final_params schema
+                    landmark_3d = triangulate_pinhole_landmarks(obs_by_landmark, self.wand_calibrator.final_params)
 
-                    cam_params = self.wand_calibrator.final_params
+                    def _triangulate_fn(_obs):
+                        return landmark_3d
+
                     points_3d = self.wand_calibrator.points_3d if self.wand_calibrator.points_3d is not None else []
 
-                    success_align, R_world, t_shift, aligned_state = align_world_to_axis_directions(
+                    # Use empty flat cam_params to avoid schema mismatch in apply_coordinate_rotation;
+                    # we only need R_world and t_shift, then apply to pinhole final_params manually.
+                    success_align, R_world, t_shift, _aligned_state = align_world_to_axis_directions(
                         axis_direction_map=self.axis_direction_map,
                         triangulate_fn=_triangulate_fn,
-                        cam_params=cam_params,
+                        cam_params={},
                         points_3d=points_3d,
                     )
 
-                    if success_align and aligned_state is not None:
-                        self.wand_calibrator.final_params = aligned_state["cam_params"]
-                        if aligned_state.get("points_3d") is not None:
-                            self.wand_calibrator.points_3d = aligned_state["points_3d"]
+                    if success_align and R_world is not None and t_shift is not None:
+                        t_shift = _np.asarray(t_shift).reshape(3,)
+                        new_final_params = {}
+                        for cam_id, p in self.wand_calibrator.final_params.items():
+                            R_old = _np.asarray(p["R"]).reshape(3, 3)
+                            T_old = _np.asarray(p["T"]).reshape(3, 1)
+
+                            # Camera center in world frame
+                            C_old = -R_old.T @ T_old
+
+                            # Compose world transform in camera extrinsics
+                            R_new = R_old @ R_world.T
+                            C_new = R_world @ (C_old + t_shift.reshape(3, 1))
+                            T_new = -R_new @ C_new
+
+                            # Keep all non-extrinsic entries unchanged (K/dist/img_size/...)
+                            new_final_params[cam_id] = {**p, "R": R_new, "T": T_new}
+
+                        self.wand_calibrator.final_params = new_final_params
+
+                        if points_3d is not None and len(points_3d) > 0:
+                            pts = _np.asarray(points_3d).reshape(-1, 3)
+                            pts_new = (R_world @ (pts + t_shift).T).T
+                            self.wand_calibrator.points_3d = pts_new.tolist()
+
                         print("[Axis Alignment] World coordinate alignment applied successfully.")
                         self._update_3d_viz()
                     else:
