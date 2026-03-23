@@ -14,7 +14,7 @@ First, select the **Wand Calibration** tab and ensure you are on the **Point Det
   <img src="wand_calibrator_target.png" alt="Wand Calibrator Target" width="25%" />
 </p>
 
-The wand calibrator is a two-endpoint rigid target. During wand calibration, the two endpoint centers are detected in each frame and used with the known wand length constraint.
+The wand calibrator is a two-endpoint rigid target with different endpoint sizes. The size difference helps identify endpoint correspondence among cameras, and the two endpoint centers are used with the known wand length constraint.
 
 ### Step 1: Configure Settings
 Set the detection parameters in the **Detection Settings** panel on the right:
@@ -161,5 +161,6 @@ Use this model when refractive interfaces are non-negligible and you need to mod
 3. Click **Run Calibration** for final optimization with refraction enabled.
 
 ### Step 16: Refraction Model Notes
-- It is highly recommended to use **2 or more cameras per refraction plate/window** for better calibration robustness.
-- If your camera viewing angle is nearly normal to the refraction plate, it is still recommended to use the **Pinhole** model.
+
+> [!IMPORTANT]
+> **Refraction Model Notes:** It is highly recommended to use **2 or more cameras per refraction plate/window** for better calibration robustness. If your camera viewing angle is nearly normal to the refraction plate, it is still recommended to use the **Pinhole** model.

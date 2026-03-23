@@ -110,8 +110,9 @@
             <p style="text-align: center;">
                 <img src="wand_calibrator_target.png" alt="Wand Calibrator Target" style="max-width: 25%;">
             </p>
-            <p>The wand calibrator is a two-endpoint rigid target. During wand calibration, the two endpoint centers are
-                detected in each frame and used with the known wand length constraint.</p>
+            <p>The wand calibrator is a two-endpoint rigid target with different endpoint sizes. The size difference
+                helps identify endpoint correspondence among cameras, and the two endpoint centers are used with the
+                known wand length constraint.</p>
         </div>
 
         <div class="step-block">
@@ -377,12 +378,13 @@
 
         <div class="step-block">
             <h3>Step 16: Refraction Model Notes</h3>
-            <ul>
-                <li>It is highly recommended to use <strong>2 or more cameras per refraction plate/window</strong>
-                    for better calibration robustness.</li>
-                <li>If your camera viewing angle is nearly normal to the refraction plate, it is still recommended to
-                    use the <strong>Pinhole</strong> model.</li>
-            </ul>
+            <div class="highlight">
+                <span class="important">Refraction Model Notes:</span>
+                <p style="margin-top: 5px;">It is highly recommended to use <strong>2 or more cameras per refraction
+                        plate/window</strong> for better calibration robustness. If your camera viewing angle is nearly
+                    normal to the refraction plate, it is still recommended to use the <strong>Pinhole</strong>
+                    model.</p>
+            </div>
         </div>
 
     </div>
