@@ -1758,7 +1758,10 @@ class WandCalibrator:
         if num_cams < 2:
             raise RuntimeError("Need at least 2 cameras.")
 
-        # Find best pair for initialization (max shared frames)
+        # Find best pair for initialization.
+        # Auto-selection ranks sufficiently observed pairs by raw median 2D
+        # disparity. Shared point count remains a sufficiency/context filter and
+        # fallback when no pair has enough matched samples for geometric init.
         # Support pair_override for forced pair selection
         if pair_override is not None:
             # Validate pair_override
@@ -1787,29 +1790,85 @@ class WandCalibrator:
             max_shared_pts = count
             print(f"[Phase 1] Using pair_override: Cam {i} <-> Cam {j} ({count} shared points)")
         else:
-            # Default: auto-select best pair by max shared points
-            best_pair = None
-            max_shared_pts = 0
-            
+            # Default: auto-select best pair by raw median image disparity.
+            # initialize_geometry_from_pair requires >=8 common point samples;
+            # use that same minimum for disparity-ranked candidates.
+            min_disparity_samples = 8
+            pair_candidates = []
+
             for i in range(num_cams):
                 for j in range(i + 1, num_cams):
                     c1 = cam_ids[i]
                     c2 = cam_ids[j]
-                    
-                    # Count shared points
-                    count = 0
+
+                    disparities = []
                     for f_idx, cam_pts in wand_data.items():
                         if c1 in cam_pts and c2 in cam_pts:
-                            count += 2 # 2 points per frame
-                    
-                    if count > max_shared_pts:
-                        max_shared_pts = count
-                        best_pair = (c1, c2)
-            
+                            pts1 = cam_pts[c1]
+                            pts2 = cam_pts[c2]
+                            matched_count = min(len(pts1), len(pts2), 2)
+                            for p_idx in range(matched_count):
+                                p1 = np.asarray(pts1[p_idx][:2], dtype=np.float64)
+                                p2 = np.asarray(pts2[p_idx][:2], dtype=np.float64)
+                                disparities.append(float(np.linalg.norm(p1 - p2)))
+
+                    shared_count = len(disparities)
+                    median_disparity = float(np.median(disparities)) if disparities else None
+                    pair_candidates.append({
+                        'pair': (c1, c2),
+                        'shared_count': shared_count,
+                        'median_disparity': median_disparity,
+                    })
+
+            geometry_ranked = [
+                candidate for candidate in pair_candidates
+                if candidate['shared_count'] >= min_disparity_samples
+                and candidate['median_disparity'] is not None
+            ]
+
+            if geometry_ranked:
+                geometry_ranked.sort(
+                    key=lambda candidate: (
+                        candidate['median_disparity'],
+                        candidate['shared_count'],
+                        -candidate['pair'][0],
+                        -candidate['pair'][1],
+                    ),
+                    reverse=True,
+                )
+                selected = geometry_ranked[0]
+                best_pair = selected['pair']
+                max_shared_pts = selected['shared_count']
+                fallback_reason = None
+            else:
+                pair_candidates.sort(
+                    key=lambda candidate: (
+                        candidate['shared_count'],
+                        -candidate['pair'][0],
+                        -candidate['pair'][1],
+                    ),
+                    reverse=True,
+                )
+                selected = pair_candidates[0] if pair_candidates else None
+                best_pair = selected['pair'] if selected else None
+                max_shared_pts = selected['shared_count'] if selected else 0
+                fallback_reason = f"no pair had >= {min_disparity_samples} matched disparity samples"
+
             if not best_pair or max_shared_pts < 10:
-                 print("Warning: No good camera pair found for geometric initialization. Fallback to naive pair 0-1?")
-                 best_pair = (cam_ids[0], cam_ids[1])
-            
+                  print("Warning: No good camera pair found for geometric initialization. Fallback to naive pair 0-1?")
+                  best_pair = (cam_ids[0], cam_ids[1])
+
+            print("[Phase 1] Pair candidates ranked by median raw disparity:")
+            diagnostics_rank = geometry_ranked if geometry_ranked else pair_candidates
+            for candidate in diagnostics_rank:
+                med = candidate['median_disparity']
+                med_text = f"{med:.3f}" if med is not None else "n/a"
+                print(
+                    f"  Cam {candidate['pair'][0]} <-> Cam {candidate['pair'][1]}: "
+                    f"shared_count={candidate['shared_count']}, median_disparity={med_text}"
+                )
+            if fallback_reason:
+                print(f"[Phase 1] Pair selection fallback: {fallback_reason}; using max shared points")
             print(f"[Phase 1] Auto-selected best pair: Cam {best_pair[0]} <-> Cam {best_pair[1]} ({max_shared_pts} points)")
         
         # Run 8-Point Algo with per-camera intrinsics from table
