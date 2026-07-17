@@ -2551,6 +2551,7 @@ class RefractiveWandCalibrator:
         Stores results in self.base.per_frame_errors (same format as pinhole calibration).
         
         Format: {frame_idx: {'cam_errors': {cam_id: max_err_px}, 'len_error': abs_mm}}
+        ``len_error`` is NaN when only one wand endpoint was reconstructed.
         
         Args:
             dataset: dict with 'frames', 'obsA', 'obsB', 'points_3d' keys
@@ -2588,7 +2589,7 @@ class RefractiveWandCalibrator:
                 continue
             
             # Calculate wand length error (if both points valid)
-            len_err = 0.0
+            len_err = float('nan')
             if XA is not None and XB is not None:
                 wand_len = np.linalg.norm(XB - XA)
                 len_err = abs(wand_len - wand_len_target)
@@ -2601,7 +2602,7 @@ class RefractiveWandCalibrator:
             obsB = dataset['obsB'].get(fid, {})
             
             for cid, cam in cams_cpp.items():
-                err_max = 0.0
+                point_errors = []
                 proj_A = None
                 proj_B = None
                 
@@ -2616,7 +2617,7 @@ class RefractiveWandCalibrator:
                         # Verify finite projection
                         if abs(proj_A[0]) < 1e5 and abs(proj_A[1]) < 1e5:
                             err_A = np.sqrt((proj_A[0] - uv_obs_A[0])**2 + (proj_A[1] - uv_obs_A[1])**2)
-                            err_max = max(err_max, err_A)
+                            point_errors.append(float(err_A))
                             cam_all_points_errs[cid].append(err_A) # Log A
                     
                     # [CPP_PROTOCOL] Project B point
@@ -2629,10 +2630,11 @@ class RefractiveWandCalibrator:
                         # Verify finite projection
                         if abs(proj_B[0]) < 1e5 and abs(proj_B[1]) < 1e5:
                             err_B = np.sqrt((proj_B[0] - uv_obs_B[0])**2 + (proj_B[1] - uv_obs_B[1])**2)
-                            err_max = max(err_max, err_B)
+                            point_errors.append(float(err_B))
                             cam_all_points_errs[cid].append(err_B) # Log B
                     
-                    if err_max > 0:
+                    if point_errors:
+                        err_max = max(point_errors)
                         cam_errors[cid] = err_max
                         cam_error_sums[cid].append(err_max)
                     
@@ -2671,5 +2673,4 @@ class RefractiveWandCalibrator:
             dataset['per_camera_proj_err_stats'] = per_camera_stats
 
         return per_camera_stats
-
 

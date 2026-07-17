@@ -1574,9 +1574,9 @@ class CameraCalibrationView(QWidget):
         cal_layout.setSpacing(15)
         cal_layout.setContentsMargins(10, 10, 10, 10)
 
-        # --- Config Load/Export (HZ_fix): import & export all Cal-page settings,
-        # both at the top of the tab, in their own (distinct purple) colour. ---
-        config_group = QGroupBox("Config Load/Export")
+        # Parameter-only import/export. Image folders, wand CSVs, and output paths
+        # deliberately remain outside this portable calibration preset.
+        config_group = QGroupBox("Calibration Parameter Preset (no paths)")
         config_layout = QHBoxLayout(config_group)
         config_btn_style = (
             "QPushButton { background-color:#4a3f6b; color:white; "
@@ -1587,15 +1587,16 @@ class CameraCalibrationView(QWidget):
         self.btn_import_cal_config = QPushButton("Import Config")
         self.btn_import_cal_config.setStyleSheet(config_btn_style)
         self.btn_import_cal_config.setToolTip(
-            "Load all Calibration-page settings (camera model, wand length, "
-            "distortion, refraction, filters) from a JSON config file."
+            "Load calibration parameters, camera count, per-camera focal/image "
+            "size, refraction mapping, and filters. Data and output paths are not loaded."
         )
         self.btn_import_cal_config.clicked.connect(self._import_cal_config)
 
         self.btn_export_cal_config = QPushButton("Export Config")
         self.btn_export_cal_config.setStyleSheet(config_btn_style)
         self.btn_export_cal_config.setToolTip(
-            "Save all current Calibration-page settings to a JSON config file."
+            "Save calibration parameters, camera count, per-camera focal/image "
+            "size, refraction mapping, and filters. Data and output paths are not saved."
         )
         self.btn_export_cal_config.clicked.connect(self._export_cal_config)
 
@@ -1772,18 +1773,6 @@ class CameraCalibrationView(QWidget):
         self.btn_calibrate_wand.clicked.connect(self._run_wand_calibration)
         cal_layout.addWidget(self.btn_calibrate_wand)
 
-        # HZ_fix: write a one-line terminal command (== "Run Calibration") that
-        # calibrates from a wand-points CSV. Green style matches Generate CLI.
-        self.btn_generate_calib_cli = QPushButton("Generate CLI")
-        self.btn_generate_calib_cli.setStyleSheet(self.GENERATE_CLI_BTN_STYLE)
-        self.btn_generate_calib_cli.setToolTip(
-            "Pick the wand-points CSV from the detection step and write a one-line "
-            "command (Calibration_CLI.txt) that runs this calibration headless, "
-            "using the current Calibration-page settings and per-camera focal/size."
-        )
-        self.btn_generate_calib_cli.clicked.connect(self._generate_calibration_cli)
-        cal_layout.addWidget(self.btn_generate_calib_cli)
-        
         # --- Error Analysis Section (shown after calibration) ---
         error_header_row = QHBoxLayout()
         error_header_row.addWidget(QLabel("Error Analysis:"))
@@ -1973,9 +1962,6 @@ class CameraCalibrationView(QWidget):
             
         success, msg = self.wand_calibrator.load_wand_data_from_csv(file_path)
         if success:
-            # HZ_fix: remember the CSV so "Generate CLI" can reuse it without
-            # prompting for the path again.
-            self.loaded_wand_csv_path = file_path
             self.error_table.setRowCount(0)
             self._update_3d_viz()
             # Ensure calibrator has access to cameras/size
@@ -4326,100 +4312,44 @@ class CameraCalibrationView(QWidget):
             ),
         )
 
-    def _generate_calibration_cli(self, checked=False):
-        """HZ_fix: Show the one-line "Run Calibration" command (Save/Copy/Close).
-
-        Uses the wand-points CSV (output of the detection step), the
-        Calibration-page settings and the per-camera focal/image-size from the
-        detection table. Nothing is written automatically — the user Saves (chooses
-        where), Copies the command, or Closes. Copy it into a terminal to
-        calibrate headless.
-        """
-        from pathlib import Path
-        from .wand_calibration.wand_calibration_cli import build_cli_command
-
-        camera_settings = self._collect_camera_settings_from_table()
-        if not camera_settings:
-            QMessageBox.warning(
-                self, "Generate CLI",
-                "No camera settings found. Load images / set camera focal and "
-                "image size on the Point Detection page first."
-            )
-            return
-
-        # Honor the UI camera-model choice.
-        model_name = self.wand_model_combo.currentText()
-        is_refraction = (model_name == "Pinhole+Refraction")
-        camera_model = "refraction" if is_refraction else "pinhole"
-
-        # Collect refraction settings from the UI if needed.
-        num_windows = cam_to_window = window_media = None
-        if is_refraction:
-            num_windows = self.window_count_spin.value()
-            cam_to_window = {}
-            for row in range(self.cam_window_table.rowCount()):
-                id_item = self.cam_window_table.item(row, 0)
-                win_combo = self.cam_window_table.cellWidget(row, 1)
-                if id_item and win_combo:
-                    cid = int(id_item.text())
-                    cam_to_window[cid] = int(win_combo.currentText().split()[-1])
-            window_media = {}
-            for wid in range(num_windows):
-                window_media[wid] = {
-                    'n1': self.media1_index.value(),
-                    'n2': self.media2_index.value(),
-                    'n3': self.media3_index.value(),
-                    'thickness': self.media2_thick.value(),
-                }
-
-        # HZ_fix: reuse the CSV already loaded via "Load Wand Points (from CSV)"
-        # instead of prompting again. Only ask if none has been loaded (or the
-        # remembered file no longer exists).
-        points_csv = getattr(self, 'loaded_wand_csv_path', '') or ""
-        if not points_csv or not Path(points_csv).is_file():
-            points_csv, _ = QFileDialog.getOpenFileName(
-                self, "Select Wand Points CSV (from detection step)",
-                getattr(self, 'wand_t0_dir', '') or "", "CSV Files (*.csv);;All Files (*)"
-            )
-            if not points_csv:
-                return
-
-        wand_length = self.wand_len_spin.value()
-        distortion = self.dist_model_combo.currentIndex()
-
-        csv_path = Path(points_csv)
-        output_dir = csv_path.parent
-        cli_txt_path = output_dir / "Calibration_CLI.txt"
-
-        command = build_cli_command(
-            str(csv_path), wand_length, distortion, camera_model,
-            camera_settings, str(output_dir),
-            num_windows=num_windows, cam_to_window=cam_to_window,
-            window_media=window_media,
-        )
-        self._show_generate_cli_dialog(
-            command,
-            default_save_path=cli_txt_path,
-            subtitle=(
-                "One-line command that runs 'Run Calibration' headless "
-                f"(writes camFile/cam<N>.txt in {output_dir.name}). "
-                "Save it, copy it into a terminal, or close."
-            ),
-        )
-
     # ------------------------------------------------------------------ #
     # Cal-page config import / export (HZ_fix)                            #
     # ------------------------------------------------------------------ #
     def _collect_cal_config(self):
-        """HZ_fix: Gather all Calibration-page settings into a JSON-able dict."""
+        """Gather a portable, parameter-only calibration preset."""
+        camera_count = int(self.wand_num_cams.value())
+        camera_settings = self._collect_camera_settings_from_table()
+        cameras = []
+        for cam_id in range(camera_count):
+            settings = camera_settings.get(cam_id)
+            if settings is None:
+                raise ValueError(f"Camera {cam_id} settings are missing from the camera table.")
+            cameras.append({
+                "camera_id": cam_id,
+                "focal_px": int(round(settings["focal"])),
+                "image_width": int(settings["width"]),
+                "image_height": int(settings["height"]),
+            })
+
         cam_window_map = []
         if hasattr(self, 'cam_window_table') and self.cam_window_table is not None:
+            if self.cam_window_table.rowCount() != camera_count:
+                raise ValueError(
+                    "Camera-window table row count does not match Num Cameras."
+                )
             for row in range(self.cam_window_table.rowCount()):
                 combo = self.cam_window_table.cellWidget(row, 1)
-                cam_window_map.append(combo.currentIndex() if combo else 0)
+                if combo is None or combo.currentIndex() < 0:
+                    raise ValueError(
+                        f"Camera {row} does not have a valid window assignment."
+                    )
+                cam_window_map.append(combo.currentIndex())
 
         return {
-            "version": 1,
+            "version": 2,
+            "scope": "calibration_parameters",
+            "camera_count": camera_count,
+            "cameras": cameras,
             "camera_model": self.wand_model_combo.currentIndex(),
             "wand_length": self.wand_len_spin.value(),
             "distortion": self.dist_model_combo.currentIndex(),
@@ -4448,11 +4378,193 @@ class CameraCalibrationView(QWidget):
             },
         }
 
+    def _validate_cal_config(self, cfg):
+        """Validate a calibration preset without changing the current UI."""
+        if not isinstance(cfg, dict):
+            raise ValueError("The config root must be a JSON object.")
+
+        def _require_int(value, label):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{label} must be an integer.")
+            return value
+
+        def _check_spin(value, widget, label):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{label} must be a number.")
+            value = float(value)
+            if not np.isfinite(value):
+                raise ValueError(f"{label} must be finite.")
+            if value < widget.minimum() or value > widget.maximum():
+                raise ValueError(
+                    f"{label}={value:g} is outside the supported range "
+                    f"[{widget.minimum():g}, {widget.maximum():g}]."
+                )
+
+        def _check_combo(value, combo, label):
+            idx = _require_int(value, label)
+            if idx < 0 or idx >= combo.count():
+                raise ValueError(
+                    f"{label} index {idx} is invalid; expected 0..{combo.count() - 1}."
+                )
+
+        version = _require_int(cfg.get("version", 1), "version")
+        if version not in (1, 2):
+            raise ValueError(f"Unsupported calibration config version: {version}.")
+        if "scope" in cfg and cfg["scope"] != "calibration_parameters":
+            raise ValueError("This JSON file is not a calibration-parameter config.")
+
+        if version >= 2 and "camera_count" not in cfg:
+            raise ValueError("Version 2 config is missing camera_count.")
+        camera_count = _require_int(
+            cfg.get("camera_count", int(self.wand_num_cams.value())),
+            "camera_count",
+        )
+        if camera_count < self.wand_num_cams.minimum() or camera_count > self.wand_num_cams.maximum():
+            raise ValueError(
+                f"camera_count={camera_count} is outside the supported range "
+                f"[{self.wand_num_cams.minimum()}, {self.wand_num_cams.maximum()}]."
+            )
+
+        camera_entries = cfg.get("cameras")
+        if version >= 2 and camera_entries is None:
+            raise ValueError("Version 2 config is missing per-camera settings.")
+        if camera_entries is not None:
+            if not isinstance(camera_entries, list):
+                raise ValueError("cameras must be a JSON array.")
+            if len(camera_entries) != camera_count:
+                raise ValueError(
+                    f"cameras contains {len(camera_entries)} entries, but "
+                    f"camera_count is {camera_count}."
+                )
+
+            focal_widget = self.wand_cam_table.cellWidget(0, 2)
+            width_widget = self.wand_cam_table.cellWidget(0, 3)
+            height_widget = self.wand_cam_table.cellWidget(0, 4)
+            if not all((focal_widget, width_widget, height_widget)):
+                raise RuntimeError("Camera parameter controls are unavailable.")
+
+            seen_ids = set()
+            for entry in camera_entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("Every cameras entry must be a JSON object.")
+                missing = {
+                    "camera_id", "focal_px", "image_width", "image_height"
+                } - set(entry)
+                if missing:
+                    raise ValueError(
+                        "Camera entry is missing: " + ", ".join(sorted(missing)) + "."
+                    )
+                cam_id = _require_int(entry["camera_id"], "camera_id")
+                if cam_id < 0 or cam_id >= camera_count:
+                    raise ValueError(
+                        f"camera_id {cam_id} is invalid for {camera_count} cameras."
+                    )
+                if cam_id in seen_ids:
+                    raise ValueError(f"camera_id {cam_id} appears more than once.")
+                seen_ids.add(cam_id)
+                focal = _require_int(entry["focal_px"], f"camera {cam_id} focal_px")
+                width = _require_int(entry["image_width"], f"camera {cam_id} image_width")
+                height = _require_int(entry["image_height"], f"camera {cam_id} image_height")
+                _check_spin(focal, focal_widget, f"camera {cam_id} focal_px")
+                _check_spin(width, width_widget, f"camera {cam_id} image_width")
+                _check_spin(height, height_widget, f"camera {cam_id} image_height")
+            expected_ids = set(range(camera_count))
+            if seen_ids != expected_ids:
+                missing_ids = sorted(expected_ids - seen_ids)
+                raise ValueError(f"Missing camera settings for IDs: {missing_ids}.")
+
+        if "camera_model" in cfg:
+            _check_combo(cfg["camera_model"], self.wand_model_combo, "camera_model")
+        if "wand_length" in cfg:
+            _check_spin(cfg["wand_length"], self.wand_len_spin, "wand_length")
+        if "distortion" in cfg:
+            _check_combo(cfg["distortion"], self.dist_model_combo, "distortion")
+
+        ref = cfg.get("refraction", {})
+        if not isinstance(ref, dict):
+            raise ValueError("refraction must be a JSON object.")
+        window_count = _require_int(
+            ref.get("window_count", int(self.window_count_spin.value())),
+            "refraction.window_count",
+        )
+        if window_count < self.window_count_spin.minimum() or window_count > self.window_count_spin.maximum():
+            raise ValueError(
+                f"refraction.window_count={window_count} is outside the supported range "
+                f"[{self.window_count_spin.minimum()}, {self.window_count_spin.maximum()}]."
+            )
+
+        cam_window_map = ref.get("cam_window_map")
+        if version >= 2 and cam_window_map is None:
+            raise ValueError("Version 2 config is missing refraction.cam_window_map.")
+        if cam_window_map is not None:
+            if not isinstance(cam_window_map, list):
+                raise ValueError("refraction.cam_window_map must be a JSON array.")
+            if len(cam_window_map) != camera_count:
+                raise ValueError(
+                    "refraction.cam_window_map has "
+                    f"{len(cam_window_map)} entries, but camera_count is {camera_count}. "
+                    "The mapping must contain exactly one window index per camera."
+                )
+            for cam_id, win_idx in enumerate(cam_window_map):
+                win_idx = _require_int(
+                    win_idx, f"refraction.cam_window_map[{cam_id}]"
+                )
+                if win_idx < 0 or win_idx >= window_count:
+                    raise ValueError(
+                        f"Camera {cam_id} maps to window {win_idx}, but valid window "
+                        f"indices are 0..{window_count - 1}."
+                    )
+
+        for media_name, combo, index_widget in (
+            ("media1", self.media1_combo, self.media1_index),
+            ("media2", self.media2_combo, self.media2_index),
+            ("media3", self.media3_combo, self.media3_index),
+        ):
+            media = ref.get(media_name, {})
+            if not isinstance(media, dict):
+                raise ValueError(f"refraction.{media_name} must be a JSON object.")
+            if "type" in media:
+                _check_combo(media["type"], combo, f"refraction.{media_name}.type")
+            if "index" in media:
+                _check_spin(media["index"], index_widget, f"refraction.{media_name}.index")
+        media2 = ref.get("media2", {})
+        if "thickness" in media2:
+            _check_spin(
+                media2["thickness"], self.media2_thick,
+                "refraction.media2.thickness",
+            )
+
+        filters = cfg.get("filters", {})
+        if not isinstance(filters, dict):
+            raise ValueError("filters must be a JSON object.")
+        if "proj_enabled" in filters and not isinstance(filters["proj_enabled"], bool):
+            raise ValueError("filters.proj_enabled must be true or false.")
+        if "proj_threshold" in filters:
+            _check_spin(filters["proj_threshold"], self.filter_proj_spin, "filters.proj_threshold")
+        if "len_enabled" in filters and not isinstance(filters["len_enabled"], bool):
+            raise ValueError("filters.len_enabled must be true or false.")
+        if "len_threshold" in filters:
+            _check_spin(filters["len_threshold"], self.filter_len_spin, "filters.len_threshold")
+
+        return camera_count, camera_entries
+
     def _apply_cal_config(self, cfg):
-        """HZ_fix: Apply a config dict (from _collect_cal_config) to the widgets."""
+        """Apply a validated calibration-parameter config to the widgets."""
+        camera_count, camera_entries = self._validate_cal_config(cfg)
+
         def _set_combo(combo, idx):
-            if combo is not None and idx is not None and 0 <= int(idx) < combo.count():
+            if combo is not None and idx is not None:
                 combo.setCurrentIndex(int(idx))
+
+        if self.wand_num_cams.value() != camera_count:
+            self.wand_num_cams.setValue(camera_count)
+
+        if camera_entries is not None:
+            for entry in camera_entries:
+                row = int(entry["camera_id"])
+                self.wand_cam_table.cellWidget(row, 2).setValue(int(entry["focal_px"]))
+                self.wand_cam_table.cellWidget(row, 3).setValue(int(entry["image_width"]))
+                self.wand_cam_table.cellWidget(row, 4).setValue(int(entry["image_height"]))
 
         if "camera_model" in cfg:
             _set_combo(self.wand_model_combo, cfg["camera_model"])
@@ -4481,11 +4593,9 @@ class CameraCalibrationView(QWidget):
             self.media3_index.setValue(float(m3["index"]))
 
         # Apply per-camera window mapping after the table was rebuilt.
-        cam_window_map = ref.get("cam_window_map", [])
-        if hasattr(self, 'cam_window_table') and self.cam_window_table is not None:
+        cam_window_map = ref.get("cam_window_map")
+        if cam_window_map is not None:
             for row, win_idx in enumerate(cam_window_map):
-                if row >= self.cam_window_table.rowCount():
-                    break
                 combo = self.cam_window_table.cellWidget(row, 1)
                 _set_combo(combo, win_idx)
 
@@ -4500,7 +4610,7 @@ class CameraCalibrationView(QWidget):
             self.filter_len_spin.setValue(float(filt["len_threshold"]))
 
     def _export_cal_config(self, checked=False):
-        """HZ_fix: Save the Calibration-page settings to a JSON file."""
+        """Save a parameter-only calibration preset to a JSON file."""
         import json
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Calibration Config", "wand_cal_config.json",
@@ -4509,16 +4619,22 @@ class CameraCalibrationView(QWidget):
         if not path:
             return
         try:
+            cfg = self._collect_cal_config()
+            self._validate_cal_config(cfg)
             with open(path, 'w') as f:
-                json.dump(self._collect_cal_config(), f, indent=2)
-        except OSError as e:
+                json.dump(cfg, f, indent=2)
+        except (OSError, ValueError) as e:
             QMessageBox.critical(self, "Export Config", f"Failed to write config:\n{e}")
             return
         self.status_label.setText(f"Exported calibration config to {path}")
-        QMessageBox.information(self, "Export Config", f"Config saved to:\n{path}")
+        QMessageBox.information(
+            self, "Export Config",
+            f"Calibration parameters saved to:\n{path}\n\n"
+            "Image folders, wand CSV, T0, and output paths are not included."
+        )
 
     def _import_cal_config(self, checked=False):
-        """HZ_fix: Load the Calibration-page settings from a JSON file."""
+        """Load a parameter-only calibration preset from a JSON file."""
         import json
         path, _ = QFileDialog.getOpenFileName(
             self, "Import Calibration Config", "",
@@ -4538,7 +4654,17 @@ class CameraCalibrationView(QWidget):
             QMessageBox.critical(self, "Import Config", f"Failed to apply config:\n{e}")
             return
         self.status_label.setText(f"Imported calibration config from {path}")
-        QMessageBox.information(self, "Import Config", f"Config loaded from:\n{path}")
+        legacy_note = ""
+        if cfg.get("version", 1) == 1:
+            legacy_note = (
+                "\n\nLegacy version-1 config: camera count and per-camera "
+                "focal/image-size values were not stored and were left unchanged."
+            )
+        QMessageBox.information(
+            self, "Import Config",
+            f"Calibration parameters loaded from:\n{path}{legacy_note}\n\n"
+            "Image folders, wand CSV, T0, and output paths are not included."
+        )
 
     def _load_wand_root_folder(self, checked=False):
         """HZ_fix: Select the folder that directly contains the 'cam<N>' folders and
@@ -4612,8 +4738,7 @@ class CameraCalibrationView(QWidget):
         detail = ", ".join(f"{name}={c}" for name, c in counts.items())
         mismatch = len(set(counts.values())) > 1
 
-        # Remember the cam-folder location for later tooling (e.g. Generate CLI
-        # uses wand_t0_dir as the folder containing cam<N>).
+        # Remember the cam-folder location for the point-detection CLI.
         self.wand_root_dir = str(sel_dir.parent)
         self.wand_t0_dir = str(sel_dir)
 
@@ -6596,10 +6721,11 @@ class CameraCalibrationView(QWidget):
                 self.error_table.setItem(row, i + 1, item)
             
             # Length error (Col N+1)
-            len_err = err['len_error']
-            item = NumericTableWidgetItem(f"{len_err:.3f}")
+            len_err = err.get('len_error', float('nan'))
+            len_is_valid = np.isfinite(len_err)
+            item = NumericTableWidgetItem(f"{len_err:.3f}" if len_is_valid else "n/a")
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if len_err > self.filter_len_spin.value():
+            if len_is_valid and len_err > self.filter_len_spin.value():
                 item.setBackground(Qt.GlobalColor.darkRed)
             self.error_table.setItem(row, len(cam_ids) + 1, item)
         
@@ -6770,8 +6896,9 @@ class CameraCalibrationView(QWidget):
                     it.setBackground(Qt.GlobalColor.darkRed)
                 matrix.setItem(row, i + 1, it)
             le = e.get('len_error', float('nan'))
-            it = NumericTableWidgetItem("nan" if np.isnan(le) else f"{le:.3f}")
-            if not np.isnan(le) and le > len_thr:
+            le_is_valid = np.isfinite(le)
+            it = NumericTableWidgetItem(f"{le:.3f}" if le_is_valid else "n/a")
+            if le_is_valid and le > len_thr:
                 it.setBackground(Qt.GlobalColor.darkRed)
             matrix.setItem(row, len(cam_ids) + 1, it)
         matrix.setSortingEnabled(True)
@@ -6884,10 +7011,11 @@ class CameraCalibrationView(QWidget):
                 self.error_table.setItem(row, i + 1, item)
             
             # --- Error Table: Length error (Col N+1) ---
-            len_err = err['len_error']
-            item = NumericTableWidgetItem(f"{len_err:.3f}")
+            len_err = err.get('len_error', float('nan'))
+            len_is_valid = np.isfinite(len_err)
+            item = NumericTableWidgetItem(f"{len_err:.3f}" if len_is_valid else "n/a")
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if len_err > self.filter_len_spin.value():
+            if len_is_valid and len_err > self.filter_len_spin.value():
                 item.setBackground(Qt.GlobalColor.darkRed)
             self.error_table.setItem(row, len(cam_ids) + 1, item)
         
@@ -6941,8 +7069,9 @@ class CameraCalibrationView(QWidget):
         
         obs = wand_data[frame_id]  # {cam_idx: [[x,y,r], [x,y,r]]}
         
-        # Get 3D points for this frame
-        frame_list = sorted(wand_data.keys())
+        # Use the explicit reconstruction mapping. Some observed frames are not
+        # triangulated, so indexing the full wand-data frame list is unsafe.
+        frame_list = list(getattr(self.wand_calibrator, 'points_3d_frame_ids', []))
         try:
             frame_i = frame_list.index(frame_id)
         except ValueError:
@@ -8892,7 +9021,7 @@ class CameraCalibrationView(QWidget):
                 len_errs = []
                 per_camera_mean = dataset.get('per_camera_mean_proj_err', {})
                 for err in errors.values():
-                    if 'len_error' in err:
+                    if 'len_error' in err and np.isfinite(err['len_error']):
                         len_errs.append(float(err['len_error']))
                     for cid, e in err.get('cam_errors', {}).items():
                         cam_errs.setdefault(int(cid), []).append(float(e))

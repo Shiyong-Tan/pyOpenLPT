@@ -215,46 +215,6 @@ def _build_tasks_from_input_root(args: argparse.Namespace, output_dir: Path):
     return tasks, detected
 
 
-def find_reference_frame_from_detected(
-    detected: DetectedRootInput,
-    is_valid,
-    *,
-    frames: tuple[int, int] | None = None,
-    stride: int = 10,
-    tau: float = 6.0,
-    proxy_kwargs: dict | None = None,
-    **search_kwargs,
-):
-    """HZ_fix: Find a valid bubble *reference frame* over the frames enumerated by
-    ``_build_tasks_from_input_root`` (the index-aligned per-camera frame lists in
-    ``detected``), using the block-based coarse-to-fine search.
-
-    ``is_valid(frame_index) -> bool`` is the caller's *existing* validation
-    algorithm (e.g. ``calBubbleRefImg``-based) and is **not modified** — it is run
-    only on the few candidates the cheap bubble-count proxy surfaces. Returns
-    ``(frame_index or None, ReferenceSearchStats)``.
-
-    ``stride`` must be <= the shortest bubble window you need to catch; ``tau`` is
-    the minimum per-camera bubble count the validator needs.
-    """
-    from .reference_frame import (
-        build_frame_readers,
-        make_bubble_count_proxy,
-        find_reference_frame,
-    )
-
-    readers, n_frames = build_frame_readers(detected, frames=frames)
-    cheap = make_bubble_count_proxy(readers, **(proxy_kwargs or {}))
-    return find_reference_frame(
-        n_frames,
-        is_valid=is_valid,
-        cheap_count=cheap,
-        stride=stride,
-        tau=tau,
-        **search_kwargs,
-    )
-
-
 def _build_backgrounds(args: argparse.Namespace) -> dict[int, object]:
     if args.background != "mean":
         return {}
