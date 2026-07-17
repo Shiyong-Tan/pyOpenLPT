@@ -16,7 +16,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                               QDoubleSpinBox, QListWidget, QGroupBox, QFormLayout,
                               QCheckBox, QFileDialog, QScrollArea, QFrame,
                               QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
-                              QSizePolicy, QGridLayout, QRadioButton, QButtonGroup, QProgressDialog, QApplication)
+                              QSizePolicy, QGridLayout, QRadioButton, QButtonGroup, QProgressDialog, QApplication,
+                              QStackedWidget, QLineEdit)
 from PySide6.QtCore import Qt
 from .widgets import RangeSlider
 from .wand_calibration.wand_calibrator import WandCalibrator
@@ -175,7 +176,8 @@ class ZoomableImageLabel(QLabel):
     origin_selected = Signal(QPoint)        # Signal for origin selection
     axis_point_selected = Signal(QPoint, int)  # Signal for axis direction (point, axis_index)
     point_clicked = Signal(QPoint)          # Signal for manual point verification click
-    
+    clicked = Signal()                      # HZ_fix: simple left-click (no drag) in NAV mode
+
     # Modes
     MODE_NAV = 0
     MODE_TEMPLATE = 1
@@ -204,6 +206,7 @@ class ZoomableImageLabel(QLabel):
         self.mode = self.MODE_NAV
         self.is_panning = False
         self.is_selecting_rect = False
+        self._left_press_pos = None  # HZ_fix: track left-press for click detection
         
         # Template Selection
         self.rect_start = None
@@ -353,7 +356,11 @@ class ZoomableImageLabel(QLabel):
             
         elif event.button() == Qt.MouseButton.LeftButton:
             img_pt = self._to_image_coords(event.position().toPoint())
-            
+
+            if self.mode == self.MODE_NAV:
+                # HZ_fix: remember press position to detect a simple click on release
+                self._left_press_pos = event.position().toPoint()
+
             if self.mode == self.MODE_TEMPLATE:
                 self.is_selecting_rect = True
                 self.rect_start = img_pt
@@ -431,6 +438,14 @@ class ZoomableImageLabel(QLabel):
             self.rect_start = None
             self.rect_end = None
             self.update()
+
+        elif event.button() == Qt.MouseButton.LeftButton and self.mode == self.MODE_NAV:
+            # HZ_fix: emit clicked() for a simple left-click (negligible drag) in NAV mode
+            if self._left_press_pos is not None:
+                moved = (event.position().toPoint() - self._left_press_pos).manhattanLength()
+                self._left_press_pos = None
+                if moved <= 4:
+                    self.clicked.emit()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1174,40 +1189,58 @@ class CameraCalibrationView(QWidget):
             QTabBar::tab:selected { background: #444; color: #fff; }
         """)
         
-        # Tab 1: 2D Detection Images
-        vis_2d_widget = QWidget()
-        vis_2d_layout = QVBoxLayout(vis_2d_widget)
-        vis_2d_layout.setContentsMargins(0,0,0,0)
-        
-        # Scroll Area for images
-        vis_scroll = QScrollArea()
-        vis_scroll.setWidgetResizable(True)
-        vis_scroll_content = QWidget()
-        self.vis_grid_layout = QFormLayout(vis_scroll_content) # Or Grid? Form is Vertical.
-        vis_scroll.setWidget(vis_scroll_content)
-        vis_2d_layout.addWidget(vis_scroll)
-        
-        self.vis_tabs.addTab(vis_2d_widget, "2D Detection")
-        
+        # Tab 1: "Cams" — 2-column grid of camera images (HZ_fix).
+        #   * cameras are laid out 2 per row (cam0 top-left, cam1 top-right, ...)
+        #   * the grid scrolls when there are more than 4 cameras
+        #   * clicking a camera expands it to fill the view; clicking again (or the
+        #     "Back to grid" button) returns to the grid.
+        self.cams_stack = QStackedWidget()
+
+        # -- Page 0: the grid --
+        self.cam_grid_scroll = QScrollArea()
+        self.cam_grid_scroll.setWidgetResizable(True)
+        self.cam_grid_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        cam_grid_content = QWidget()
+        self.cam_grid_layout = QGridLayout(cam_grid_content)
+        self.cam_grid_layout.setContentsMargins(4, 4, 4, 4)
+        self.cam_grid_layout.setSpacing(4)
+        self.cam_grid_scroll.setWidget(cam_grid_content)
+        self.cams_stack.addWidget(self.cam_grid_scroll)  # index 0
+
+        # -- Page 1: single expanded camera --
+        self.cam_expanded_container = QWidget()
+        exp_outer = QVBoxLayout(self.cam_expanded_container)
+        exp_outer.setContentsMargins(0, 0, 0, 0)
+        exp_outer.setSpacing(0)
+        back_bar = QHBoxLayout()
+        back_bar.setContentsMargins(4, 4, 4, 4)
+        self.btn_collapse_cam = QPushButton("← Back to grid")
+        self.btn_collapse_cam.setStyleSheet(
+            "background-color:#2a3f5f; color:white; padding:4px 10px; "
+            "font-size:11px; border:1px solid #444; border-radius:4px;"
+        )
+        self.btn_collapse_cam.clicked.connect(self._collapse_cam_view)
+        back_bar.addWidget(self.btn_collapse_cam)
+        back_bar.addStretch()
+        exp_outer.addLayout(back_bar)
+        cam_expanded_holder = QWidget()
+        self.cam_expanded_layout = QVBoxLayout(cam_expanded_holder)
+        self.cam_expanded_layout.setContentsMargins(0, 0, 0, 0)
+        exp_outer.addWidget(cam_expanded_holder, 1)
+        self.cams_stack.addWidget(self.cam_expanded_container)  # index 1
+
+        self.vis_tabs.addTab(self.cams_stack, "Cams")
+
         # Tab 2: 3D Visualization
         self.calib_3d_view = Calibration3DViewer()
         self.vis_tabs.addTab(self.calib_3d_view, "3D View")
-        
+
         vis_layout.addWidget(self.vis_tabs)
-        
-        self.cam_vis_labels = {} # Will be populated dynamically in _update_wand_table? 
-        # Or I should add initial labels here?
-        # Let's keep it empty and rely on dynamic update if exists, or just leave as is.
-        # But wait, `_detect_single_frame` uses `self.cam_vis_labels`.
-        # I need to ensure they are created.
-        # I'll create 4 default labels.
-        for i in range(4):
-            lbl = ZoomableImageLabel(f"Cam {i} (No Image)")
-            lbl.setStyleSheet("background: #111; border: 1px dashed #333; color: #555;")
-            lbl.setMinimumHeight(200)
-            lbl.axis_point_selected.connect(lambda pt, axis_idx, idx=i: self._on_wand_axis_point_selected(pt, axis_idx, idx))
-            self.vis_grid_layout.addRow(f"Cam {i}:", lbl)
-            self.cam_vis_labels[i] = lbl
+
+        # Populated by _build_cam_vis_grid (called from _update_wand_table).
+        self.cam_vis_labels = {}
+        self._expanded_cam = None
+        self._build_cam_vis_grid(4)
         
         # 2. Controls Panel (RIGHT)
         right_panel = QWidget()
@@ -1289,6 +1322,41 @@ class CameraCalibrationView(QWidget):
         conf_layout.addRow("Sensitivity:", self.sensitivity_slider)
         det_layout.addWidget(conf_group)
         
+        # Camera-folder loader (HZ_fix): auto-load every 'cam<N>' folder inside the
+        # folder the user selects (the one that directly contains cam0, cam1, ...).
+        root_load_row = QHBoxLayout()
+        root_load_row.setContentsMargins(0, 0, 0, 0)
+        root_load_row.setSpacing(6)
+
+        self.btn_load_root_folder = QPushButton("Auto-Load Cameras from Folder")
+        self.btn_load_root_folder.setStyleSheet(btn_style)
+        self.btn_load_root_folder.setToolTip(
+            "Select the folder that directly contains 'cam<N>' folders (cam0, cam1, "
+            "...). All are loaded in ascending order; Num Cameras is updated to match."
+        )
+        self.btn_load_root_folder.clicked.connect(self._load_wand_root_folder)
+        root_load_row.addWidget(self.btn_load_root_folder, 1)
+
+        # Square info button: pops up the help / last-load status text.
+        self.btn_root_folder_info = QPushButton("ⓘ")
+        self.btn_root_folder_info.setStyleSheet(btn_style)
+        self.btn_root_folder_info.setFixedWidth(40)
+        self.btn_root_folder_info.setToolTip("Show info / last load status")
+        self.btn_root_folder_info.clicked.connect(self._show_root_folder_info)
+        root_load_row.addWidget(self.btn_root_folder_info, 0)
+
+        det_layout.addLayout(root_load_row)
+
+        # Help / status text — not shown inline; revealed via the ⓘ info button
+        # (and updated in place after a load so the popup reflects the last result).
+        self.root_folder_info = QLabel(
+            "Pick the folder that directly contains the cam0, cam1, …, cam<N> folders.\n"
+            "Num Cameras updates automatically.\n"
+            "Alternatively, you can load each camera folder individually by clicking the Load button below."
+        )
+        self.root_folder_info.setWordWrap(True)
+        self.root_folder_info.setVisible(False)
+
         # Table (with per-camera focal length and image size)
         det_layout.addWidget(QLabel("Camera Images:"))
         self.wand_cam_table = QTableWidget()
@@ -1377,6 +1445,32 @@ class CameraCalibrationView(QWidget):
         mode_row.addStretch()
         det_layout.addLayout(mode_row)
 
+        # HZ_fix: Output Path section (above the action buttons). "Process All
+        # Frames" saves/resumes the detection CSV here instead of prompting for a
+        # path each run (and prompting again at the end).
+        output_group = QGroupBox("Output Path for wand_points.csv")
+        output_layout = QVBoxLayout(output_group)
+        output_row = QHBoxLayout()
+        self.wand_output_path_edit = QLineEdit()
+        self.wand_output_path_edit.setPlaceholderText(
+            "Set where to save / resume the detection CSV (wand_points.csv)"
+        )
+        self.wand_output_path_edit.setStyleSheet("""
+            background-color: #2d3a4a;
+            border: 1px solid #3d4a5a;
+            border-radius: 6px;
+            padding: 6px 10px;
+            color: #eaeaea;
+            selection-background-color: #0f3460;
+        """)
+        self.btn_browse_output = QPushButton("Browse…")
+        self.btn_browse_output.setStyleSheet(btn_style)
+        self.btn_browse_output.clicked.connect(self._browse_wand_output_path)
+        output_row.addWidget(self.wand_output_path_edit, 1)
+        output_row.addWidget(self.btn_browse_output)
+        output_layout.addLayout(output_row)
+        det_layout.addWidget(output_group)
+
         # Actions
         self.btn_detect_single = QPushButton("Test Detect (Current Frame)")
         self.btn_detect_single.setStyleSheet(btn_style)
@@ -1387,6 +1481,19 @@ class CameraCalibrationView(QWidget):
         self.btn_process_wand.setStyleSheet(btn_style)
         self.btn_process_wand.clicked.connect(self._process_wand_frames)
         det_layout.addWidget(self.btn_process_wand)
+
+        # HZ_fix: write a one-line terminal command (== "Process All Frames")
+        # into the T0 folder. Green style matches the preprocessing page's
+        # "Generate CLI" button.
+        self.btn_generate_cli = QPushButton("Generate CLI")
+        self.btn_generate_cli.setStyleSheet(self.GENERATE_CLI_BTN_STYLE)
+        self.btn_generate_cli.setToolTip(
+            "Write Point_Detection_CLI.txt into the T0 folder using the current "
+            "detection settings, sample 3% of frames, and run point detection on "
+            "them to produce a reference CSV for verifying the CLI."
+        )
+        self.btn_generate_cli.clicked.connect(self._generate_point_detection_cli)
+        det_layout.addWidget(self.btn_generate_cli)
 
         axis_mode_row = QHBoxLayout()
         axis_mode_row.setContentsMargins(0, 0, 0, 0)
@@ -1466,7 +1573,37 @@ class CameraCalibrationView(QWidget):
         cal_layout = QVBoxLayout(cal_content)
         cal_layout.setSpacing(15)
         cal_layout.setContentsMargins(10, 10, 10, 10)
-        
+
+        # Parameter-only import/export. Image folders, wand CSVs, and output paths
+        # deliberately remain outside this portable calibration preset.
+        config_group = QGroupBox("Calibration Parameter Preset (no paths)")
+        config_layout = QHBoxLayout(config_group)
+        config_btn_style = (
+            "QPushButton { background-color:#4a3f6b; color:white; "
+            "border:1px solid #6a5a9a; border-radius:4px; padding:8px; "
+            "font-size:13px; min-height:25px; }"
+            "QPushButton:hover { background-color:#5d4f86; }"
+        )
+        self.btn_import_cal_config = QPushButton("Import Config")
+        self.btn_import_cal_config.setStyleSheet(config_btn_style)
+        self.btn_import_cal_config.setToolTip(
+            "Load calibration parameters, camera count, per-camera focal/image "
+            "size, refraction mapping, and filters. Data and output paths are not loaded."
+        )
+        self.btn_import_cal_config.clicked.connect(self._import_cal_config)
+
+        self.btn_export_cal_config = QPushButton("Export Config")
+        self.btn_export_cal_config.setStyleSheet(config_btn_style)
+        self.btn_export_cal_config.setToolTip(
+            "Save calibration parameters, camera count, per-camera focal/image "
+            "size, refraction mapping, and filters. Data and output paths are not saved."
+        )
+        self.btn_export_cal_config.clicked.connect(self._export_cal_config)
+
+        config_layout.addWidget(self.btn_import_cal_config)
+        config_layout.addWidget(self.btn_export_cal_config)
+        cal_layout.addWidget(config_group)
+
         cal_group = QGroupBox("Calibration Settings")
         cal_form = QFormLayout(cal_group)
         
@@ -1608,7 +1745,7 @@ class CameraCalibrationView(QWidget):
         self._update_refraction_cam_table(4)
         
         cal_layout.addStretch()
-        
+
         # Load Points Button
         self.btn_load_points = QPushButton("Load Wand Points (from CSV)")
         self.btn_load_points.setStyleSheet(btn_style)
@@ -1635,7 +1772,7 @@ class CameraCalibrationView(QWidget):
         self.btn_calibrate_wand.setStyleSheet(btn_style_primary)
         self.btn_calibrate_wand.clicked.connect(self._run_wand_calibration)
         cal_layout.addWidget(self.btn_calibrate_wand)
-        
+
         # --- Error Analysis Section (shown after calibration) ---
         error_header_row = QHBoxLayout()
         error_header_row.addWidget(QLabel("Error Analysis:"))
@@ -1648,6 +1785,20 @@ class CameraCalibrationView(QWidget):
 
         
         error_header_row.addStretch()
+
+        # HZ_fix: pop up an Error Matrix window (per-camera stats + full matrix).
+        self.btn_error_matrix = QPushButton("Error Matrix")
+        self.btn_error_matrix.setStyleSheet(
+            "background-color:#2a3f5f; color:white; font-size:11px; "
+            "padding:4px 10px; border-radius:4px;"
+        )
+        self.btn_error_matrix.setToolTip(
+            "Open a window with per-camera error stats (mean, median, tail %) and "
+            "the full frame x camera error matrix."
+        )
+        self.btn_error_matrix.clicked.connect(self._show_error_matrix)
+        error_header_row.addWidget(self.btn_error_matrix)
+
         cal_layout.addLayout(error_header_row)
         
         # Error Table with horizontal scroll and sorting
@@ -1896,7 +2047,20 @@ class CameraCalibrationView(QWidget):
             }
         """
         self.INDEXING_BTN_STYLE = "background-color: #2a2a2a; border: 1px solid #555; color: #fff; padding: 6px; font-weight: bold;"
-        
+
+        # HZ_fix: green "Generate CLI" style, matching the preprocessing page.
+        self.GENERATE_CLI_BTN_STYLE = """
+            QPushButton {
+                background-color: #1f5f3a;
+                color: white;
+                border: 1px solid #2d7a4d;
+                border-radius: 4px;
+                padding: 10px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #2d7a4d; }
+        """
+
         self.setup_ui()
 
     def _busy_begin(self, key, task_name):
@@ -3168,25 +3332,13 @@ class CameraCalibrationView(QWidget):
         self.wand_cam_table.setRowCount(count)
         self.wand_images = {i: [] for i in range(count)}
         
-        # Update Vis Tabs (Wand)
+        # Update Vis area (Wand): rebuild the 2-column camera grid (HZ_fix).
+        # The "Cams" / "3D View" tabs themselves are created once in
+        # create_wand_tab_v2; here we only repopulate the camera labels.
         try:
-            self.vis_tabs.clear()
-            self.cam_vis_labels = {}
-            for i in range(count):
-                lbl = ZoomableImageLabel("No Image")
-                lbl.setStyleSheet("background: #1a1a1a; color: #666; font-size: 18px;")
-                lbl.axis_point_selected.connect(lambda pt, axis_idx, idx=i: self._on_wand_axis_point_selected(pt, axis_idx, idx))
-                self.cam_vis_labels[i] = lbl
-                self.vis_tabs.addTab(lbl, f"Cam {i+1}")
-            
-            # Add 3D View tab at the end
-            if not hasattr(self, 'calib_3d_view') or self.calib_3d_view is None:
-                self.calib_3d_view = Calibration3DViewer()
-            self.vis_tabs.addTab(self.calib_3d_view, "3D View")
-            # self.vis_tabs.addTab(QLabel("3D View Disabled (Debug)"), "3D View")
-            
+            self._build_cam_vis_grid(count)
         except RuntimeError:
-            return 
+            return
 
         for i in range(count):
             # Col 0: Load Folder button (compact)
@@ -3540,8 +3692,8 @@ class CameraCalibrationView(QWidget):
             self._focus_axis_camera(row)
 
     def _focus_axis_camera(self, cam_idx):
-        if hasattr(self, 'vis_tabs'):
-            self.vis_tabs.setCurrentIndex(cam_idx)
+        # HZ_fix: switch to the 'Cams' tab and expand the focused camera.
+        self._show_cam_in_vis(cam_idx, expand=True)
         self._show_axis_image_for_cam(cam_idx)
 
     def _show_axis_image_for_cam(self, cam_idx):
@@ -3931,6 +4083,721 @@ class CameraCalibrationView(QWidget):
                 self._visualize_keypoints_with_origin()
             else:
                 target_label.setText(f"Failed to load image:\n{Path(img_path).name}")
+
+    def _build_cam_vis_grid(self, count):
+        """HZ_fix: (Re)build the 2-column camera image grid in the 'Cams' tab.
+
+        Cameras are laid out 2 per row (cam0 top-left, cam1 top-right, cam2 next
+        row, ...). With more than 4 cameras the grid scrolls vertically. Each
+        label is a ZoomableImageLabel whose clicked() signal toggles an expanded,
+        full-view of that single camera.
+        """
+        if not hasattr(self, 'cam_grid_layout'):
+            return
+
+        # Make sure we are showing the grid (not an expanded camera) before rebuild.
+        self._expanded_cam = None
+        if hasattr(self, 'cams_stack'):
+            self.cams_stack.setCurrentIndex(0)
+
+        # Remove any existing labels from the grid (and the expanded holder).
+        for layout in (self.cam_grid_layout, getattr(self, 'cam_expanded_layout', None)):
+            if layout is None:
+                continue
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
+
+        self.cam_vis_labels = {}
+        for i in range(count):
+            lbl = ZoomableImageLabel(f"Cam {i} (No Image)")
+            lbl.setStyleSheet(
+                "background: #111; border: 1px solid #333; color: #555; font-size: 14px;"
+            )
+            lbl.setMinimumSize(240, 200)
+            lbl.setToolTip("Click to expand / collapse this camera view.")
+            lbl.axis_point_selected.connect(
+                lambda pt, axis_idx, idx=i: self._on_wand_axis_point_selected(pt, axis_idx, idx)
+            )
+            lbl.clicked.connect(lambda idx=i: self._on_cam_label_clicked(idx))
+            r, c = divmod(i, 2)
+            self.cam_grid_layout.addWidget(lbl, r, c)
+            self.cam_vis_labels[i] = lbl
+
+        # Equal width for the two columns.
+        self.cam_grid_layout.setColumnStretch(0, 1)
+        self.cam_grid_layout.setColumnStretch(1, 1)
+
+    def _on_cam_label_clicked(self, cam_idx):
+        """HZ_fix: Toggle between the 2-column grid and a single expanded camera."""
+        if not hasattr(self, 'cams_stack'):
+            return
+        if self._expanded_cam is None:
+            lbl = self.cam_vis_labels.get(cam_idx)
+            if lbl is None:
+                return
+            # Reparent the label into the expanded page and show it full-size.
+            self.cam_expanded_layout.addWidget(lbl)
+            self.cams_stack.setCurrentIndex(1)
+            self._expanded_cam = cam_idx
+        else:
+            # Any click while expanded returns to the grid.
+            self._collapse_cam_view()
+
+    def _collapse_cam_view(self, *args):
+        """HZ_fix: Return the expanded camera to its slot in the 2-column grid."""
+        if self._expanded_cam is None:
+            return
+        cam_idx = self._expanded_cam
+        lbl = self.cam_vis_labels.get(cam_idx)
+        if lbl is not None and hasattr(self, 'cam_grid_layout'):
+            r, c = divmod(cam_idx, 2)
+            self.cam_grid_layout.addWidget(lbl, r, c)
+        self._expanded_cam = None
+        if hasattr(self, 'cams_stack'):
+            self.cams_stack.setCurrentIndex(0)
+
+    def _show_cam_in_vis(self, cam_idx, expand=False):
+        """HZ_fix: Focus a camera in the 'Cams' / '3D View' layout.
+
+        Switches to the 'Cams' tab. When ``expand`` is True the requested camera
+        is shown full-size (matching the old behavior where each camera had its
+        own dedicated tab); otherwise the grid is shown.
+        """
+        if not hasattr(self, 'vis_tabs'):
+            return
+        self.vis_tabs.setCurrentIndex(0)  # 'Cams' tab
+        if cam_idx not in self.cam_vis_labels:
+            return
+        if expand:
+            if self._expanded_cam is not None and self._expanded_cam != cam_idx:
+                self._collapse_cam_view()
+            if self._expanded_cam is None:
+                self._on_cam_label_clicked(cam_idx)
+
+    def _wand_cam_folders(self):
+        """HZ_fix: Map cam_idx -> folder for cameras that have loaded images."""
+        from pathlib import Path
+        folders = {}
+        for cam_idx, files in self.wand_images.items():
+            if files:
+                folders[cam_idx] = str(Path(files[0]).parent)
+        return folders
+
+    def _show_generate_cli_dialog(self, command, default_save_path, subtitle=""):
+        """HZ_fix: Popup showing a generated CLI command with Save / Copy / Close.
+
+        Does NOT write any file automatically — the user chooses Save (asks where),
+        Copy CLI (to clipboard), or Close.
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPlainTextEdit,
+            QPushButton, QApplication,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Generate CLI")
+        dlg.setMinimumWidth(660)
+        layout = QVBoxLayout(dlg)
+
+        if subtitle:
+            lbl = QLabel(subtitle)
+            lbl.setWordWrap(True)
+            layout.addWidget(lbl)
+
+        text = QPlainTextEdit()
+        text.setPlainText(command)
+        text.setReadOnly(True)
+        text.setMinimumHeight(150)
+        text.setStyleSheet(
+            "QPlainTextEdit { background:#0d1117; color:#7ee787; "
+            "font-family: Menlo, Consolas, monospace; font-size: 12px; "
+            "border:1px solid #333; padding:6px; }"
+        )
+        layout.addWidget(text, 1)
+
+        btn_style = ("QPushButton { background:#2a3f5f; color:white; padding:6px 18px; "
+                     "border:1px solid #444; border-radius:4px; }"
+                     "QPushButton:hover { background:#3b5278; }")
+        btn_save = QPushButton("Save")
+        btn_copy = QPushButton("Copy CLI")
+        btn_close = QPushButton("Close")
+        for b in (btn_save, btn_copy, btn_close):
+            b.setStyleSheet(btn_style)
+
+        row = QHBoxLayout()
+        row.addWidget(btn_save)      # bottom-left
+        row.addStretch()
+        row.addWidget(btn_copy)      # middle
+        row.addStretch()
+        row.addWidget(btn_close)     # bottom-right
+        layout.addLayout(row)
+
+        def do_save():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, "Save CLI Command", str(default_save_path),
+                "Text Files (*.txt);;All Files (*)"
+            )
+            if not path:
+                return
+            try:
+                with open(path, 'w') as f:
+                    f.write(command + "\n")
+            except OSError as e:
+                QMessageBox.critical(dlg, "Save", f"Failed to write:\n{e}")
+                return
+            self.status_label.setText(f"Saved CLI command to {path}")
+            QMessageBox.information(dlg, "Saved", f"Saved to:\n{path}")
+
+        def do_copy():
+            QApplication.clipboard().setText(command)
+            self.status_label.setText("CLI command copied to clipboard")
+            btn_copy.setText("Copied!")
+
+        btn_save.clicked.connect(do_save)
+        btn_copy.clicked.connect(do_copy)
+        btn_close.clicked.connect(dlg.accept)
+
+        self._generate_cli_dialog = dlg  # keep a reference
+        dlg.exec()
+
+    def _generate_point_detection_cli(self, checked=False):
+        """HZ_fix: Show the one-line "Process All Frames" command (Save/Copy/Close).
+
+        Copy that line into a terminal and it runs exactly what the
+        "Process All Frames / Resume" button does — the same detection over all
+        frames in T0/cam<N>/ with the current UI settings — writing wand_points.csv.
+        """
+        from pathlib import Path
+        from .wand_calibration.point_detection_cli import build_cli_command
+
+        cam_folders = self._wand_cam_folders()
+        if not cam_folders:
+            QMessageBox.warning(
+                self, "Generate CLI",
+                "Load camera images first (use 'Auto-Load Cameras from Folder' "
+                "or the per-camera Load buttons)."
+            )
+            return
+
+        # Resolve T0 directory: prefer the one captured by the Root folder loader,
+        # otherwise fall back to the common parent of the camera folders.
+        t0_dir = getattr(self, 'wand_t0_dir', None)
+        if not t0_dir:
+            t0_dir = str(Path(next(iter(cam_folders.values()))).parent)
+        t0_dir = Path(t0_dir)
+
+        # Current UI detection settings (same values "Process All Frames" reads).
+        wand_type = "dark" if "Dark" in self.wand_type_combo.currentText() else "bright"
+        min_r, max_r = self.radius_range.value()
+        sensitivity = self.sensitivity_slider.value()
+        detect_mode = self._get_wand_detect_mode()
+
+        cli_txt_path = t0_dir / "Point_Detection_CLI.txt"
+        out_csv = t0_dir / "wand_points.csv"
+
+        command = build_cli_command(
+            str(t0_dir), wand_type, min_r, max_r, sensitivity,
+            detect_mode, str(out_csv),
+        )
+        self._show_generate_cli_dialog(
+            command,
+            default_save_path=cli_txt_path,
+            subtitle=(
+                "One-line command that runs 'Process All Frames' headless "
+                f"(writes {out_csv.name}). Save it, copy it into a terminal, or close."
+            ),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Cal-page config import / export (HZ_fix)                            #
+    # ------------------------------------------------------------------ #
+    def _collect_cal_config(self):
+        """Gather a portable, parameter-only calibration preset."""
+        camera_count = int(self.wand_num_cams.value())
+        camera_settings = self._collect_camera_settings_from_table()
+        cameras = []
+        for cam_id in range(camera_count):
+            settings = camera_settings.get(cam_id)
+            if settings is None:
+                raise ValueError(f"Camera {cam_id} settings are missing from the camera table.")
+            cameras.append({
+                "camera_id": cam_id,
+                "focal_px": int(round(settings["focal"])),
+                "image_width": int(settings["width"]),
+                "image_height": int(settings["height"]),
+            })
+
+        cam_window_map = []
+        if hasattr(self, 'cam_window_table') and self.cam_window_table is not None:
+            if self.cam_window_table.rowCount() != camera_count:
+                raise ValueError(
+                    "Camera-window table row count does not match Num Cameras."
+                )
+            for row in range(self.cam_window_table.rowCount()):
+                combo = self.cam_window_table.cellWidget(row, 1)
+                if combo is None or combo.currentIndex() < 0:
+                    raise ValueError(
+                        f"Camera {row} does not have a valid window assignment."
+                    )
+                cam_window_map.append(combo.currentIndex())
+
+        return {
+            "version": 2,
+            "scope": "calibration_parameters",
+            "camera_count": camera_count,
+            "cameras": cameras,
+            "camera_model": self.wand_model_combo.currentIndex(),
+            "wand_length": self.wand_len_spin.value(),
+            "distortion": self.dist_model_combo.currentIndex(),
+            "refraction": {
+                "window_count": self.window_count_spin.value(),
+                "cam_window_map": cam_window_map,
+                "media1": {
+                    "type": self.media1_combo.currentIndex(),
+                    "index": self.media1_index.value(),
+                },
+                "media2": {
+                    "type": self.media2_combo.currentIndex(),
+                    "index": self.media2_index.value(),
+                    "thickness": self.media2_thick.value(),
+                },
+                "media3": {
+                    "type": self.media3_combo.currentIndex(),
+                    "index": self.media3_index.value(),
+                },
+            },
+            "filters": {
+                "proj_enabled": self.filter_proj_check.isChecked(),
+                "proj_threshold": self.filter_proj_spin.value(),
+                "len_enabled": self.filter_len_check.isChecked(),
+                "len_threshold": self.filter_len_spin.value(),
+            },
+        }
+
+    def _validate_cal_config(self, cfg):
+        """Validate a calibration preset without changing the current UI."""
+        if not isinstance(cfg, dict):
+            raise ValueError("The config root must be a JSON object.")
+
+        def _require_int(value, label):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{label} must be an integer.")
+            return value
+
+        def _check_spin(value, widget, label):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{label} must be a number.")
+            value = float(value)
+            if not np.isfinite(value):
+                raise ValueError(f"{label} must be finite.")
+            if value < widget.minimum() or value > widget.maximum():
+                raise ValueError(
+                    f"{label}={value:g} is outside the supported range "
+                    f"[{widget.minimum():g}, {widget.maximum():g}]."
+                )
+
+        def _check_combo(value, combo, label):
+            idx = _require_int(value, label)
+            if idx < 0 or idx >= combo.count():
+                raise ValueError(
+                    f"{label} index {idx} is invalid; expected 0..{combo.count() - 1}."
+                )
+
+        version = _require_int(cfg.get("version", 1), "version")
+        if version not in (1, 2):
+            raise ValueError(f"Unsupported calibration config version: {version}.")
+        if "scope" in cfg and cfg["scope"] != "calibration_parameters":
+            raise ValueError("This JSON file is not a calibration-parameter config.")
+
+        if version >= 2 and "camera_count" not in cfg:
+            raise ValueError("Version 2 config is missing camera_count.")
+        camera_count = _require_int(
+            cfg.get("camera_count", int(self.wand_num_cams.value())),
+            "camera_count",
+        )
+        if camera_count < self.wand_num_cams.minimum() or camera_count > self.wand_num_cams.maximum():
+            raise ValueError(
+                f"camera_count={camera_count} is outside the supported range "
+                f"[{self.wand_num_cams.minimum()}, {self.wand_num_cams.maximum()}]."
+            )
+
+        camera_entries = cfg.get("cameras")
+        if version >= 2 and camera_entries is None:
+            raise ValueError("Version 2 config is missing per-camera settings.")
+        if camera_entries is not None:
+            if not isinstance(camera_entries, list):
+                raise ValueError("cameras must be a JSON array.")
+            if len(camera_entries) != camera_count:
+                raise ValueError(
+                    f"cameras contains {len(camera_entries)} entries, but "
+                    f"camera_count is {camera_count}."
+                )
+
+            focal_widget = self.wand_cam_table.cellWidget(0, 2)
+            width_widget = self.wand_cam_table.cellWidget(0, 3)
+            height_widget = self.wand_cam_table.cellWidget(0, 4)
+            if not all((focal_widget, width_widget, height_widget)):
+                raise RuntimeError("Camera parameter controls are unavailable.")
+
+            seen_ids = set()
+            for entry in camera_entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("Every cameras entry must be a JSON object.")
+                missing = {
+                    "camera_id", "focal_px", "image_width", "image_height"
+                } - set(entry)
+                if missing:
+                    raise ValueError(
+                        "Camera entry is missing: " + ", ".join(sorted(missing)) + "."
+                    )
+                cam_id = _require_int(entry["camera_id"], "camera_id")
+                if cam_id < 0 or cam_id >= camera_count:
+                    raise ValueError(
+                        f"camera_id {cam_id} is invalid for {camera_count} cameras."
+                    )
+                if cam_id in seen_ids:
+                    raise ValueError(f"camera_id {cam_id} appears more than once.")
+                seen_ids.add(cam_id)
+                focal = _require_int(entry["focal_px"], f"camera {cam_id} focal_px")
+                width = _require_int(entry["image_width"], f"camera {cam_id} image_width")
+                height = _require_int(entry["image_height"], f"camera {cam_id} image_height")
+                _check_spin(focal, focal_widget, f"camera {cam_id} focal_px")
+                _check_spin(width, width_widget, f"camera {cam_id} image_width")
+                _check_spin(height, height_widget, f"camera {cam_id} image_height")
+            expected_ids = set(range(camera_count))
+            if seen_ids != expected_ids:
+                missing_ids = sorted(expected_ids - seen_ids)
+                raise ValueError(f"Missing camera settings for IDs: {missing_ids}.")
+
+        if "camera_model" in cfg:
+            _check_combo(cfg["camera_model"], self.wand_model_combo, "camera_model")
+        if "wand_length" in cfg:
+            _check_spin(cfg["wand_length"], self.wand_len_spin, "wand_length")
+        if "distortion" in cfg:
+            _check_combo(cfg["distortion"], self.dist_model_combo, "distortion")
+
+        ref = cfg.get("refraction", {})
+        if not isinstance(ref, dict):
+            raise ValueError("refraction must be a JSON object.")
+        window_count = _require_int(
+            ref.get("window_count", int(self.window_count_spin.value())),
+            "refraction.window_count",
+        )
+        if window_count < self.window_count_spin.minimum() or window_count > self.window_count_spin.maximum():
+            raise ValueError(
+                f"refraction.window_count={window_count} is outside the supported range "
+                f"[{self.window_count_spin.minimum()}, {self.window_count_spin.maximum()}]."
+            )
+
+        cam_window_map = ref.get("cam_window_map")
+        if version >= 2 and cam_window_map is None:
+            raise ValueError("Version 2 config is missing refraction.cam_window_map.")
+        if cam_window_map is not None:
+            if not isinstance(cam_window_map, list):
+                raise ValueError("refraction.cam_window_map must be a JSON array.")
+            if len(cam_window_map) != camera_count:
+                raise ValueError(
+                    "refraction.cam_window_map has "
+                    f"{len(cam_window_map)} entries, but camera_count is {camera_count}. "
+                    "The mapping must contain exactly one window index per camera."
+                )
+            for cam_id, win_idx in enumerate(cam_window_map):
+                win_idx = _require_int(
+                    win_idx, f"refraction.cam_window_map[{cam_id}]"
+                )
+                if win_idx < 0 or win_idx >= window_count:
+                    raise ValueError(
+                        f"Camera {cam_id} maps to window {win_idx}, but valid window "
+                        f"indices are 0..{window_count - 1}."
+                    )
+
+        for media_name, combo, index_widget in (
+            ("media1", self.media1_combo, self.media1_index),
+            ("media2", self.media2_combo, self.media2_index),
+            ("media3", self.media3_combo, self.media3_index),
+        ):
+            media = ref.get(media_name, {})
+            if not isinstance(media, dict):
+                raise ValueError(f"refraction.{media_name} must be a JSON object.")
+            if "type" in media:
+                _check_combo(media["type"], combo, f"refraction.{media_name}.type")
+            if "index" in media:
+                _check_spin(media["index"], index_widget, f"refraction.{media_name}.index")
+        media2 = ref.get("media2", {})
+        if "thickness" in media2:
+            _check_spin(
+                media2["thickness"], self.media2_thick,
+                "refraction.media2.thickness",
+            )
+
+        filters = cfg.get("filters", {})
+        if not isinstance(filters, dict):
+            raise ValueError("filters must be a JSON object.")
+        if "proj_enabled" in filters and not isinstance(filters["proj_enabled"], bool):
+            raise ValueError("filters.proj_enabled must be true or false.")
+        if "proj_threshold" in filters:
+            _check_spin(filters["proj_threshold"], self.filter_proj_spin, "filters.proj_threshold")
+        if "len_enabled" in filters and not isinstance(filters["len_enabled"], bool):
+            raise ValueError("filters.len_enabled must be true or false.")
+        if "len_threshold" in filters:
+            _check_spin(filters["len_threshold"], self.filter_len_spin, "filters.len_threshold")
+
+        return camera_count, camera_entries
+
+    def _apply_cal_config(self, cfg):
+        """Apply a validated calibration-parameter config to the widgets."""
+        camera_count, camera_entries = self._validate_cal_config(cfg)
+
+        def _set_combo(combo, idx):
+            if combo is not None and idx is not None:
+                combo.setCurrentIndex(int(idx))
+
+        if self.wand_num_cams.value() != camera_count:
+            self.wand_num_cams.setValue(camera_count)
+
+        if camera_entries is not None:
+            for entry in camera_entries:
+                row = int(entry["camera_id"])
+                self.wand_cam_table.cellWidget(row, 2).setValue(int(entry["focal_px"]))
+                self.wand_cam_table.cellWidget(row, 3).setValue(int(entry["image_width"]))
+                self.wand_cam_table.cellWidget(row, 4).setValue(int(entry["image_height"]))
+
+        if "camera_model" in cfg:
+            _set_combo(self.wand_model_combo, cfg["camera_model"])
+        if "wand_length" in cfg:
+            self.wand_len_spin.setValue(float(cfg["wand_length"]))
+        if "distortion" in cfg:
+            _set_combo(self.dist_model_combo, cfg["distortion"])
+
+        ref = cfg.get("refraction", {})
+        if "window_count" in ref:
+            # Triggers _on_window_count_changed -> rebuilds cam_window_table.
+            self.window_count_spin.setValue(int(ref["window_count"]))
+        m1 = ref.get("media1", {})
+        _set_combo(self.media1_combo, m1.get("type"))
+        if "index" in m1:
+            self.media1_index.setValue(float(m1["index"]))
+        m2 = ref.get("media2", {})
+        _set_combo(self.media2_combo, m2.get("type"))
+        if "index" in m2:
+            self.media2_index.setValue(float(m2["index"]))
+        if "thickness" in m2:
+            self.media2_thick.setValue(float(m2["thickness"]))
+        m3 = ref.get("media3", {})
+        _set_combo(self.media3_combo, m3.get("type"))
+        if "index" in m3:
+            self.media3_index.setValue(float(m3["index"]))
+
+        # Apply per-camera window mapping after the table was rebuilt.
+        cam_window_map = ref.get("cam_window_map")
+        if cam_window_map is not None:
+            for row, win_idx in enumerate(cam_window_map):
+                combo = self.cam_window_table.cellWidget(row, 1)
+                _set_combo(combo, win_idx)
+
+        filt = cfg.get("filters", {})
+        if "proj_enabled" in filt:
+            self.filter_proj_check.setChecked(bool(filt["proj_enabled"]))
+        if "proj_threshold" in filt:
+            self.filter_proj_spin.setValue(float(filt["proj_threshold"]))
+        if "len_enabled" in filt:
+            self.filter_len_check.setChecked(bool(filt["len_enabled"]))
+        if "len_threshold" in filt:
+            self.filter_len_spin.setValue(float(filt["len_threshold"]))
+
+    def _export_cal_config(self, checked=False):
+        """Save a parameter-only calibration preset to a JSON file."""
+        import json
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Calibration Config", "wand_cal_config.json",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            cfg = self._collect_cal_config()
+            self._validate_cal_config(cfg)
+            with open(path, 'w') as f:
+                json.dump(cfg, f, indent=2)
+        except (OSError, ValueError) as e:
+            QMessageBox.critical(self, "Export Config", f"Failed to write config:\n{e}")
+            return
+        self.status_label.setText(f"Exported calibration config to {path}")
+        QMessageBox.information(
+            self, "Export Config",
+            f"Calibration parameters saved to:\n{path}\n\n"
+            "Image folders, wand CSV, T0, and output paths are not included."
+        )
+
+    def _import_cal_config(self, checked=False):
+        """Load a parameter-only calibration preset from a JSON file."""
+        import json
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Calibration Config", "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'r') as f:
+                cfg = json.load(f)
+        except (OSError, ValueError) as e:
+            QMessageBox.critical(self, "Import Config", f"Failed to read config:\n{e}")
+            return
+        try:
+            self._apply_cal_config(cfg)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Config", f"Failed to apply config:\n{e}")
+            return
+        self.status_label.setText(f"Imported calibration config from {path}")
+        legacy_note = ""
+        if cfg.get("version", 1) == 1:
+            legacy_note = (
+                "\n\nLegacy version-1 config: camera count and per-camera "
+                "focal/image-size values were not stored and were left unchanged."
+            )
+        QMessageBox.information(
+            self, "Import Config",
+            f"Calibration parameters loaded from:\n{path}{legacy_note}\n\n"
+            "Image folders, wand CSV, T0, and output paths are not included."
+        )
+
+    def _load_wand_root_folder(self, checked=False):
+        """HZ_fix: Select the folder that directly contains the 'cam<N>' folders and
+        auto-load every 'cam<N>' (ascending by N) into the camera image slots.
+
+        If the number of cam folders found differs from the current Num Cameras
+        value, the spinbox is updated to match (e.g. >4 cameras are supported).
+        Detection / calibration algorithms are untouched; this only wires up the
+        same per-camera image loading the manual 'Load' buttons already perform.
+        """
+        import re
+        from pathlib import Path
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Folder Containing cam<N> Folders"
+        )
+        if not folder:
+            return
+
+        sel_dir = Path(folder)
+
+        # Find cam folders named 'cam<number>' (cam0, cam1, ...) directly inside the
+        # selected folder, ascending by number.
+        cam_pattern = re.compile(r"^cam(\d+)$", re.IGNORECASE)
+        cam_dirs = []
+        for child in sel_dir.iterdir():
+            if not child.is_dir():
+                continue
+            m = cam_pattern.match(child.name)
+            if m:
+                cam_dirs.append((int(m.group(1)), child))
+
+        if not cam_dirs:
+            self._set_root_folder_info(
+                f"No 'cam<N>' folders found in: {sel_dir.name}", error=True
+            )
+            QMessageBox.warning(
+                self, "Camera Folders",
+                f"No 'cam<N>' folders found directly inside:\n{sel_dir}"
+            )
+            return
+
+        cam_dirs.sort(key=lambda x: x[0])
+        num_found = len(cam_dirs)
+
+        # HZ_fix: gather the image list for every cam folder. The load PROCEEDS
+        # even when the per-camera frame counts differ — a warning is shown but the
+        # cameras are still loaded. Only a total absence of images aborts.
+        image_exts = ['.png', '.jpg', '.bmp', '.tif', '.jpeg']
+        cam_files = []
+        for n, cam_dir in cam_dirs:
+            files = sorted(
+                str(f) for f in cam_dir.iterdir()
+                if f.is_file() and f.suffix.lower() in image_exts
+            )
+            cam_files.append(files)
+
+        counts = {f"cam{n}": len(files) for (n, _), files in zip(cam_dirs, cam_files)}
+
+        if all(c == 0 for c in counts.values()):
+            self._set_root_folder_info(
+                "No images found in any cam folder. Nothing loaded.", error=True
+            )
+            QMessageBox.warning(
+                self, "Camera Folders",
+                f"No images found in any 'cam<N>' folder inside:\n{sel_dir}\n\n"
+                "Nothing was loaded."
+            )
+            return
+
+        detail = ", ".join(f"{name}={c}" for name, c in counts.items())
+        mismatch = len(set(counts.values())) > 1
+
+        # Remember the cam-folder location for the point-detection CLI.
+        self.wand_root_dir = str(sel_dir.parent)
+        self.wand_t0_dir = str(sel_dir)
+
+        # Update Num Cameras to match the number of cam folders found. Setting the
+        # value (when changed) triggers _update_wand_table, which rebuilds the rows
+        # and resets self.wand_images.
+        if self.wand_num_cams.value() != num_found:
+            self.wand_num_cams.setValue(num_found)
+        else:
+            # Same count: still rebuild so stale image lists are cleared.
+            self._update_wand_table(num_found)
+
+        for cam_idx, files in enumerate(cam_files):
+            self.wand_images[cam_idx] = files
+            btn = self.wand_cam_table.cellWidget(cam_idx, 0)
+            if btn:
+                btn.setText(f"{len(files)}")
+            self._update_wand_cam_size_from_first_image(cam_idx, files)
+
+        self._refresh_wand_radius_range_limit()
+        self.populate_wand_table()
+
+        cam_labels = ", ".join(f"cam{n}" for n, _ in cam_dirs)
+        if mismatch:
+            self._set_root_folder_info(
+                f"Loaded {num_found} cameras from {sel_dir.name}, but frame counts "
+                f"DIFFER ({detail}).", error=True
+            )
+            QMessageBox.warning(
+                self, "Camera Folders",
+                f"Loaded {num_found} camera folder(s) from:\n{sel_dir}\n\n"
+                f"Warning: the cameras have DIFFERENT numbers of images:\n{detail}\n\n"
+                "They were loaded anyway, but per-frame correspondence may be wrong — "
+                "make sure the frames are synchronized before detecting / calibrating."
+            )
+        else:
+            self._set_root_folder_info(
+                f"Loaded {num_found} cameras ({cam_labels}) from {sel_dir.name}. "
+                f"Num Cameras = {num_found}.", error=False
+            )
+            QMessageBox.information(
+                self, "Camera Folders",
+                f"Loaded {num_found} camera folder(s) from:\n{sel_dir}\n"
+                f"({next(iter(counts.values()))} frames per camera)"
+            )
+
+    def _set_root_folder_info(self, text, error=False):
+        """HZ_fix: update the status line shown below the Root folder button."""
+        if not hasattr(self, 'root_folder_info') or self.root_folder_info is None:
+            return
+        color = "#e06c6c" if error else "#6cc06c"
+        self.root_folder_info.setStyleSheet(f"color: {color}; font-size: 11px;")
+        self.root_folder_info.setText(text)
+
+    def _show_root_folder_info(self, checked=False):
+        """HZ_fix: Popup with the Auto-Load help / last-load status text."""
+        QMessageBox.information(
+            self, "Auto-Load Cameras", self.root_folder_info.text()
+        )
 
     def _load_wand_folder_for_cam(self, cam_idx):
         folder = QFileDialog.getExistingDirectory(self, f"Select Image Folder for Camera {cam_idx+1}")
@@ -5079,6 +5946,29 @@ class CameraCalibrationView(QWidget):
         self.status_label.setText(f"Frame {idx}: Found {total_points} points in {len(res)} cameras.")
         self._busy_end('wand_detect_single')
 
+    def _browse_wand_output_path(self, checked=False):
+        """HZ_fix: pick the detection-results CSV path for the Output Path field.
+
+        The chosen path is where 'Process All Frames' saves results (or an
+        existing file to RESUME from).
+        """
+        start_dir = ""
+        current = self.wand_output_path_edit.text().strip()
+        if current:
+            start_dir = current
+        elif getattr(self, 'wand_t0_dir', ''):
+            from pathlib import Path
+            start_dir = str(Path(self.wand_t0_dir) / "wand_points.csv")
+        else:
+            start_dir = "wand_points.csv"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Select Output File (detection results)",
+            start_dir, "CSV Files (*.csv)"
+        )
+        if path:
+            self.wand_output_path_edit.setText(path)
+
     def _process_wand_frames(self, checked=False):
         from .wand_calibration.wand_calibrator import WandCalibrator, WandDetectionWorker
         from .widgets import ProcessingDialog
@@ -5094,17 +5984,22 @@ class CameraCalibrationView(QWidget):
             QMessageBox.warning(self, "No Images", "Please load images first.")
             return
 
-        # 0. Info Popup (UX Improvement)
-        QMessageBox.information(self, "Process Frames", 
-                                "Please select the path to save the detection results.\n\n"
-                                "You can also select a previously-saved results file to RESUME processing.",
-                                QMessageBox.StandardButton.Ok)
-
-        # 1. Prompt for Save Path (Autosave)
-        autosave_path, _ = QFileDialog.getSaveFileName(self, "Select Save File (Autosave)", "wand_points.csv", "CSV Files (*.csv)")
+        # HZ_fix: read the autosave path from the "Output Path" section instead of
+        # prompting for it here (and again at the end). If it is empty, ask the
+        # user to set it first.
+        autosave_path = ""
+        if hasattr(self, 'wand_output_path_edit') and self.wand_output_path_edit is not None:
+            autosave_path = self.wand_output_path_edit.text().strip()
         if not autosave_path:
-            return # User cancelled
-            
+            QMessageBox.warning(
+                self, "No Output Path",
+                "Please set an Output Path first (the 'Output Path' section above "
+                "the buttons), then click Process All Frames again.\n\n"
+                "Point it at a new file to start fresh, or at an existing results "
+                "file to RESUME processing."
+            )
+            return
+
         resume = False
         # 2. Check if file exists -> Resume?
         if QFileInfo(autosave_path).exists():
@@ -5194,20 +6089,10 @@ class CameraCalibrationView(QWidget):
              else:
                  from PySide6.QtWidgets import QMessageBox
                  QMessageBox.warning(self, "Detection Failed", msg)
-        from PySide6.QtWidgets import QMessageBox, QFileDialog
-        
-        reply = QMessageBox.question(self, "Export Data", "Detection complete. Do you want to export the point data?", 
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        
-        if reply == QMessageBox.StandardButton.Yes:
-             path, _ = QFileDialog.getSaveFileName(self, "Save Wand Data", "wand_points.csv", "CSV Files (*.csv)")
-             if path:
-                 success, msg = self.wand_calibrator.export_wand_data(path)
-                 if success:
-                     QMessageBox.information(self, "Export", "Data exported successfully.")
-                 else:
-                     QMessageBox.warning(self, "Export Failed", msg)
-        
+        # HZ_fix: results are auto-saved to the Output Path during processing, so
+        # the redundant "Detection complete. Do you want to export?" prompt that
+        # used to run here was removed.
+
     def _apply_current_ui_filter(self):
         """Collect checked frames from table and apply to calibrator."""
         from PySide6.QtWidgets import QCheckBox
@@ -5314,11 +6199,11 @@ class CameraCalibrationView(QWidget):
         self._calib_worker = CalibrationWorker(self.wand_calibrator, wand_len, init_focal, precalibrate=precalibrate)
         self._calib_worker.finished_signal.connect(self._on_calibration_finished)
         self._calib_worker.cost_signal.connect(self._on_cost_update)
-        
-        self._calib_worker.start()
-        
-        # Create custom progress dialog with cost plot
+
+        # Create the plot before starting the worker so early progress signals
+        # cannot arrive before the line/status widgets exist.
         self._create_calibration_dialog()
+        self._calib_worker.start()
 
     def _collect_camera_settings_from_table(self):
         """Collect per-camera settings from detection table.
@@ -5491,6 +6376,7 @@ class CameraCalibrationView(QWidget):
         self._cost_ax.set_title('Cost vs Iteration', color='white', fontsize=10)
         
         # Initialize data and line
+        self._cost_iter_count = 0
         self._cost_iterations = []
         self._cost_values = []
         self._cost_line, = self._cost_ax.plot([], [], 'c-', linewidth=1.5)
@@ -5835,10 +6721,11 @@ class CameraCalibrationView(QWidget):
                 self.error_table.setItem(row, i + 1, item)
             
             # Length error (Col N+1)
-            len_err = err['len_error']
-            item = NumericTableWidgetItem(f"{len_err:.3f}")
+            len_err = err.get('len_error', float('nan'))
+            len_is_valid = np.isfinite(len_err)
+            item = NumericTableWidgetItem(f"{len_err:.3f}" if len_is_valid else "n/a")
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if len_err > self.filter_len_spin.value():
+            if len_is_valid and len_err > self.filter_len_spin.value():
                 item.setBackground(Qt.GlobalColor.darkRed)
             self.error_table.setItem(row, len(cam_ids) + 1, item)
         
@@ -5857,7 +6744,178 @@ class CameraCalibrationView(QWidget):
         # (repopulating data doesn't trigger sortIndicatorChanged signal)
         header = self.error_table.horizontalHeader()
         self._sync_frozen_table_sort(header.sortIndicatorSection(), header.sortIndicatorOrder())
-    
+
+    def _show_error_matrix(self, checked=False):
+        """HZ_fix: Pop up an Error Matrix window.
+
+        Top: per-camera projection-error stats — Mean, Median, a user-set Tail
+        percentile, and Max (plus an 'All cams' row and a wand-length summary).
+        Bottom: the full frame x camera error matrix (sortable, read-only).
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
+            QTableWidgetItem, QDoubleSpinBox, QPushButton,
+        )
+        import numpy as np
+
+        if not hasattr(self, 'wand_calibrator'):
+            QMessageBox.information(self, "Error Matrix", "Run a calibration first.")
+            return
+        errors = self.wand_calibrator.calculate_per_frame_errors()
+        if not errors:
+            QMessageBox.information(
+                self, "Error Matrix",
+                "No error data yet. Run 'Run Calibration' or 'Precalibrate to Check' first."
+            )
+            return
+
+        cam_ids = sorted({c for e in errors.values() for c in e['cam_errors'].keys()})
+        frame_ids = sorted(errors.keys())
+
+        # Collect per-camera projection-error distributions and wand-length errors.
+        per_cam = {c: [] for c in cam_ids}
+        len_errs = []
+        for fid in frame_ids:
+            e = errors[fid]
+            for c in cam_ids:
+                v = e['cam_errors'].get(c)
+                if v is not None and not np.isnan(v):
+                    per_cam[c].append(float(v))
+            le = e.get('len_error')
+            if le is not None and not np.isnan(le):
+                len_errs.append(float(le))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Error Matrix")
+        dlg.setMinimumSize(740, 580)
+        dlg.setStyleSheet("background-color:#0d1117; color:#e6e6e6;")
+        layout = QVBoxLayout(dlg)
+
+        # --- Top: tail % control + per-camera summary ---
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("Per-Camera Error Stats (px)"))
+        ctrl.addStretch()
+        ctrl.addWidget(QLabel("Tail %:"))
+        tail_spin = QDoubleSpinBox()
+        tail_spin.setRange(0.1, 50.0)
+        tail_spin.setSingleStep(1.0)
+        tail_spin.setValue(5.0)
+        tail_spin.setSuffix(" %")
+        tail_spin.setStyleSheet("background:#161b22; color:#fff; padding:2px 4px;")
+        tail_spin.setToolTip(
+            "Tail percentile: the projection error exceeded by the worst p% of "
+            "frames (i.e. the (100 - p)th percentile)."
+        )
+        ctrl.addWidget(tail_spin)
+        layout.addLayout(ctrl)
+
+        table_style = (
+            "QTableWidget{background:#161b22; gridline-color:#30363d;} "
+            "QHeaderView::section{background:#21262d; color:#fff; border:0; padding:3px;}"
+        )
+
+        summary = QTableWidget()
+        summary.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        summary.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        summary.verticalHeader().setVisible(False)
+        summary.setStyleSheet(table_style)
+        summary.setMaximumHeight(200)
+        layout.addWidget(summary)
+
+        len_label = QLabel("")
+        len_label.setStyleSheet("color:#9aa7b3; font-size:11px;")
+        layout.addWidget(len_label)
+
+        def _stats(vals, p):
+            arr = np.asarray(vals, dtype=float)
+            if arr.size == 0:
+                return None
+            return {
+                "n": arr.size,
+                "mean": float(arr.mean()),
+                "median": float(np.median(arr)),
+                "tail": float(np.percentile(arr, 100.0 - p)),
+                "max": float(arr.max()),
+            }
+
+        def fill_summary():
+            p = tail_spin.value()
+            cols = ["Camera", "N", "Mean", "Median", f"Tail {p:g}%", "Max"]
+            rows = [(f"Cam {c + 1}", per_cam[c]) for c in cam_ids]
+            rows.append(("All cams", [v for c in cam_ids for v in per_cam[c]]))
+            summary.setColumnCount(len(cols))
+            summary.setHorizontalHeaderLabels(cols)
+            summary.setRowCount(len(rows))
+            for r, (label, vals) in enumerate(rows):
+                st = _stats(vals, p)
+                if st is None:
+                    cells = [label, "0", "-", "-", "-", "-"]
+                else:
+                    cells = [label, str(st["n"]), f"{st['mean']:.3f}",
+                             f"{st['median']:.3f}", f"{st['tail']:.3f}", f"{st['max']:.3f}"]
+                for cidx, txt in enumerate(cells):
+                    item = QTableWidgetItem(txt)
+                    if cidx == 0 and label == "All cams":
+                        item.setForeground(Qt.GlobalColor.cyan)
+                    summary.setItem(r, cidx, item)
+            summary.resizeColumnsToContents()
+            summary.horizontalHeader().setStretchLastSection(True)
+            le = _stats(len_errs, p)
+            if le is None:
+                len_label.setText("Wand length error: n/a")
+            else:
+                len_label.setText(
+                    f"Wand length error (mm) — mean {le['mean']:.3f}, "
+                    f"median {le['median']:.3f}, tail {p:g}% {le['tail']:.3f}, "
+                    f"max {le['max']:.3f}"
+                )
+
+        tail_spin.valueChanged.connect(lambda _v: fill_summary())
+        fill_summary()
+
+        # --- Bottom: full frame x camera matrix ---
+        layout.addWidget(QLabel("Error Matrix (per-frame projection error px; Len Err mm)"))
+        matrix = QTableWidget()
+        matrix.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        matrix.verticalHeader().setVisible(False)
+        matrix.setStyleSheet(table_style)
+        matrix.setSortingEnabled(False)
+        headers = ["Frame"] + [f"Cam {c + 1}" for c in cam_ids] + ["Len Err (mm)"]
+        matrix.setColumnCount(len(headers))
+        matrix.setHorizontalHeaderLabels(headers)
+        matrix.setRowCount(len(frame_ids))
+        proj_thr = self.filter_proj_spin.value() if hasattr(self, 'filter_proj_spin') else float('inf')
+        len_thr = self.filter_len_spin.value() if hasattr(self, 'filter_len_spin') else float('inf')
+        for row, fid in enumerate(frame_ids):
+            e = errors[fid]
+            matrix.setItem(row, 0, NumericTableWidgetItem(str(fid)))
+            for i, c in enumerate(cam_ids):
+                v = e['cam_errors'].get(c, float('nan'))
+                it = NumericTableWidgetItem("nan" if np.isnan(v) else f"{v:.2f}")
+                if not np.isnan(v) and v > proj_thr:
+                    it.setBackground(Qt.GlobalColor.darkRed)
+                matrix.setItem(row, i + 1, it)
+            le = e.get('len_error', float('nan'))
+            le_is_valid = np.isfinite(le)
+            it = NumericTableWidgetItem(f"{le:.3f}" if le_is_valid else "n/a")
+            if le_is_valid and le > len_thr:
+                it.setBackground(Qt.GlobalColor.darkRed)
+            matrix.setItem(row, len(cam_ids) + 1, it)
+        matrix.setSortingEnabled(True)
+        matrix.resizeColumnsToContents()
+        layout.addWidget(matrix, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet("background:#2a3f5f; color:white; padding:5px 18px; border-radius:4px;")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._error_matrix_dialog = dlg  # keep a reference so it isn't GC'd
+        dlg.show()
+
     def _sync_frozen_table_sort(self, logical_index, order):
         """Handle sort request by manually sorting and repopulating BOTH tables."""
         from PySide6.QtWidgets import QCheckBox, QWidget, QHBoxLayout
@@ -5953,10 +7011,11 @@ class CameraCalibrationView(QWidget):
                 self.error_table.setItem(row, i + 1, item)
             
             # --- Error Table: Length error (Col N+1) ---
-            len_err = err['len_error']
-            item = NumericTableWidgetItem(f"{len_err:.3f}")
+            len_err = err.get('len_error', float('nan'))
+            len_is_valid = np.isfinite(len_err)
+            item = NumericTableWidgetItem(f"{len_err:.3f}" if len_is_valid else "n/a")
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if len_err > self.filter_len_spin.value():
+            if len_is_valid and len_err > self.filter_len_spin.value():
                 item.setBackground(Qt.GlobalColor.darkRed)
             self.error_table.setItem(row, len(cam_ids) + 1, item)
         
@@ -6010,8 +7069,9 @@ class CameraCalibrationView(QWidget):
         
         obs = wand_data[frame_id]  # {cam_idx: [[x,y,r], [x,y,r]]}
         
-        # Get 3D points for this frame
-        frame_list = sorted(wand_data.keys())
+        # Use the explicit reconstruction mapping. Some observed frames are not
+        # triangulated, so indexing the full wand-data frame list is unsafe.
+        frame_list = list(getattr(self.wand_calibrator, 'points_3d_frame_ids', []))
         try:
             frame_i = frame_list.index(frame_id)
         except ValueError:
@@ -6078,12 +7138,13 @@ class CameraCalibrationView(QWidget):
                 scaled = pixmap.scaled(lbl.size(), Qt.AspectRatioMode.KeepAspectRatio)
                 lbl.setPixmap(scaled)
         
-        # Switch to target camera tab (if specified) or first camera
+        # HZ_fix: show results on the 'Cams' tab. If a specific target camera was
+        # requested, expand it full-size; otherwise show the grid of all cameras.
         if hasattr(self, 'vis_tabs') and self.cam_vis_labels:
-            switch_cam = target_cam if target_cam is not None and target_cam in self.cam_vis_labels else 0
-            # Tab index matches camera index (0 = Cam 1, 1 = Cam 2, etc.)
-            if switch_cam in self.cam_vis_labels:
-                self.vis_tabs.setCurrentIndex(switch_cam)
+            if target_cam is not None and target_cam in self.cam_vis_labels:
+                self._show_cam_in_vis(target_cam, expand=True)
+            else:
+                self._show_cam_in_vis(0, expand=False)
     
     def _auto_update_filter_marks(self, *args):
         """Auto-update Remove checkboxes when filter criteria change."""
@@ -7960,7 +9021,7 @@ class CameraCalibrationView(QWidget):
                 len_errs = []
                 per_camera_mean = dataset.get('per_camera_mean_proj_err', {})
                 for err in errors.values():
-                    if 'len_error' in err:
+                    if 'len_error' in err and np.isfinite(err['len_error']):
                         len_errs.append(float(err['len_error']))
                     for cid, e in err.get('cam_errors', {}).items():
                         cam_errs.setdefault(int(cid), []).append(float(e))

@@ -178,7 +178,7 @@ def run_batch_processing(
     cameras = sorted(image_relpaths_by_camera)
     list_total = len(cameras)
     for current, cam_idx in enumerate(cameras, start=1):
-        image_list_path = output_dir / f"cam{cam_idx}_image_list.txt"
+        image_list_path = output_dir / f"cam{cam_idx}ImageNames.txt"
         image_list_files[cam_idx] = write_image_list_file(image_list_path, image_relpaths_by_camera[cam_idx])
         _emit_progress(progress_callback, "write_lists", current, list_total, f"Wrote image list for cam{cam_idx}")
 
