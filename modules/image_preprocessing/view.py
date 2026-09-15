@@ -22,7 +22,11 @@ from PySide6.QtCore import Qt, Signal, QObject, QThread, Slot
 from PySide6.QtGui import QPixmap, QImage, QPainter, QPen, QColor
 
 from .widgets import RangeSlider, ProcessingDialog
-from .core import imadjust_opencv, apply_processing_pipeline_with_settings
+from .core import (
+    imadjust_opencv,
+    apply_processing_pipeline_with_settings,
+    gpu_preprocessing_available,
+)
 
 try:
     from pycine.raw import read_frames as pycine_read_frames
@@ -32,9 +36,13 @@ except Exception as e:
     pycine = None
 
 
-def _apply_processing_pipeline_with_settings(img_data, bg_data, cam_idx, settings):
+def _apply_processing_pipeline_with_settings(
+    img_data, bg_data, cam_idx, settings, use_gpu=False
+):
     """Compatibility wrapper for GUI code."""
-    return apply_processing_pipeline_with_settings(img_data, bg_data, cam_idx, settings)
+    return apply_processing_pipeline_with_settings(
+        img_data, bg_data, cam_idx, settings, use_gpu=use_gpu
+    )
 
 
 class PreprocessWorker(QObject):
@@ -44,13 +52,22 @@ class PreprocessWorker(QObject):
     finished = Signal(dict)
     error = Signal(str)
 
-    def __init__(self, tasks, settings, process_workers, write_workers, max_pending_writes=64):
+    def __init__(
+        self,
+        tasks,
+        settings,
+        process_workers,
+        write_workers,
+        max_pending_writes=64,
+        cpu_only=False,
+    ):
         super().__init__()
         self.tasks = tasks
         self.settings = settings
         self.process_workers = max(1, int(process_workers))
         self.write_workers = max(1, int(write_workers))
         self.max_pending_writes = max(8, int(max_pending_writes))
+        self.cpu_only = bool(cpu_only)
 
         self._stop = False
         self._paused = False
@@ -69,6 +86,42 @@ class PreprocessWorker(QObject):
         except Exception:
             pass
 
+        gpu_active = False
+        gpu_backgrounds = self.settings["camera_backgrounds"]
+        if not self.cpu_only:
+            available, detail = gpu_preprocessing_available()
+            if available:
+                try:
+                    import cupy as cp
+
+                    gpu_backgrounds = {
+                        cam_idx: cp.asarray(background)
+                        for cam_idx, background
+                        in self.settings["camera_backgrounds"].items()
+                    }
+                    gpu_active = True
+                    self.progress.emit(
+                        0, total, f"GPU preprocessing: {detail}"
+                    )
+                except Exception as exc:
+                    self.progress.emit(
+                        0,
+                        total,
+                        f"GPU unavailable; exact CPU fallback: {exc}",
+                    )
+            else:
+                self.progress.emit(
+                    0,
+                    total,
+                    f"GPU unavailable; exact CPU fallback: {detail}",
+                )
+        else:
+            self.progress.emit(
+                0,
+                total,
+                "CPU-only preprocessing (significantly slower)",
+            )
+
         # Split task types once
         cine_tasks = [t for t in self.tasks if t.get("is_cine", False)]
         file_tasks = [t for t in self.tasks if not t.get("is_cine", False)]
@@ -84,8 +137,25 @@ class PreprocessWorker(QObject):
         def process_image_data(img, cam_idx):
             if img is None:
                 return None
-            bg = self.settings["camera_backgrounds"].get(cam_idx)
-            return _apply_processing_pipeline_with_settings(img, bg, cam_idx, self.settings)
+            bg = gpu_backgrounds.get(cam_idx)
+            if gpu_active:
+                try:
+                    return _apply_processing_pipeline_with_settings(
+                        img,
+                        bg,
+                        cam_idx,
+                        self.settings,
+                        use_gpu=True,
+                    )
+                except Exception:
+                    bg = self.settings["camera_backgrounds"].get(cam_idx)
+            return _apply_processing_pipeline_with_settings(
+                img,
+                bg,
+                cam_idx,
+                self.settings,
+                use_gpu=False,
+            )
 
         def process_file_task(task):
             src = task["src"]
@@ -1111,6 +1181,18 @@ class ImagePreprocessingView(QWidget):
         self.denoise_check.setStyleSheet("color: white; font-weight: bold;")
         self.denoise_check.stateChanged.connect(self._on_settings_changed)
         adjust_layout.addWidget(self.denoise_check, 2, 0, 1, 3)
+
+        self.preprocess_cpu_only_check = QCheckBox(
+            "CPU only (significantly slower)"
+        )
+        self.preprocess_cpu_only_check.setChecked(False)
+        self.preprocess_cpu_only_check.setToolTip(
+            "Disable CUDA preprocessing and run the exact CPU pipeline only."
+        )
+        self.preprocess_cpu_only_check.setStyleSheet("color: #f0b35a;")
+        adjust_layout.addWidget(
+            self.preprocess_cpu_only_check, 3, 0, 1, 3
+        )
         
         settings_layout.addWidget(adjust_group)
         
@@ -1995,6 +2077,9 @@ class ImagePreprocessingView(QWidget):
         if self.denoise_check.isChecked():
             cmd.append("--denoise")
 
+        if self.preprocess_cpu_only_check.isChecked():
+            cmd.append("--cpu-only")
+
         cmd.extend(["--workers", "0"])
 
         absolute_command = self._format_cli_command(cmd)
@@ -2158,6 +2243,7 @@ class ImagePreprocessingView(QWidget):
             process_workers=process_workers,
             write_workers=write_workers,
             max_pending_writes=64,
+            cpu_only=self.preprocess_cpu_only_check.isChecked(),
         )
         self.preprocess_worker.moveToThread(self.preprocess_thread)
 
