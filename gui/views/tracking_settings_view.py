@@ -259,6 +259,11 @@ class TrackingSettingsView(QWidget):
         self.vol_z_max.setRange(-10000, 10000)
         self.vol_z_max.setValue(200)
         vol_grid.addWidget(self.vol_z_max, 2, 2)
+
+        # The master configuration defines 1000 voxels across X. Keep the
+        # physical conversion synchronized when the user edits that extent.
+        self.vol_x_min.valueChanged.connect(self._on_volume_x_changed)
+        self.vol_x_max.valueChanged.connect(self._on_volume_x_changed)
         
         # Object Type
         obj_group = QGroupBox("Object Settings")
@@ -1339,6 +1344,12 @@ class TrackingSettingsView(QWidget):
 
             voxel_size = (x_max - x_min) / 1000.0
             self.voxel_spin.setValue(voxel_size)
+
+    def _on_volume_x_changed(self, _value=None):
+        """Maintain 1000 voxels across the configured X extent."""
+        x_span = float(self.vol_x_max.value() - self.vol_x_min.value())
+        if x_span > 0.0:
+            self.voxel_spin.setValue(x_span / 1000.0)
 
     def _on_voxel_scale_changed(self):
         """Update 3D tolerance in voxels if scale changes."""
