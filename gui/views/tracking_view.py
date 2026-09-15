@@ -3,6 +3,7 @@ matplotlib.use('Agg') # MUST be first
 import matplotlib.pyplot as plt
 import os
 import sys
+import time
 import qtawesome as qta
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
@@ -282,6 +283,10 @@ class TrackingView(QWidget):
         self.process.readyReadStandardError.connect(self._handle_stderr)
         self.process.finished.connect(self._on_process_finished)
         self.log_file = None
+        self._tracking_wall_start = None
+        self._tracking_stop_requested = False
+        self._completed_frame_ids = set()
+        self._frame_log_buffer = ""
         
         # Cache for statistics
         self.cached_proj_path = None
@@ -948,6 +953,10 @@ class TrackingView(QWidget):
         self._busy_begin('run_tracking', 'Running tracking')
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self._tracking_wall_start = time.perf_counter()
+        self._tracking_stop_requested = False
+        self._completed_frame_ids.clear()
+        self._frame_log_buffer = ""
         if use_python_module:
             # Python -m openlpt <config>
             self.process.start(sys.executable, ["-m", "openlpt", config_path])
@@ -1056,6 +1065,7 @@ class TrackingView(QWidget):
 
     def _stop_tracking(self):
         if self.process.state() != QProcess.ProcessState.NotRunning:
+            self._tracking_stop_requested = True
             self.process.terminate()
             if not self.process.waitForFinished(2000):
                 self.process.kill()
@@ -1350,6 +1360,7 @@ class TrackingView(QWidget):
 
     def _handle_stdout(self):
         data = self.process.readAllStandardOutput().data().decode(errors='replace')
+        self._record_completed_frames(data)
         self._append_log(data)
 
     def _handle_stderr(self):
@@ -1374,16 +1385,68 @@ class TrackingView(QWidget):
             self.log_file.write(text)
             self.log_file.flush()
 
+    def _record_completed_frames(self, text, flush=False):
+        """Count complete frame reports without assuming QProcess chunk boundaries."""
+        combined = self._frame_log_buffer + text
+        lines = combined.splitlines(keepends=True)
+        if not flush and lines and not lines[-1].endswith(('\n', '\r')):
+            self._frame_log_buffer = lines.pop()
+        else:
+            self._frame_log_buffer = ""
+
+        for line in lines:
+            match = re.search(r"Total time for frame\s+(\d+)\s*:", line)
+            if match:
+                self._completed_frame_ids.add(int(match.group(1)))
+
+    @staticmethod
+    def _format_elapsed(seconds):
+        hours, remainder = divmod(max(0.0, seconds), 3600.0)
+        minutes, secs = divmod(remainder, 60.0)
+        return f"{int(hours):02d}:{int(minutes):02d}:{secs:06.3f}"
+
     def _on_process_finished(self, exit_code, exit_status):
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        
+
+        self._record_completed_frames("", flush=True)
+        elapsed = None
+        if self._tracking_wall_start is not None:
+            elapsed = time.perf_counter() - self._tracking_wall_start
+
+        stopped = self._tracking_stop_requested
+        status_str = (
+            "after a user stop"
+            if stopped
+            else ("successfully" if exit_code == 0 else f"with exit code {exit_code}")
+        )
+        self._append_log(f"\n[Info] Tracking finished {status_str}.\n")
+
+        if elapsed is not None:
+            frame_count = len(self._completed_frame_ids)
+            event = "until user stop" if stopped else "for complete run"
+            self._append_log(
+                f"[Timing] End-to-end wall time {event}: "
+                f"{self._format_elapsed(elapsed)} ({elapsed:.3f} s).\n"
+            )
+            if frame_count:
+                self._append_log(
+                    f"[Timing] Completed frames: {frame_count}; effective average: "
+                    f"{elapsed / frame_count:.3f} s/frame.\n"
+                )
+            else:
+                self._append_log("[Timing] Completed frames: 0.\n")
+            self._append_log(
+                "[Timing] Includes backend startup, image input, LPT computation, "
+                "result output, and shutdown.\n"
+            )
+
         if self.log_file:
             self.log_file.close()
             self.log_file = None
-            
-        status_str = "Successfully" if exit_code == 0 else f"with exit code {exit_code}"
-        self.log_text.append(f"\n[Info] Tracking finished {status_str}.")
+
+        self._tracking_wall_start = None
+        self._tracking_stop_requested = False
         self._busy_end('run_tracking')
 
     def _load_track_statistics(self, force=False):
