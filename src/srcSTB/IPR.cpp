@@ -116,18 +116,28 @@ runSingleIPRIteration(const std::vector<std::shared_ptr<Camera>> &camera_models,
 
   std::cout << "\t\t2D detections per active camera: ";
   const clock_t t_find2D_start = clock();
+  if (cfg.kind() == ObjectKind::Bubble) {
+    std::vector<char> active(n_cam, 0);
+    for (std::size_t cam_id = 0; cam_id < n_cam; ++cam_id)
+      active[cam_id] = camera_models[cam_id]->is_active ? 1 : 0;
+
+    o2d_list_all = finder.findBubble2DFixedBatch(
+        images, active, static_cast<const BubbleConfig &>(cfg));
+  } else {
 #pragma omp parallel for schedule(static)
-  for (int cam_id = 0; cam_id < static_cast<int>(n_cam); ++cam_id) {
-    if (!camera_models[cam_id]->is_active)
-      continue;
+    for (int cam_id = 0; cam_id < static_cast<int>(n_cam); ++cam_id) {
+      if (!camera_models[cam_id]->is_active)
+        continue;
 
-    // Implementation should branch internally by reading `cfg` (Tracer/Bubble).
-    std::vector<std::unique_ptr<Object2D>> o2d_list =
-        finder.findObject2D(images[cam_id], cfg);
-
-    std::cout << o2d_list.size() << "  ";
-    o2d_list_all[cam_id] = std::move(o2d_list);
+      std::vector<std::unique_ptr<Object2D>> o2d_list =
+          finder.findObject2D(images[cam_id], cfg);
+      o2d_list_all[cam_id] = std::move(o2d_list);
+    }
   }
+
+  for (std::size_t cam_id = 0; cam_id < n_cam; ++cam_id)
+    if (camera_models[cam_id]->is_active)
+      std::cout << o2d_list_all[cam_id].size() << "  ";
   const clock_t t_find2D_end = clock();
   std::cout << " (" << double(t_find2D_end - t_find2D_start) / CLOCKS_PER_SEC
             << " s)" << "\n";
