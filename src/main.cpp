@@ -1,5 +1,6 @@
 // main.cpp
 #include "STB.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib> // EXIT_SUCCESS / EXIT_FAILURE
 #include <ctime>
@@ -78,7 +79,15 @@ int run_openlpt(const std::string &config_path) {
     // load previous tracks if needed
     if (basic_settings._load_track) {
       for (size_t i = 0; i < basic_settings._object_types.size(); ++i) {
-        stb_objects[i].loadTracksAll(basic_settings._load_track_path,
+        std::string load_path = basic_settings._load_track_path;
+        if (basic_settings._object_types.size() > 1) {
+          const fs::path requested(load_path);
+          const fs::path object_root =
+              requested.parent_path().parent_path() /
+              ("object_" + std::to_string(i));
+          load_path = (object_root / requested.filename()).string();
+        }
+        stb_objects[i].loadTracksAll(load_path,
                                      basic_settings._load_track_frame);
         std::cout << "Load previous tracks at frame "
                   << basic_settings._load_track_frame << "\n";
@@ -120,6 +129,13 @@ int run_openlpt(const std::string &config_path) {
       frame_start = basic_settings._load_track_frame + 1;
     }
 
+    const fs::path pause_request =
+        fs::path(basic_settings._output_path) / ".openlpt_pause_requested";
+    const fs::path checkpoint_root =
+        fs::path(basic_settings._output_path) / "Checkpoints";
+    bool paused = false;
+    bool pause_deferred_reported = false;
+
     clock_t start = clock();
     for (int frame_id = frame_start; frame_id <= frame_end; ++frame_id) {
       for (int i = 0; i < num_cams; ++i) {
@@ -128,6 +144,44 @@ int run_openlpt(const std::string &config_path) {
       for (auto &stb : stb_objects) {
         stb.processFrame(frame_id, image_list);
       }
+
+      const bool checkpointable =
+          std::all_of(stb_objects.begin(), stb_objects.end(),
+                      [frame_id](const STB &stb) {
+                        return stb.canCheckpoint(frame_id);
+                      });
+      const bool periodic_checkpoint = frame_id % 500 == 0 && checkpointable;
+      if (periodic_checkpoint) {
+        for (size_t i = 0; i < stb_objects.size(); ++i) {
+          stb_objects[i].saveCheckpoint(
+              (checkpoint_root / ("object_" + std::to_string(i))).string(),
+              frame_id);
+        }
+      }
+
+      if (fs::exists(pause_request)) {
+        if (!checkpointable) {
+          if (!pause_deferred_reported) {
+            std::cout << "Pause requested; waiting for the initial tracking "
+                         "phase to complete."
+                      << std::endl;
+            pause_deferred_reported = true;
+          }
+        } else {
+          if (!periodic_checkpoint) {
+            for (size_t i = 0; i < stb_objects.size(); ++i) {
+              stb_objects[i].saveCheckpoint(
+                  (checkpoint_root / ("object_" + std::to_string(i))).string(),
+                  frame_id);
+            }
+          }
+          std::error_code remove_ec;
+          fs::remove(pause_request, remove_ec);
+          std::cout << "OPENLPT_PAUSED frame=" << frame_id << std::endl;
+          paused = true;
+          break;
+        }
+      }
     }
     clock_t end = clock();
 
@@ -135,7 +189,8 @@ int run_openlpt(const std::string &config_path) {
               << double(end - start) / CLOCKS_PER_SEC << "s\n"
               << std::endl;
     std::cout << "***************" << std::endl;
-    std::cout << "OpenLPT finish!" << std::endl;
+    std::cout << (paused ? "OpenLPT paused safely!" : "OpenLPT finish!")
+              << std::endl;
     std::cout << "***************" << std::endl;
   } catch (const FatalError &e) {
     std::cerr << "Program aborted due to error: " << e.what() << std::endl;

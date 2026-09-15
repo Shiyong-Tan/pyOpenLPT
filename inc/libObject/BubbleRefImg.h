@@ -32,6 +32,11 @@ public:
   // Load reference images from folder and RECALCULATE intensity
   bool loadRefImg(std::string folder, int n_cam);
 
+  // Lossless checkpoint persistence. Unlike the user-facing TIFF files,
+  // these methods preserve exact in-memory doubles and cached intensities.
+  bool saveExactRef(const std::string &folder, int n_cam) const;
+  bool loadExactRef(const std::string &folder, int n_cam);
+
   const Image &operator[](int camID) const { return _img_Ref_list[camID]; };
 
   double getIntRef(int camID) const { return _intRef_list[camID]; };
