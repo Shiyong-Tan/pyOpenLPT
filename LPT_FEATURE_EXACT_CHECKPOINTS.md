@@ -94,7 +94,10 @@ The isolated branch must pass both before publication:
 
 No numeric-tolerance fallback is permitted.
 
-The earlier integrated implementation already passed a 10-frame uninterrupted
-versus paused-and-resumed comparison with zero SHA-256 differences across all
-15 scientific result files. A clean build and repeat of that exact gate remain
-required for this isolated PR branch before it is pushed.
+The isolated PR branch was clean-built together with pristine upstream using
+GCC 11.4 and exercised for frames 0 through 9 on the committed Bubble tracking
+fixture. Pristine upstream and the uninterrupted candidate produced identical
+SHA-256 hashes for all 15 scientific result files. The candidate was then
+paused safely at frame 3, resumed from its lossless checkpoint, and again
+produced identical hashes for all 15 files. No numeric-tolerance fallback was
+used.
