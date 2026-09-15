@@ -40,6 +40,9 @@ update_openlpt.command
 # Temporary repair scripts
 repair_environment.bat
 
+# Per-run GUI resume override; config.txt remains the user's master settings.
+.openlpt_runtime_config.txt
+
 # Local OpenCode config
 opencode.jsonc
 

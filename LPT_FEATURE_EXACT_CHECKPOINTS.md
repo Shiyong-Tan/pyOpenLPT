@@ -55,9 +55,37 @@ Legacy resume remains available for old scientific snapshots. It is explicitly
 reported as non-bit-exact because integer BubbleRef TIFF storage and six-place
 track files cannot satisfy the exact continuation contract.
 
+## GUI workflow and input identity
+
+The Tracking view replaces the destructive first-click stop action with
+`Pause Safely`. The first click writes the pause request and lets the backend
+finish its current frame. The button then becomes `Force Stop`; only that
+explicit second click terminates a non-responsive process mid-frame.
+
+After a safe pause marker is received, the GUI enables
+`Resume latest safe checkpoint`. A resume scan accepts only a frame that is
+complete for every configured object type. Bubble objects must contain the
+lossless BubbleRef binary; Tracer objects do not require it.
+
+Before every run, the GUI hashes the unchanged master `config.txt`, all camera
+files, image lists, and object configuration files. The identity is stored with
+each checkpoint. Resume is refused if any byte of those inputs changes. The GUI
+uses a temporary runtime config for the load flag and checkpoint paths; it does
+not rewrite the master config.
+
+The resume checkbox owns continuation behavior. When it is unchecked, a stale
+manual value such as `1,43000` in the master config is overridden with `0,0` in
+the runtime copy, preventing an incomplete legacy folder from being treated as
+a safe checkpoint.
+
+Checkpoint discovery was tested with a Bubble plus Tracer fixture. A frame
+present for only one object was rejected, the newest common complete frame was
+selected, a changed camera file invalidated resume, and a pause marker split
+across process-output chunks was still recognized.
+
 ## Correctness gate
 
-Before submission, this change must pass both:
+The isolated branch must pass both before publication:
 
 1. an uninterrupted run with no pause request must produce byte-for-byte the
    same scientific result files as pristine OpenLPT; and
@@ -65,3 +93,8 @@ Before submission, this change must pass both:
    scientific result files as the uninterrupted candidate run.
 
 No numeric-tolerance fallback is permitted.
+
+The earlier integrated implementation already passed a 10-frame uninterrupted
+versus paused-and-resumed comparison with zero SHA-256 differences across all
+15 scientific result files. A clean build and repeat of that exact gate remain
+required for this isolated PR branch before it is pushed.
