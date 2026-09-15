@@ -1195,155 +1195,160 @@ class TrackingSettingsView(QWidget):
             print(f"[TrackingSettings] Warning: failed to patch Rotation Vector in {os.path.basename(file_path)}: {e}")
 
     def _estimate_volume_from_cameras(self, cams_data):
-        """Estimate common view volume using adaptive voxel visibility search.
+        """Estimate a conservative, connected, refraction-aware LPT volume.
 
-        Priority of initial center candidates:
-        1) world origin [0,0,0]
-        2) robust center from camera axes intersections
+        A deterministic coarse grid identifies one connected visibility
+        component, then a finer grid refines its bounds. Reduced-camera IPR
+        uses the same minimum visible-camera count as the configured search.
         """
 
         def get_center(cam):
             if 't_inv' in cam:
-                return np.asarray(cam['t_inv'], dtype=np.float64)
+                return np.asarray(cam['t_inv'], dtype=np.float64).reshape(3)
             if 'rvec' in cam and 'tvec' in cam:
                 R, _ = cv2.Rodrigues(cam['rvec'])
-                return (-R.T @ cam['tvec'].reshape(3, 1)).ravel()
+                return (-R.T @ np.asarray(cam['tvec']).reshape(3, 1)).ravel()
             return None
 
-        centers = [get_center(c) for c in cams_data]
-        centers = [c for c in centers if c is not None and np.all(np.isfinite(c))]
-        if len(centers) < 2:
+        camera_centers = []
+        for cam in cams_data:
+            point = get_center(cam)
+            if point is not None and np.all(np.isfinite(point)):
+                camera_centers.append((cam, point))
+        if len(camera_centers) < 2:
+            print("[TrackingSettings] View-volume estimation requires at least two valid camera poses.")
             return
-        centers = np.asarray(centers)
+        robust_center = self._robust_estimate_working_center(cams_data)
+        if robust_center is None or not np.all(np.isfinite(robust_center)):
+            robust_center = np.zeros(3, dtype=np.float64)
+        else:
+            robust_center = np.asarray(robust_center, dtype=np.float64).reshape(3)
 
-        def estimate_initial_half(P_ref):
-            # pinhole FOV-based estimate at reference depth, with robust fallbacks
-            d_ref = np.median(np.linalg.norm(centers - P_ref, axis=1))
-            d_ref = max(float(d_ref), 50.0)
+        # Intrinsics choose only a generous search envelope; visibility
+        # projections, not this approximation, determine the final bounds.
+        optical_half_sizes = []
+        for cam, cam_center in camera_centers:
+            K = cam.get('K')
+            H, W = cam.get('h'), cam.get('w')
+            if K is None or H is None or W is None or np.shape(K) != (3, 3):
+                continue
+            fx, fy = abs(float(K[0, 0])), abs(float(K[1, 1]))
+            if fx <= 1e-12 or fy <= 1e-12:
+                continue
+            distance = max(float(np.linalg.norm(cam_center - robust_center)), 1.0)
+            optical_half_sizes.extend((distance * float(W) / (2.0 * fx),
+                                       distance * float(H) / (2.0 * fy)))
 
-            hx_list, hy_list = [], []
-            for cam in cams_data:
-                if 'K' not in cam or 'w' not in cam or 'h' not in cam:
-                    continue
-                K = cam['K']
-                if K is None or K.shape != (3, 3):
-                    continue
-                fx = float(K[0, 0]) if abs(float(K[0, 0])) > 1e-12 else 0.0
-                fy = float(K[1, 1]) if abs(float(K[1, 1])) > 1e-12 else 0.0
-                if fx <= 0 or fy <= 0:
-                    continue
-                hx_list.append(d_ref * float(cam['w']) / (2.0 * fx))
-                hy_list.append(d_ref * float(cam['h']) / (2.0 * fy))
+        optical_half = max(optical_half_sizes) if optical_half_sizes else 20.0
+        search_half = float(np.clip(max(30.0, 2.5 * optical_half), 30.0, 5000.0))
+        bbox_min = robust_center - search_half
+        bbox_max = robust_center + search_half
 
-            if hx_list and hy_list:
-                hx = max(10.0, min(hx_list) * 0.8)
-                hy = max(10.0, min(hy_list) * 0.8)
-            else:
-                # fallback from camera-center spread
-                spread = np.median(np.linalg.norm(centers - P_ref, axis=1))
-                spread = max(float(spread), 50.0)
-                hx = hy = 0.8 * spread
+        seed_points = self._calibration_volume_seed_points()
+        if len(seed_points):
+            bbox_min = np.minimum(bbox_min, seed_points.min(axis=0) - 10.0)
+            bbox_max = np.maximum(bbox_max, seed_points.max(axis=0) + 10.0)
 
-            hz = max(20.0, 0.8 * d_ref)
-            return np.array([hx, hy, hz], dtype=np.float64)
+        n_cam = len(cams_data)
+        reduced = int(self.ipr_reduce_spin.value()) if hasattr(self, 'ipr_reduce_spin') else 0
+        min_visible = max(2, n_cam - max(0, reduced))
 
-        def adaptive_search(P_ref):
-            # Start from FOV-estimated box
-            half = estimate_initial_half(P_ref)
-            bbmin = P_ref - half
-            bbmax = P_ref + half
-
-            for it in range(7):
-                span = np.maximum(bbmax - bbmin, 1.0)
-                step = float(np.clip(np.max(span) / 30.0, 2.0, 20.0))
-                vmin, vmax = self._common_fov_bbox_voxel(cams_data, bbmin, bbmax, step=step)
-
-                if vmin is None:
-                    # expand and retry
-                    c = 0.5 * (bbmin + bbmax)
-                    h = 0.5 * (bbmax - bbmin) * 1.5
-                    bbmin, bbmax = c - h, c + h
-                    print(f"[TrackingSettings] adaptive coarse iter={it+1}: empty, expanding bbox (x1.5)")
-                    continue
-
-                used = np.maximum(vmax - vmin, step)
-                c = 0.5 * (bbmin + bbmax)
-                h = 0.5 * (bbmax - bbmin)
-
-                # edge occupation: if close to edge, expand; otherwise shrink
-                left_gap = vmin - bbmin
-                right_gap = bbmax - vmax
-                edge_tol = np.maximum(0.1 * h, np.array([step, step, step], dtype=np.float64))
-
-                for ax in range(3):
-                    near_left = left_gap[ax] <= edge_tol[ax]
-                    near_right = right_gap[ax] <= edge_tol[ax]
-                    if near_left or near_right:
-                        h[ax] *= 1.3
-                    else:
-                        target_h = 0.5 * used[ax] + 2.0 * step
-                        h[ax] = max(target_h, h[ax] * 0.8)
-
-                new_bbmin, new_bbmax = c - h, c + h
-                rel = np.max(np.abs((new_bbmax - new_bbmin) - (bbmax - bbmin)) / np.maximum(bbmax - bbmin, 1.0))
-                bbmin, bbmax = new_bbmin, new_bbmax
-
-                print(
-                    f"[TrackingSettings] adaptive coarse iter={it+1}: step={step:.2f}mm, "
-                    f"span=({(bbmax[0]-bbmin[0]):.1f},{(bbmax[1]-bbmin[1]):.1f},{(bbmax[2]-bbmin[2]):.1f}), rel_change={rel:.3f}"
-                )
-
-                if rel < 0.05:
-                    break
-
-            # Final coarse extraction from converged box
-            final_span = np.maximum(bbmax - bbmin, 1.0)
-            final_step = float(np.clip(np.max(final_span) / 30.0, 2.0, 20.0))
-            return self._common_fov_bbox_voxel(cams_data, bbmin, bbmax, step=final_step)
-
-        # Origin first, robust center second
-        candidates = [
-            ("origin", np.array([0.0, 0.0, 0.0], dtype=np.float64)),
-        ]
-        P_robust = self._robust_estimate_working_center(cams_data)
-        if P_robust is not None:
-            candidates.append(("robust", P_robust))
-
-        bbmin1 = bbmax1 = None
-        for name, P_ref in candidates:
-            print(f"[TrackingSettings] Coarse search center={name}, P0={P_ref}")
-            bbmin1, bbmax1 = adaptive_search(P_ref)
-            if bbmin1 is not None:
-                break
-
-        if bbmin1 is None:
-            print("[TrackingSettings] No coarse common FOV found.")
+        try:
+            axes, visible_count, coarse_step = self._camera_visibility_grid(
+                cams_data, bbox_min, bbox_max, requested_step=2.0
+            )
+        except RuntimeError as exc:
+            # PINPLATE must use the exact refraction-aware projection. Never
+            # substitute the lower-fidelity pinhole approximation silently.
+            print(f"[TrackingSettings] View-volume estimation aborted: {exc}")
             return
 
-        # Fine scan from coarse result; adaptive pad for small volumes
-        span1 = np.maximum(bbmax1 - bbmin1, 1.0)
-        pad = float(np.clip(0.1 * np.max(span1), 2.0, 20.0))
-        fine_step = float(np.clip(np.max(span1) / 80.0, 1.0, 2.0))
-        bbminF, bbmaxF = self._common_fov_bbox_voxel(cams_data, bbmin1 - pad, bbmax1 + pad, step=fine_step)
+        try:
+            coarse_min, coarse_max, coarse_voxels = self._select_visibility_component(
+                axes, visible_count >= min_visible, robust_center, seed_points
+            )
+        except RuntimeError as exc:
+            print(f"[TrackingSettings] View-volume component selection aborted: {exc}")
+            return
+        if coarse_min is None:
+            print(
+                f"[TrackingSettings] No connected volume visible in at least "
+                f"{min_visible}/{n_cam} cameras; existing values were preserved."
+            )
+            return
 
-        if bbminF is not None:
-            # Round outward to nearest multiple of 5
-            x_min = np.floor(bbminF[0] / 5.0) * 5.0
-            x_max = np.ceil(bbmaxF[0] / 5.0) * 5.0
-            y_min = np.floor(bbminF[1] / 5.0) * 5.0
-            y_max = np.ceil(bbmaxF[1] / 5.0) * 5.0
-            z_min = np.floor(bbminF[2] / 5.0) * 5.0
-            z_max = np.ceil(bbmaxF[2] / 5.0) * 5.0
+        coarse_span = coarse_max - coarse_min
+        if coarse_voxels < 8 or np.any(coarse_span < 2.0 * coarse_step):
+            print(
+                f"[TrackingSettings] Rejected collapsed coarse view-volume "
+                f"span={coarse_span.tolist()}, voxels={coarse_voxels}; "
+                "existing values were preserved."
+            )
+            return
 
-            self.vol_x_min.setValue(x_min)
-            self.vol_x_max.setValue(x_max)
-            self.vol_y_min.setValue(y_min)
-            self.vol_y_max.setValue(y_max)
-            self.vol_z_min.setValue(z_min)
-            self.vol_z_max.setValue(z_max)
+        refine_pad = max(4.0, 2.0 * coarse_step)
+        try:
+            fine_axes, fine_count, fine_step = self._camera_visibility_grid(
+                cams_data,
+                coarse_min - refine_pad,
+                coarse_max + refine_pad,
+                requested_step=0.5,
+            )
+        except RuntimeError as exc:
+            print(f"[TrackingSettings] Fine view-volume estimation aborted: {exc}")
+            return
 
-            voxel_size = (x_max - x_min) / 1000.0
-            self.voxel_spin.setValue(voxel_size)
+        try:
+            usable_min, usable_max, usable_voxels = self._select_visibility_component(
+                fine_axes, fine_count >= min_visible, robust_center, seed_points
+            )
+            strict_min, strict_max, _ = self._select_visibility_component(
+                fine_axes, fine_count >= n_cam, robust_center, seed_points
+            )
+        except RuntimeError as exc:
+            print(f"[TrackingSettings] Fine view-volume component selection aborted: {exc}")
+            return
+        if usable_min is None:
+            print("[TrackingSettings] Fine view-volume component disappeared; existing values were preserved.")
+            return
+
+        usable_span = usable_max - usable_min
+        if usable_voxels < 16 or np.any(usable_span < 2.0 * fine_step):
+            print(
+                f"[TrackingSettings] Rejected collapsed fine view-volume "
+                f"span={usable_span.tolist()}, voxels={usable_voxels}; "
+                "existing values were preserved."
+            )
+            return
+
+        safety_margin = 0.5 * fine_step
+        recommended_min = usable_min - safety_margin
+        recommended_max = usable_max + safety_margin
+        rounded_min = np.floor(recommended_min / 5.0) * 5.0
+        rounded_max = np.ceil(recommended_max / 5.0) * 5.0
+
+        if strict_min is not None:
+            print(
+                f"[TrackingSettings] Strict {n_cam}/{n_cam} view-volume: "
+                f"min={strict_min.tolist()}, max={strict_max.tolist()}"
+            )
+        print(
+            f"[TrackingSettings] Usable >= {min_visible}/{n_cam} view-volume: "
+            f"min={usable_min.tolist()}, max={usable_max.tolist()}, "
+            f"fine_step={fine_step:.3f} mm"
+        )
+        print(
+            f"[TrackingSettings] Recommended padded bounds: "
+            f"min={rounded_min.tolist()}, max={rounded_max.tolist()}"
+        )
+
+        self.vol_x_min.setValue(float(rounded_min[0]))
+        self.vol_x_max.setValue(float(rounded_max[0]))
+        self.vol_y_min.setValue(float(rounded_min[1]))
+        self.vol_y_max.setValue(float(rounded_max[1]))
+        self.vol_z_min.setValue(float(rounded_min[2]))
+        self.vol_z_max.setValue(float(rounded_max[2]))
+        self._on_volume_x_changed()
 
     def _on_volume_x_changed(self, _value=None):
         """Maintain 1000 voxels across the configured X extent."""
@@ -1423,111 +1428,195 @@ class TrackingSettingsView(QWidget):
         t = (a*e - b*d) / denom
         return 0.5 * ((C1 + s*a1) + (C2 + t*a2))
 
-    def _common_fov_bbox_voxel(self, cams, bbox_min, bbox_max, step):
-        """Check visibility on grid and return new bbox."""
-        # Limiting grid size to prevent memory issues
-        dim_limit = 60 # Smaller limit for performance
-        x_steps = int((bbox_max[0] - bbox_min[0]) / step)
-        y_steps = int((bbox_max[1] - bbox_min[1]) / step)
-        z_steps = int((bbox_max[2] - bbox_min[2]) / step)
-        
-        if x_steps > dim_limit or y_steps > dim_limit or z_steps > dim_limit:
-            step = max(step, (bbox_max - bbox_min).max() / dim_limit)
-            x_steps = int((bbox_max[0] - bbox_min[0]) / step)
-            y_steps = int((bbox_max[1] - bbox_min[1]) / step)
-            z_steps = int((bbox_max[2] - bbox_min[2]) / step)
-
-        xs = np.linspace(bbox_min[0], bbox_max[0], x_steps + 1)
-        ys = np.linspace(bbox_min[1], bbox_max[1], y_steps + 1)
-        zs = np.linspace(bbox_min[2], bbox_max[2], z_steps + 1)
-        
+    def _calibration_volume_seed_points(self):
+        """Return finite reconstructed wand points, when live calibration exists."""
+        calibration = self.calibration_view
+        calibrator = getattr(calibration, 'wand_calibrator', None) if calibration else None
+        raw_points = getattr(calibrator, 'points_3d', None) if calibrator else None
+        if raw_points is None:
+            return np.empty((0, 3), dtype=np.float64)
         try:
-            X, Y, Z = np.meshgrid(xs, ys, zs, indexing="xy")
-            pts_w = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1).astype(np.float32)
-        except MemoryError:
-            return None, None
+            points = np.asarray(raw_points, dtype=np.float64).reshape(-1, 3)
+        except (TypeError, ValueError):
+            return np.empty((0, 3), dtype=np.float64)
+        return points[np.all(np.isfinite(points), axis=1)]
 
-        visible_all = np.ones(len(pts_w), dtype=bool)
-        pinplate_cam_cache = {}
+    def _camera_visibility_grid(self, cams, bbox_min, bbox_max, requested_step):
+        """Project a deterministic 3-D grid and count visible cameras per voxel.
+
+        PINPLATE cameras must use the C++ refraction-aware projection. Failure
+        is reported instead of silently changing camera models.
+        """
+        bbox_min = np.asarray(bbox_min, dtype=np.float64).reshape(3)
+        bbox_max = np.asarray(bbox_max, dtype=np.float64).reshape(3)
+        spans = bbox_max - bbox_min
+        if not np.all(np.isfinite(spans)) or np.any(spans <= 0.0):
+            raise RuntimeError("invalid search bounds")
+
+        max_samples_per_axis = 101
+        actual_step = max(
+            float(requested_step),
+            float(np.max(spans)) / float(max_samples_per_axis - 1),
+        )
+        sample_counts = np.ceil(spans / actual_step).astype(int) + 1
+        sample_counts = np.maximum(sample_counts, 2)
+        axes = tuple(
+            np.linspace(
+                bbox_min[axis], bbox_max[axis], int(sample_counts[axis]),
+                dtype=np.float64,
+            )
+            for axis in range(3)
+        )
+        actual_step = max(
+            float((axis[-1] - axis[0]) / max(1, len(axis) - 1))
+            for axis in axes
+        )
+
+        try:
+            X, Y, Z = np.meshgrid(*axes, indexing='ij')
+            points = np.column_stack((X.ravel(), Y.ravel(), Z.ravel()))
+        except MemoryError as exc:
+            raise RuntimeError("not enough memory for the visibility grid") from exc
+
+        visible_count = np.zeros(len(points), dtype=np.uint16)
+        pinplate_cache = {}
         lpt_mod = None
-        lpt_import_failed = False
 
-        for cam in cams:
+        for cam_index, cam in enumerate(cams):
             model = str(cam.get('model', '')).strip().upper()
-            H = cam.get('h')
-            W = cam.get('w')
+            H, W = cam.get('h'), cam.get('w')
+            if H is None or W is None:
+                raise RuntimeError(f"camera {cam_index} has no image dimensions")
 
-            ok = None
-
-            if model == 'PINPLATE' and H is not None and W is not None and 'cam_file_path' in cam:
-                if lpt_mod is None and not lpt_import_failed:
+            if model == 'PINPLATE':
+                cam_path = cam.get('cam_file_path')
+                if not cam_path:
+                    raise RuntimeError(f"PINPLATE camera {cam_index} has no source file path")
+                if lpt_mod is None:
                     try:
                         import pyopenlpt as lpt_mod
-                    except Exception:
-                        lpt_import_failed = True
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "pyopenlpt is unavailable for exact PINPLATE projection"
+                        ) from exc
+                try:
+                    camera = pinplate_cache.get(cam_path)
+                    if camera is None:
+                        camera = lpt_mod.Camera(cam_path)
+                        pinplate_cache[cam_path] = camera
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"cannot load PINPLATE camera {cam_index}: {exc}"
+                    ) from exc
 
-                if lpt_mod is not None:
-                    cam_path = cam['cam_file_path']
-                    cam_obj = pinplate_cam_cache.get(cam_path)
-                    if cam_obj is None:
+                ok = np.zeros(len(points), dtype=bool)
+                chunk_size = 25000
+                for first in range(0, len(points), chunk_size):
+                    block = points[first:first + chunk_size]
+                    world_points = [
+                        lpt_mod.Pt3D(float(point[0]), float(point[1]), float(point[2]))
+                        for point in block
+                    ]
+                    try:
                         try:
-                            cam_obj = lpt_mod.Camera(cam_path)
-                            pinplate_cam_cache[cam_path] = cam_obj
-                        except Exception:
-                            cam_obj = None
-
-                    if cam_obj is not None:
-                        try:
-                            pts_world = [
-                                lpt_mod.Pt3D(float(p[0]), float(p[1]), float(p[2]))
-                                for p in pts_w
-                            ]
-                            try:
-                                proj_status = cam_obj.projectBatchStatus(pts_world, False)
-                            except TypeError:
-                                proj_status = cam_obj.projectBatchStatus(pts_world)
-
-                            ok_local = np.zeros(len(pts_w), dtype=bool)
-                            for idx, st in enumerate(proj_status):
-                                if not st or not st[0]:
-                                    continue
-                                uv = st[1]
-                                u = float(uv[0])
-                                v = float(uv[1])
-                                if 0 <= u < W and 0 <= v < H:
-                                    ok_local[idx] = True
-                            ok = ok_local
-                        except Exception:
-                            ok = None
-
-            if ok is None:
-                if not all(k in cam for k in ['K', 'rvec', 'tvec', 'h', 'w']):
-                    continue
-
-                K = cam['K']
-                dist = cam.get('dist', np.zeros(5))
-                rvec = cam['rvec']
-                tvec = cam['tvec']
-                H, W = cam['h'], cam['w']
-
-                img_pts, _ = cv2.projectPoints(pts_w, rvec, tvec, K, dist)
-                uv = img_pts.reshape(-1, 2)
-
+                            statuses = camera.projectBatchStatus(world_points, False)
+                        except TypeError:
+                            statuses = camera.projectBatchStatus(world_points)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"exact PINPLATE projection failed for camera {cam_index}: {exc}"
+                        ) from exc
+                    if len(statuses) != len(block):
+                        raise RuntimeError(
+                            f"camera {cam_index} returned an incomplete projection batch"
+                        )
+                    for local_index, status in enumerate(statuses):
+                        if not status or not status[0]:
+                            continue
+                        uv = status[1]
+                        u, v = float(uv[0]), float(uv[1])
+                        if 0.0 <= u < float(W) and 0.0 <= v < float(H):
+                            ok[first + local_index] = True
+            else:
+                required = ('K', 'rvec', 'tvec', 'h', 'w')
+                if not all(key in cam for key in required):
+                    raise RuntimeError(
+                        f"camera {cam_index} has incomplete pinhole parameters"
+                    )
+                K = np.asarray(cam['K'], dtype=np.float64)
+                dist = np.asarray(cam.get('dist', np.zeros(5)), dtype=np.float64)
+                rvec = np.asarray(cam['rvec'], dtype=np.float64)
+                tvec = np.asarray(cam['tvec'], dtype=np.float64).reshape(3, 1)
+                image_points, _ = cv2.projectPoints(points, rvec, tvec, K, dist)
+                uv = image_points.reshape(-1, 2)
                 R, _ = cv2.Rodrigues(rvec)
-                pts_c = (R @ pts_w.T + tvec.reshape(3,1)).T
-                Zc = pts_c[:, 2]
+                camera_points = (R @ points.T + tvec).T
+                ok = (
+                    (camera_points[:, 2] > 0.0)
+                    & (uv[:, 0] >= 0.0) & (uv[:, 0] < float(W))
+                    & (uv[:, 1] >= 0.0) & (uv[:, 1] < float(H))
+                )
 
-                ok = (Zc > 0) & (uv[:,0] >= 0) & (uv[:,0] < W) & (uv[:,1] >= 0) & (uv[:,1] < H)
+            visible_count += ok.astype(np.uint16)
 
-            visible_all &= ok
-            if not np.any(visible_all):
-                return None, None
+        shape = tuple(len(axis) for axis in axes)
+        return axes, visible_count.reshape(shape), actual_step
 
-        pts_common = pts_w[visible_all]
-        if len(pts_common) == 0:
-            return None, None
+    def _select_visibility_component(self, axes, valid_grid, center, seed_points):
+        """Select one connected visibility region and return its bounding box."""
+        valid_grid = np.asarray(valid_grid, dtype=bool)
+        if not np.any(valid_grid):
+            return None, None, 0
 
-        return pts_common.min(axis=0), pts_common.max(axis=0)
+        try:
+            from scipy import ndimage
+            structure = ndimage.generate_binary_structure(3, 1)
+            labels, component_count = ndimage.label(valid_grid, structure=structure)
+        except Exception as exc:
+            raise RuntimeError(
+                f"3-D connected-component analysis failed: {exc}"
+            ) from exc
+
+        sizes = np.bincount(labels.ravel(), minlength=component_count + 1)
+        center = np.asarray(center, dtype=np.float64).reshape(3)
+        center_index = tuple(
+            int(np.argmin(np.abs(axis - center[i])))
+            for i, axis in enumerate(axes)
+        )
+        center_label = int(labels[center_index])
+
+        seed_hits = np.zeros(component_count + 1, dtype=np.int64)
+        for point in np.asarray(seed_points, dtype=np.float64).reshape(-1, 3):
+            if any(
+                point[i] < axes[i][0] or point[i] > axes[i][-1]
+                for i in range(3)
+            ):
+                continue
+            index = tuple(
+                int(np.argmin(np.abs(axis - point[i])))
+                for i, axis in enumerate(axes)
+            )
+            label_id = int(labels[index])
+            if label_id > 0:
+                seed_hits[label_id] += 1
+
+        chosen = max(
+            range(1, component_count + 1),
+            key=lambda label_id: (
+                int(seed_hits[label_id]),
+                int(label_id == center_label),
+                int(sizes[label_id]),
+            ),
+        )
+        indices = np.argwhere(labels == chosen)
+        mins = np.array([
+            axes[axis][int(indices[:, axis].min())] for axis in range(3)
+        ])
+        maxs = np.array([
+            axes[axis][int(indices[:, axis].max())] for axis in range(3)
+        ])
+        return mins, maxs, int(sizes[chosen])
+
 
     def _validate_settings(self):
         """Validate current settings by running 2D detection and 3D matching on the configured start frame."""
