@@ -243,7 +243,8 @@ class VSCWorker(QObject):
     log = Signal(str)
 
     def __init__(self, proj_dir, min_track_len, sample_points, min_valid_points,
-                 tolerance_mode='default', tolerance_value=5.0):
+                 tolerance_mode='default', tolerance_value=5.0,
+                 frame_start=None, frame_end=None):
         super().__init__()
         self.proj_dir = proj_dir
         self.min_track_len = int(min_track_len)
@@ -251,6 +252,8 @@ class VSCWorker(QObject):
         self.min_valid_points = int(min_valid_points)
         self.tolerance_mode = tolerance_mode
         self.tolerance_value = float(tolerance_value)
+        self.frame_start = frame_start
+        self.frame_end = frame_end
 
     def run(self):
         try:
@@ -266,11 +269,50 @@ class VSCWorker(QObject):
                 min_valid_points=self.min_valid_points,
                 tolerance_mode=self.tolerance_mode,
                 tolerance_value=self.tolerance_value,
+                frame_start=self.frame_start,
+                frame_end=self.frame_end,
             )
             success, message, vsc_data = service.run()
             self.finished.emit(bool(success), str(message), vsc_data)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class VSCValidationWorker(QObject):
+    """Run the sampled VSC quality gate away from the UI thread."""
+
+    finished = Signal(bool, str, object)
+    error = Signal(str)
+    log = Signal(str)
+
+    def __init__(self, source_project, frame_count=30):
+        super().__init__()
+        self.source_project = source_project
+        self.frame_count = int(frame_count)
+
+    def run(self):
+        try:
+            from modules.vsc import VSCValidationService
+
+            service = VSCValidationService(
+                self.source_project,
+                self.source_project,
+                log_callback=lambda message: self.log.emit(str(message)),
+            )
+            report_path = os.path.join(
+                self.source_project, "camFile_VSC", "vsc_validation.json"
+            )
+            success, message, report = service.run(
+                frame_count=self.frame_count,
+                report_path=report_path,
+                require_provenance=True,
+                allow_current_data_self_check=True,
+                random_sampling=True,
+            )
+            self.finished.emit(bool(success), str(message), report)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
 
 class TrackingView(QWidget):
     """View for running and monitoring the tracking process."""
@@ -285,6 +327,7 @@ class TrackingView(QWidget):
         self.log_file = None
         self._last_synced_project = None
         self.active_run_config_path = None
+        self._active_vsc_validation_message = None
         
         # Cache for statistics
         self.cached_proj_path = None
@@ -324,6 +367,10 @@ class TrackingView(QWidget):
         self.vsc_data = {}
         self.vsc_thread = None
         self.vsc_worker = None
+        self.vsc_validation_thread = None
+        self.vsc_validation_worker = None
+        self._suppress_vsc_check_prompt = False
+        self._run_lpt_after_vsc_check = False
         self._vsc_lpt = None
         self._vsc_lpt_unavailable = False
         self._vsc_cpp_cam_cache_init = {}
@@ -784,6 +831,7 @@ class TrackingView(QWidget):
         self.use_vsc_cameras_cb.setToolTip(
             "Checked: use camFile_VSC. Unchecked: use the original camFile folder."
         )
+        self.use_vsc_cameras_cb.toggled.connect(self._on_use_vsc_toggled)
         path_layout.addWidget(self.use_vsc_cameras_cb)
         layout.addWidget(path_group)
 
@@ -875,6 +923,31 @@ class TrackingView(QWidget):
         self.vsc_tolerance_mode.currentIndexChanged.connect(
             lambda idx: self.vsc_tolerance_custom_widget.setVisible(idx == 2)
         )
+
+        vsc_layout.addWidget(QLabel("Source Frame Start:"), 5, 0)
+        self.vsc_frame_start = QSpinBox()
+        self.vsc_frame_start.setRange(0, 2147483647)
+        self.vsc_frame_start.setValue(0)
+        self.vsc_frame_start.setToolTip(
+            "First frame eligible to contribute to the VSC fit."
+        )
+        self.vsc_frame_start.setStyleSheet(
+            "background-color: #222; color: #fff; border: 1px solid #444;"
+        )
+        vsc_layout.addWidget(self.vsc_frame_start, 5, 1)
+
+        vsc_layout.addWidget(QLabel("Source Frame End:"), 6, 0)
+        self.vsc_frame_end = QSpinBox()
+        self.vsc_frame_end.setRange(0, 2147483647)
+        self.vsc_frame_end.setValue(0)
+        self.vsc_frame_end.setSpecialValueText("All")
+        self.vsc_frame_end.setToolTip(
+            "Last contributing frame; All means no upper limit."
+        )
+        self.vsc_frame_end.setStyleSheet(
+            "background-color: #222; color: #fff; border: 1px solid #444;"
+        )
+        vsc_layout.addWidget(self.vsc_frame_end, 6, 1)
         
         # Run VSC Button
         self.vsc_btn = QPushButton(" Run VSC")
@@ -886,7 +959,27 @@ class TrackingView(QWidget):
             QPushButton:disabled { background-color: #333; color: #666; }
         """)
         self.vsc_btn.clicked.connect(self._run_vsc)
-        vsc_layout.addWidget(self.vsc_btn, 5, 0, 1, 2)
+        vsc_layout.addWidget(self.vsc_btn, 7, 0, 1, 2)
+
+        self.vsc_validate_btn = QPushButton(
+            " Check VSC (30 Random Frames)"
+        )
+        self.vsc_validate_btn.setIcon(
+            qta.icon("fa5s.check-double", color="white")
+        )
+        self.vsc_validate_btn.setFixedHeight(36)
+        self.vsc_validate_btn.setStyleSheet("""
+            QPushButton { background-color: #176b45; color: white; font-weight: bold; border-radius: 4px; }
+            QPushButton:hover { background-color: #218c5d; }
+            QPushButton:disabled { background-color: #333; color: #666; }
+        """)
+        self.vsc_validate_btn.clicked.connect(self._run_vsc_validation)
+        vsc_layout.addWidget(self.vsc_validate_btn, 8, 0, 1, 2)
+
+        self.vsc_validation_status = QLabel("VSC validation: not verified")
+        self.vsc_validation_status.setStyleSheet("color: #d6a84b;")
+        self.vsc_validation_status.setWordWrap(True)
+        vsc_layout.addWidget(self.vsc_validation_status, 9, 0, 1, 2)
         
         # Frame List Table for VSC
         self.vsc_frame_table = QTableWidget()
@@ -904,7 +997,7 @@ class TrackingView(QWidget):
             QTableWidget::item:selected { background-color: #005a8c; color: #fff; }
         """)
         self.vsc_frame_table.itemClicked.connect(self._on_vsc_frame_selected)
-        vsc_layout.addWidget(self.vsc_frame_table, 6, 0, 1, 2)
+        vsc_layout.addWidget(self.vsc_frame_table, 10, 0, 1, 2)
 
         
         layout.addWidget(vsc_group)
@@ -922,6 +1015,7 @@ class TrackingView(QWidget):
             if path:
                 self.proj_path_edit.setText(path)
                 self._set_default_output_for_project(path)
+                self._refresh_vsc_validation_status()
 
     def _browse_project(self):
         """Manually select project directory."""
@@ -930,6 +1024,7 @@ class TrackingView(QWidget):
         if dir_path:
             self.proj_path_edit.setText(dir_path)
             self._set_default_output_for_project(dir_path)
+            self._refresh_vsc_validation_status()
 
     def _set_default_output_for_project(self, proj_dir):
         """Follow the project output setting until the user selects another project."""
@@ -962,6 +1057,83 @@ class TrackingView(QWidget):
         if dir_path:
             self.lpt_output_path_edit.setText(os.path.normpath(dir_path))
 
+    def _on_use_vsc_toggled(self, checked):
+        self._refresh_vsc_validation_status()
+        if not checked or self._suppress_vsc_check_prompt:
+            return
+
+        project = self.proj_path_edit.text().strip()
+        if not project or not os.path.isdir(project):
+            return
+        try:
+            from modules.vsc import verify_saved_validation, vsc_source_frame_count
+
+            validation_ok, _ = verify_saved_validation(project)
+            source_frame_count, count_source = vsc_source_frame_count(project)
+        except Exception:
+            validation_ok = False
+            source_frame_count, count_source = None, "unknown"
+        if validation_ok:
+            return
+
+        count_text = (
+            f"{source_frame_count:,} contributing frames ({count_source})"
+            if source_frame_count is not None
+            else "an unknown number of contributing frames"
+        )
+        answer = QMessageBox.question(
+            self,
+            "VSC Check Required",
+            f"This VSC was built from {count_text}.\n"
+            "It has no valid quality check yet.\n\n"
+            "OpenLPT can test it on 30 reproducibly random frames from the "
+            "current dataset. If the fitting range is known, those frames are "
+            "excluded. A legacy VSC with an unknown fitting range is clearly "
+            "recorded as a non-independent self-check.\n\n"
+            "Run the check now and start LPT automatically if it passes?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._run_lpt_after_vsc_check = True
+            QTimer.singleShot(0, self._run_vsc_validation)
+            return
+
+        self._run_lpt_after_vsc_check = False
+        self._suppress_vsc_check_prompt = True
+        try:
+            self.use_vsc_cameras_cb.setChecked(False)
+        finally:
+            self._suppress_vsc_check_prompt = False
+
+    def _refresh_vsc_validation_status(self, *_args):
+        if not hasattr(self, "vsc_validation_status"):
+            return
+        if not self.use_vsc_cameras_cb.isChecked():
+            self.vsc_validation_status.setText(
+                "VSC validation: required only when VSC cameras are selected"
+            )
+            self.vsc_validation_status.setStyleSheet("color: #888;")
+            return
+
+        project = self.proj_path_edit.text().strip()
+        if not project or not os.path.isdir(project):
+            self.vsc_validation_status.setText(
+                "VSC validation: project unavailable"
+            )
+            self.vsc_validation_status.setStyleSheet("color: #ff6b6b;")
+            return
+        try:
+            from modules.vsc import verify_saved_validation
+
+            ok, message = verify_saved_validation(project)
+        except Exception as exc:
+            ok, message = False, str(exc)
+        self.vsc_validation_status.setText(message)
+        self.vsc_validation_status.setStyleSheet(
+            "color: #55d68b;" if ok else "color: #d6a84b;"
+        )
+
     @staticmethod
     def _natural_sort_key(name):
         return [
@@ -993,6 +1165,22 @@ class TrackingView(QWidget):
         self.lpt_output_path_edit.setText(output_dir)
 
         use_vsc = self.use_vsc_cameras_cb.isChecked()
+        self._active_vsc_validation_message = None
+        if use_vsc:
+            from modules.vsc import (
+                saved_validation_audit_lines,
+                verify_saved_validation,
+            )
+
+            validation_ok, validation_message = verify_saved_validation(
+                proj_dir
+            )
+            if not validation_ok:
+                raise ValueError(validation_message)
+            audit_lines = saved_validation_audit_lines(proj_dir)
+            self._active_vsc_validation_message = (
+                validation_message + "\n[Info] " + "\n[Info] ".join(audit_lines)
+            )
         camera_folder_name = "camFile_VSC" if use_vsc else "camFile"
         camera_dir = os.path.join(proj_dir, camera_folder_name)
         if not os.path.isdir(camera_dir):
@@ -1137,6 +1325,10 @@ class TrackingView(QWidget):
                  self._append_log(f"[Info] Running: {exe_path} {config_path}\n")
             self._append_log(f"[Info] Logging to: {log_path}\n\n")
             self._append_log(f"[Info] Camera source: {camera_source}\n")
+            if self._active_vsc_validation_message:
+                self._append_log(
+                    f"[Info] {self._active_vsc_validation_message}\n"
+                )
             self._append_log(f"[Info] Output folder: {output_dir}\n")
             self._append_log(
                 f"[Info] Original config preserved: "
@@ -1312,6 +1504,20 @@ class TrackingView(QWidget):
         tolerance_modes = ['default', 'reproj', 'custom']
         tol_mode = tolerance_modes[self.vsc_tolerance_mode.currentIndex()]
         tol_value = self.vsc_tolerance_spin.value()
+        frame_start = self.vsc_frame_start.value()
+        frame_end_value = self.vsc_frame_end.value()
+        frame_end = None if frame_end_value == 0 else frame_end_value
+        if frame_end is not None and frame_end < frame_start:
+            self.vsc_btn.setEnabled(True)
+            self.vsc_btn.setText(" Run VSC")
+            self._busy_end('run_vsc')
+            QMessageBox.warning(
+                self,
+                "Invalid VSC Frame Range",
+                "Source Frame End must be All or greater than/equal to "
+                "Source Frame Start.",
+            )
+            return
         self.vsc_worker = VSCWorker(
             proj_dir,
             self.vsc_min_track_len.value(),
@@ -1319,6 +1525,8 @@ class TrackingView(QWidget):
             self.vsc_min_valid.value(),
             tolerance_mode=tol_mode,
             tolerance_value=tol_value,
+            frame_start=frame_start,
+            frame_end=frame_end,
         )
         self.vsc_worker.moveToThread(self.vsc_thread)
 
@@ -1390,13 +1598,18 @@ class TrackingView(QWidget):
             self._update_vsc_visualization(vsc_data)
 
         if success:
+            self.vsc_validation_status.setText(
+                "VSC 30-frame current-data check required"
+            )
+            self.vsc_validation_status.setStyleSheet("color: #d6a84b;")
             self._append_log(f"\n[SUCCESS] {message}\n")
             QMessageBox.information(
                 self,
                 "VSC Complete",
                 "Volume Self-Calibration completed successfully!\n\n"
                 "Optimized cameras saved to camFile_VSC/vsc_cam*.txt\n"
-                "Log saved to VSC_log.txt",
+                "Provenance saved to camFile_VSC/vsc_provenance.json\n"
+                "A 30-frame quality check is required before VSC tracking.",
             )
         else:
             self._append_log(f"\n[FAILED] {message}\n")
@@ -1420,6 +1633,151 @@ class TrackingView(QWidget):
         self.vsc_worker = None
         self.vsc_thread = None
         self._busy_end('run_vsc')
+
+    def _run_vsc_validation(self):
+        source_project = self.proj_path_edit.text().strip()
+        if not source_project or not os.path.isdir(source_project):
+            QMessageBox.warning(
+                self,
+                "VSC Validation",
+                "The source project directory is invalid.",
+            )
+            return
+        if self.vsc_validation_worker is not None:
+            return
+
+        self.log_text.clear()
+        self.vis_tabs.setCurrentWidget(self.log_text)
+        self._busy_begin("validate_vsc", "Validating VSC")
+        self.vsc_validate_btn.setEnabled(False)
+        self.vsc_validate_btn.setText(" Validating VSC...")
+        self.run_btn.setEnabled(False)
+        self.vsc_btn.setEnabled(False)
+        self.vsc_validation_status.setText("VSC validation: running")
+        self.vsc_validation_status.setStyleSheet("color: #d6a84b;")
+
+        self.vsc_validation_thread = QThread()
+        self.vsc_validation_worker = VSCValidationWorker(
+            source_project, frame_count=30
+        )
+        self.vsc_validation_worker.moveToThread(self.vsc_validation_thread)
+        self.vsc_validation_thread.started.connect(
+            self.vsc_validation_worker.run
+        )
+        self.vsc_validation_worker.log.connect(
+            self._on_vsc_log, Qt.ConnectionType.QueuedConnection
+        )
+        self.vsc_validation_worker.finished.connect(
+            self._on_vsc_validation_finished
+        )
+        self.vsc_validation_worker.error.connect(
+            self._on_vsc_validation_error
+        )
+        self.vsc_validation_worker.finished.connect(
+            self.vsc_validation_thread.quit
+        )
+        self.vsc_validation_worker.error.connect(
+            self.vsc_validation_thread.quit
+        )
+        self.vsc_validation_worker.finished.connect(
+            self.vsc_validation_worker.deleteLater
+        )
+        self.vsc_validation_worker.error.connect(
+            self.vsc_validation_worker.deleteLater
+        )
+        self.vsc_validation_thread.finished.connect(
+            self.vsc_validation_thread.deleteLater
+        )
+        self.vsc_validation_thread.start()
+
+    @staticmethod
+    def _vsc_metric_text(value):
+        return "unavailable" if value is None else f"{value:.4f}"
+
+    def _on_vsc_validation_finished(self, success, message, report):
+        auto_run_lpt = self._run_lpt_after_vsc_check
+        self._run_lpt_after_vsc_check = False
+        self.vsc_validate_btn.setEnabled(True)
+        self.vsc_validate_btn.setText(" Check VSC (30 Random Frames)")
+        self.run_btn.setEnabled(True)
+        self.vsc_btn.setEnabled(True)
+        color = "#55d68b" if success else "#ff6b6b"
+        self.vsc_validation_status.setText(message)
+        self.vsc_validation_status.setStyleSheet(f"color: {color};")
+
+        metrics = report.get("metrics", {})
+        original = metrics.get("validation_original", {}).get(
+            "leave_one_camera_out_px", {}
+        ).get("pooled", {})
+        vsc = metrics.get("source_vsc", {}).get(
+            "leave_one_camera_out_px", {}
+        ).get("pooled", {})
+        self._append_log(
+            f"\n[{message}] LOCO RMSE: "
+            f"{self._vsc_metric_text(original.get('rmse'))} -> "
+            f"{self._vsc_metric_text(vsc.get('rmse'))} px; P95: "
+            f"{self._vsc_metric_text(original.get('p95'))} -> "
+            f"{self._vsc_metric_text(vsc.get('p95'))} px\n"
+        )
+
+        report_path = os.path.join(
+            self.proj_path_edit.text().strip(),
+            "camFile_VSC",
+            "vsc_validation.json",
+        )
+        if success:
+            if report.get("validation_mode") == "current_data_self_check":
+                detail = (
+                    "The VSC passed the 30-frame current-data self-check and "
+                    "is enabled for LPT. This result is not independent because "
+                    "the VSC fitting frames were not known or held out."
+                )
+            else:
+                detail = (
+                    "The VSC passed the 30-frame held-out quality check and is "
+                    "enabled for LPT."
+                )
+            if auto_run_lpt:
+                self._append_log(
+                    "[Info] VSC check passed; starting LPT automatically.\n"
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "VSC Check Passed",
+                    detail + "\n\n" + f"Report: {report_path}",
+                )
+        else:
+            failed = [
+                name for name, item in report.get("checks", {}).items()
+                if item.get("required") and not item.get("passed")
+            ]
+            QMessageBox.warning(
+                self,
+                "VSC Validation Failed",
+                "The VSC was not enabled for LPT.\n\nFailed checks: "
+                + ", ".join(failed),
+            )
+
+        self.vsc_validation_worker = None
+        self.vsc_validation_thread = None
+        self._busy_end("validate_vsc")
+        if success and auto_run_lpt:
+            QTimer.singleShot(0, self._run_tracking)
+
+    def _on_vsc_validation_error(self, message):
+        self._run_lpt_after_vsc_check = False
+        self.vsc_validate_btn.setEnabled(True)
+        self.vsc_validate_btn.setText(" Check VSC (30 Random Frames)")
+        self.run_btn.setEnabled(True)
+        self.vsc_btn.setEnabled(True)
+        self.vsc_validation_status.setText("VSC validation: error")
+        self.vsc_validation_status.setStyleSheet("color: #ff6b6b;")
+        self._append_log(f"\n[Error] VSC validation failed: {message}\n")
+        QMessageBox.warning(self, "VSC Validation Error", str(message))
+        self.vsc_validation_worker = None
+        self.vsc_validation_thread = None
+        self._busy_end("validate_vsc")
 
     def _update_vsc_visualization(self, vsc_data):
         """Update UI with VSC results."""
