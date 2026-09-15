@@ -104,7 +104,6 @@ std::vector<double> CircleIdentifier::BubbleCenterAndSizeByCircle(
   coder::array<bool, 2U> bwpre;
   coder::array<bool, 2U> expl_temp_bw;
   coder::array<bool, 1U> x;
-  b_struct_T expl_temp;
   double radiusRange_data[2];
   int b_np[2];
   int radiusRange_size[2];
@@ -247,13 +246,11 @@ std::vector<double> CircleIdentifier::BubbleCenterAndSizeByCircle(
               expl_temp_bw[i] = true;
           }
           continuePropagation = true;
+          bwpre.set_size(expl_temp_bw.size(0), expl_temp_bw.size(1));
+          auto *morph_current = &expl_temp_bw;
+          auto *morph_next = &bwpre;
           while (continuePropagation) {
               bool p;
-              bwpre.set_size(expl_temp_bw.size(0), expl_temp_bw.size(1));
-              loop_ub = expl_temp_bw.size(0) * expl_temp_bw.size(1);
-              for (i = 0; i < loop_ub; i++) {
-                  bwpre[i] = expl_temp_bw[i];
-              }
               b_np[0] = np.ImageSize[0];
               b_np[1] = np.ImageSize[1];
               for (int i2{ 0 }; i2 < 9; i2++) {
@@ -264,20 +261,22 @@ std::vector<double> CircleIdentifier::BubbleCenterAndSizeByCircle(
                       np.NeighborLinearIndices,
                       np.NeighborSubscriptOffsets, np.InteriorStart,
                       np.InteriorEnd);
-              expl_temp.bw = expl_temp_bw;
-              np.process2D(Hd, expl_temp_bw, &expl_temp);
+              np.process2D(Hd, *morph_next, *morph_current);
               p = false;
-              if ((bwpre.size(0) == expl_temp_bw.size(0)) &&
-                  (bwpre.size(1) == expl_temp_bw.size(1))) {
+              if ((morph_current->size(0) == morph_next->size(0)) &&
+                  (morph_current->size(1) == morph_next->size(1))) {
                   p = true;
               }
-              if (p && ((bwpre.size(0) != 0) && (bwpre.size(1) != 0)) &&
-                  ((expl_temp_bw.size(0) != 0) && (expl_temp_bw.size(1) != 0))) {
+              if (p && ((morph_current->size(0) != 0) &&
+                        (morph_current->size(1) != 0)) &&
+                  ((morph_next->size(0) != 0) &&
+                   (morph_next->size(1) != 0))) {
                   nrows = 0;
                   exitg1 = false;
                   while ((!exitg1) &&
-                      (nrows <= expl_temp_bw.size(0) * expl_temp_bw.size(1) - 1)) {
-                      if (bwpre[nrows] != expl_temp_bw[nrows]) {
+                      (nrows <= morph_current->size(0) *
+                                    morph_current->size(1) - 1)) {
+                      if ((*morph_current)[nrows] != (*morph_next)[nrows]) {
                           p = false;
                           exitg1 = true;
                       }
@@ -288,6 +287,14 @@ std::vector<double> CircleIdentifier::BubbleCenterAndSizeByCircle(
               }
               continuePropagation = p;
               continuePropagation = !continuePropagation;
+              if (continuePropagation) {
+                  auto *morph_tmp = morph_current;
+                  morph_current = morph_next;
+                  morph_next = morph_tmp;
+              }
+          }
+          if (morph_next != &expl_temp_bw) {
+              expl_temp_bw = *morph_next;
           }
           coder::regionprops(expl_temp_bw, accumMatrixRe, s);
           if (s.size(0) != 0) {
