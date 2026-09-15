@@ -1,8 +1,10 @@
 
 // IPR.cpp (place these before IPR::runIPR)
 #include <algorithm>
+#include <cstdint>
 #include <ctime>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <type_traits>
 
@@ -87,6 +89,21 @@ static void setActiveSubset(std::vector<std::shared_ptr<Camera>> &camera_models,
   }
 }
 
+struct Cached2DDetections {
+  std::uint64_t image_generation =
+      std::numeric_limits<std::uint64_t>::max();
+  std::vector<std::unique_ptr<Object2D>> objects;
+};
+
+static std::vector<std::unique_ptr<Object2D>> clone2DDetections(
+    const std::vector<std::unique_ptr<Object2D>> &source) {
+  std::vector<std::unique_ptr<Object2D>> copy;
+  copy.reserve(source.size());
+  for (const auto &object : source)
+    copy.emplace_back(object ? object->clone() : nullptr);
+  return copy;
+}
+
 // Run one full IPR iteration on the CURRENT active camera set.
 // - Returns newly reconstructed 3D objects (derived from Object3D).
 // - Mutates `images` in-place (residual/mask updates) for active cameras only.
@@ -94,8 +111,12 @@ static void setActiveSubset(std::vector<std::shared_ptr<Camera>> &camera_models,
 // - All indices are GLOBAL cam_id aligned (no compacting).
 static std::vector<std::unique_ptr<Object3D>>
 runSingleIPRIteration(const std::vector<std::shared_ptr<Camera>> &camera_models,
-                      std::vector<Image> &images, ObjectConfig &cfg) {
+                      std::vector<Image> &images, ObjectConfig &cfg,
+                      std::vector<Cached2DDetections> &detection_cache,
+                      std::uint64_t image_generation,
+                      bool &residual_changed) {
   std::vector<std::unique_ptr<Object3D>> objs_out;
+  residual_changed = false;
 
   const auto &ipr = cfg._ipr_param;
   const std::size_t n_cam = camera_models.size();
@@ -121,9 +142,20 @@ runSingleIPRIteration(const std::vector<std::shared_ptr<Camera>> &camera_models,
     if (!camera_models[cam_id]->is_active)
       continue;
 
-    // Implementation should branch internally by reading `cfg` (Tracer/Bubble).
-    std::vector<std::unique_ptr<Object2D>> o2d_list =
-        finder.findObject2D(images[cam_id], cfg);
+    std::vector<std::unique_ptr<Object2D>> o2d_list;
+    auto &cache_entry = detection_cache[static_cast<std::size_t>(cam_id)];
+    if (cfg.kind() == ObjectKind::Bubble &&
+        cache_entry.image_generation == image_generation) {
+      o2d_list = clone2DDetections(cache_entry.objects);
+    } else {
+      o2d_list = finder.findObject2D(images[cam_id], cfg);
+      if (cfg.kind() == ObjectKind::Bubble) {
+        // Cache the complete ordered list before the global object-limit step,
+        // which is deliberately reapplied on every IPR iteration.
+        cache_entry.objects = clone2DDetections(o2d_list);
+        cache_entry.image_generation = image_generation;
+      }
+    }
 
     std::cout << o2d_list.size() << "  ";
     o2d_list_all[cam_id] = std::move(o2d_list);
@@ -207,6 +239,10 @@ runSingleIPRIteration(const std::vector<std::shared_ptr<Camera>> &camera_models,
   // 4) remove ghost and repeated objects
   filterOutInvalid(objs_out, flags);
 
+  // Only accepted objects can change residual pixels. Invalidating all camera
+  // entries is conservative when a reduced-camera subset was active.
+  residual_changed = !objs_out.empty();
+
   images = shaker.calResidualImage(
       objs_out, images); // get updated images with contructed objects removed.
 
@@ -230,6 +266,8 @@ std::vector<std::unique_ptr<Object3D>> IPR::runIPR(ObjectConfig &cfg,
   }
 
   const IPRParam &ipr_param = cfg._ipr_param;
+  std::vector<Cached2DDetections> detection_cache(n_cam);
+  std::uint64_t image_generation = 0;
 
   // Always start from a well-defined state: all cameras active
   setActiveAll(_cam_list);
@@ -298,8 +336,12 @@ std::vector<std::unique_ptr<Object3D>> IPR::runIPR(ObjectConfig &cfg,
         // cfg._sm_param.tol_2d_px = tol_2d_px_orig + 1.0 / loops * loop; // 1.0
         // is used for "double" calculation
 
-        auto objs = runSingleIPRIteration(_cam_list, images,
-                                          cfg); // images will be updated for every loop.
+        bool residual_changed = false;
+        auto objs = runSingleIPRIteration(
+            _cam_list, images, cfg, detection_cache, image_generation,
+            residual_changed); // images may be updated after every loop.
+        if (residual_changed)
+          ++image_generation;
 
         if (calibration_loop) {
           cfg._sm_param.match_cam_count =
