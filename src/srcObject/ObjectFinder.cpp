@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <iterator>
 
 #include <omp.h>
@@ -326,7 +327,8 @@ ObjectFinder2D::findBubble2D(Image const& img, BubbleConfig const& cfg)
 std::vector<std::vector<std::unique_ptr<Object2D>>>
 ObjectFinder2D::findBubble2DFixedBatch(const std::vector<Image>& images,
                                        const std::vector<char>& active,
-                                       const BubbleConfig& cfg)
+                                       const BubbleConfig& cfg,
+                                       BubbleFixedBatchCache& cache)
 {
     struct Plan {
         int W = 0;
@@ -355,6 +357,10 @@ ObjectFinder2D::findBubble2DFixedBatch(const std::vector<Image>& images,
     std::vector<std::vector<std::vector<BubbleTileDetection>>>
         tile_results(images.size());
     std::vector<Job> jobs;
+    if (cache.cameras.size() != images.size()) {
+        cache.cameras.clear();
+        cache.cameras.resize(images.size());
+    }
 
     for (std::size_t cam = 0; cam < images.size(); ++cam) {
         if (!active[cam]) continue;
@@ -377,6 +383,10 @@ ObjectFinder2D::findBubble2DFixedBatch(const std::vector<Image>& images,
         plan.ny = (plan.H + plan.core - 1) / plan.core;
 
         tile_results[cam].resize(static_cast<std::size_t>(plan.nx * plan.ny));
+        if (cache.cameras[cam].size() != tile_results[cam].size()) {
+            cache.cameras[cam].clear();
+            cache.cameras[cam].resize(tile_results[cam].size());
+        }
         for (int ty = 0; ty < plan.ny; ++ty) {
             for (int tx = 0; tx < plan.nx; ++tx) {
                 jobs.push_back(Job{cam, tx, ty});
@@ -404,7 +414,37 @@ ObjectFinder2D::findBubble2DFixedBatch(const std::vector<Image>& images,
 
         const std::size_t tile_id =
             static_cast<std::size_t>(job.ty * plan.nx + job.tx);
+        auto& entry = cache.cameras[job.cam][tile_id];
         auto& detections = tile_results[job.cam][tile_id];
+
+        const int input_w = ix1 - ix0;
+        const int input_h = iy1 - iy0;
+        bool cache_hit = entry.valid && entry.ix0 == ix0 && entry.iy0 == iy0 &&
+            entry.ix1 == ix1 && entry.iy1 == iy1 &&
+            std::memcmp(&entry.radius_min, &rmin, sizeof(double)) == 0 &&
+            std::memcmp(&entry.radius_max, &rmax, sizeof(double)) == 0 &&
+            std::memcmp(&entry.sense, &sense, sizeof(double)) == 0 &&
+            entry.input.getDimRow() == input_h &&
+            entry.input.getDimCol() == input_w;
+
+        if (cache_hit) {
+            const double* source = img.data();
+            const double* snapshot = entry.input.data();
+            for (int row = 0; row < input_h; ++row) {
+                if (std::memcmp(source + (iy0 + row) * plan.W + ix0,
+                                snapshot + row * input_w,
+                                static_cast<std::size_t>(input_w) *
+                                    sizeof(double)) != 0) {
+                    cache_hit = false;
+                    break;
+                }
+            }
+        }
+
+        if (cache_hit) {
+            detections = entry.detections;
+            continue;
+        }
 
         Image subimg = img.crop(iy0, iy1, ix0, ix1);
         CircleIdentifier circle_id(subimg);
@@ -422,6 +462,18 @@ ObjectFinder2D::findBubble2DFixedBatch(const std::vector<Image>& images,
                     BubbleTileDetection{Pt2D{gx, gy}, radii[i], metrics[i]});
             }
         }
+
+        entry.valid = false;
+        entry.ix0 = ix0;
+        entry.iy0 = iy0;
+        entry.ix1 = ix1;
+        entry.iy1 = iy1;
+        entry.radius_min = rmin;
+        entry.radius_max = rmax;
+        entry.sense = sense;
+        entry.input = subimg;
+        entry.detections = detections;
+        entry.valid = true;
     }
 
     for (std::size_t cam = 0; cam < images.size(); ++cam) {
