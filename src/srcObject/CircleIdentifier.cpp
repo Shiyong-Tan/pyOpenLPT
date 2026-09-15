@@ -8,6 +8,9 @@
 // C/C++ source code generated on  : 03-Jul-2025 19:27:50
 //
 #include "CircleIdentifier.h"
+#ifdef OPENLPT_ENABLE_GPU_EXACT_MORPHOLOGY
+#include "GpuExactMorphology.h"
+#endif
 
 // Function Declarations
 static double rt_atan2d_snf(double u0, double u1);
@@ -249,7 +252,14 @@ std::vector<double> CircleIdentifier::BubbleCenterAndSizeByCircle(
           bwpre.set_size(expl_temp_bw.size(0), expl_temp_bw.size(1));
           auto *morph_current = &expl_temp_bw;
           auto *morph_next = &bwpre;
-          while (continuePropagation) {
+#ifdef OPENLPT_ENABLE_GPU_EXACT_MORPHOLOGY
+          const bool gpu_morphology_complete = openlptGpuExactMorphology(
+              Hd.data(), Hd.size(0), Hd.size(1), expl_temp_bw.data());
+#else
+          const bool gpu_morphology_complete = false;
+#endif
+          if (!gpu_morphology_complete) {
+            while (continuePropagation) {
               bool p;
               b_np[0] = np.ImageSize[0];
               b_np[1] = np.ImageSize[1];
@@ -292,9 +302,10 @@ std::vector<double> CircleIdentifier::BubbleCenterAndSizeByCircle(
                   morph_current = morph_next;
                   morph_next = morph_tmp;
               }
-          }
-          if (morph_next != &expl_temp_bw) {
+            }
+            if (morph_next != &expl_temp_bw) {
               expl_temp_bw = *morph_next;
+            }
           }
           coder::regionprops(expl_temp_bw, accumMatrixRe, s);
           if (s.size(0) != 0) {
