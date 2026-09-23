@@ -336,8 +336,31 @@ STB::LinkCandidate STB::findNN(KDTreeObj3d const &tree_obj3d,
 }
 
 void STB::runConvPhase(int frame, std::vector<Image> &img_list) {
-  // Save original images for VSC (before any modifications)
-  std::vector<Image> img_orig = img_list;
+  // Decide once whether this frame will consume original images in VSC. Keep
+  // this before any Shake/residual operation that can modify img_list.
+  bool has_active_pinhole = false;
+  for (const auto &cam : _basic_setting._cam_list) {
+    if (cam && cam->is_active && cam->type() == CameraType::Pinhole) {
+      has_active_pinhole = true;
+      break;
+    }
+  }
+
+  // Preserve the current branch's VSC behavior. When configuration-controlled
+  // gating is restored, this remains the single decision used by both the
+  // image copy and the later VSC call.
+  // bool skip_vsc = !has_active_pinhole ||
+  //                 (_obj_config->_vsc_param._camera_calibrated &&
+  //                  (!_obj_config->_vsc_param._enable_otf ||
+  //                   _obj_config->_vsc_param._otf_calibrated));
+  bool skip_vsc = true;
+  const bool is_accumulate_frame =
+      (frame % _obj_config->_vsc_param._accumulate_interval == 0);
+  const bool need_vsc_images = !skip_vsc && is_accumulate_frame;
+
+  std::vector<Image> img_orig;
+  if (need_vsc_images)
+    img_orig = img_list;
 
   // Initialize some variables
   int n_sa = _short_track_active.size();
@@ -619,24 +642,7 @@ void STB::runConvPhase(int frame, std::vector<Image> &img_list) {
   // --------------------------- //
   // ----- VSC: Only accumulate every N frames and only if not already
   // calibrated -----
-  bool has_active_pinhole = false;
-  for (const auto &cam : _basic_setting._cam_list) {
-    if (cam && cam->is_active && cam->type() == CameraType::Pinhole) {
-      has_active_pinhole = true;
-      break;
-    }
-  }
-
-  // bool skip_vsc = !has_active_pinhole ||
-  //                 (_obj_config->_vsc_param._camera_calibrated &&
-  //                  (!_obj_config->_vsc_param._enable_otf ||
-  //                   _obj_config->_vsc_param._otf_calibrated));
-  bool skip_vsc = true;
-
-  bool is_accumulate_frame =
-      (frame % _obj_config->_vsc_param._accumulate_interval == 0);
-
-  if (!skip_vsc && is_accumulate_frame) {
+  if (need_vsc_images) {
     clock_t t_vsc_start = clock();
     _vsc.accumulate(frame, _long_track_active, img_orig,
                     _basic_setting._cam_list, *_obj_config);
