@@ -37,19 +37,27 @@ bool BubbleRefImg::calBubbleRefImg(
     std::string output_folder, double r_thres, int n_bb_thres) {
   _img_Ref_list.clear();
   _intRef_list.clear();
+  _is_valid = false;
+  _last_error.clear();
+  const auto fail = [this](const std::string &reason) {
+    _last_error = reason;
+    std::cerr << "Bubble reference diagnostic: " << reason << std::endl;
+    return false;
+  };
 
   const int n_cam = static_cast<int>(camera_models.size());
   if (n_cam == 0)
-    return false;
+    return fail("no camera models were loaded");
   if (static_cast<int>(img_input.size()) != n_cam)
-    return false;
+    return fail("image count does not match camera count");
   if (static_cast<int>(bb2d_list_all.size()) != n_cam)
-    return false;
+    return fail("2D-detection camera count does not match camera count");
 
   // NEW: all cameras must be active
   for (int cam = 0; cam < n_cam; ++cam) {
     if (!camera_models[cam] || !camera_models[cam]->is_active)
-      return false;
+      return fail("camera " + std::to_string(cam) +
+                  " is missing or inactive during reference generation");
   }
 
   // ---- Build non-owning pointer views: Bubble3D* and Bubble2D* ----
@@ -62,7 +70,7 @@ bool BubbleRefImg::calBubbleRefImg(
     bb3d_ptrs.push_back(static_cast<const Bubble3D *>(up.get()));
   }
   if (bb3d_ptrs.empty())
-    return false;
+    return fail("the full-camera match produced no 3D bubble candidates");
 
   std::vector<std::vector<const Bubble2D *>> bb2d_ptrs(n_cam);
   for (int cam = 0; cam < n_cam; ++cam) {
@@ -100,7 +108,9 @@ bool BubbleRefImg::calBubbleRefImg(
   }
   const int n_select = static_cast<int>(id_select.size());
   if (n_select <= n_bb_thres)
-    return false;
+    return fail("only " + std::to_string(n_select) +
+                " matched bubbles exceeded the per-camera radius threshold; " +
+                std::to_string(n_bb_thres + 1) + " are required");
 
   // ---- 2) Determine per-camera template size (max diameter among selected)
   // ----
@@ -116,7 +126,8 @@ bool BubbleRefImg::calBubbleRefImg(
       dmax = std::max(dmax, 2.0 * b2->_r_px);
     }
     if (dmax <= 0.0)
-      return false; // every camera must have usable 2D projections
+      return fail("camera " + std::to_string(cam) +
+                  " has no usable projected bubble radius");
     dia_ref[cam] = dmax;
   }
 
@@ -130,7 +141,8 @@ bool BubbleRefImg::calBubbleRefImg(
     if (npix <= 0) {
       _img_Ref_list.clear();
       _intRef_list.clear();
-      return false;
+      return fail("camera " + std::to_string(cam) +
+                  " produced a non-positive reference-image size");
     }
 
     _img_Ref_list[cam] = Image(npix, npix, 0.0);
@@ -225,7 +237,8 @@ bool BubbleRefImg::calBubbleRefImg(
     if (cnt == 0) {
       _img_Ref_list.clear();
       _intRef_list.clear();
-      return false;
+      return fail("camera " + std::to_string(cam) +
+                  " has no isolated in-bounds bubble crops");
     }
     mean_peak /= cnt;
 
@@ -238,7 +251,10 @@ bool BubbleRefImg::calBubbleRefImg(
     if (n_eff < n_bb_thres) {
       _img_Ref_list.clear();
       _intRef_list.clear();
-      return false; // not enough qualified samples overall
+      return fail("camera " + std::to_string(cam) + " has only " +
+                  std::to_string(n_eff) +
+                  " intensity-qualified crops; at least " +
+                  std::to_string(n_bb_thres) + " are required");
     }
 
     // Average resized crops whose peak > 0.8 × mean_peak.
@@ -271,7 +287,8 @@ bool BubbleRefImg::calBubbleRefImg(
         if (navg < n_bb_thres) {
           _img_Ref_list.clear();
           _intRef_list.clear();
-          return false; // not enough contributing samples at this pixel
+          return fail("camera " + std::to_string(cam) +
+                      " has insufficient per-pixel crop coverage");
         }
 
         _img_Ref_list[cam](yy, xx) = acc / navg;
