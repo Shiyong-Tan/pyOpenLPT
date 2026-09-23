@@ -1089,6 +1089,40 @@ ShakeStrategy::ROISize BubbleShakeStrategy::calROISize(const Object3D &obj,
   return roi_size;
 }
 
+std::shared_ptr<const Image>
+BubbleShakeStrategy::getResizedBubbleRef(int cam, int npix) const {
+#ifdef OPENLPT_DISABLE_BUBBLE_REF_CACHE
+  const auto &bb_cfg = static_cast<const BubbleConfig &>(_obj_cfg);
+  BubbleResize bb_resizer;
+  return std::make_shared<const Image>(bb_resizer.ResizeBubble(
+      bb_cfg._bb_ref_img[cam], npix, _cam_list[cam]->max_intensity));
+#else
+  const RefCacheKey key{cam, npix};
+  {
+    std::shared_lock<std::shared_mutex> read_lock(_ref_cache_mutex);
+    const auto found = _ref_cache.find(key);
+    if (found != _ref_cache.end()) {
+      return found->second;
+    }
+  }
+
+  // Serialize misses, including generated-code first use, and check again in
+  // case another worker populated this key while this worker was waiting.
+  std::unique_lock<std::shared_mutex> write_lock(_ref_cache_mutex);
+  const auto found = _ref_cache.find(key);
+  if (found != _ref_cache.end()) {
+    return found->second;
+  }
+
+  const auto &bb_cfg = static_cast<const BubbleConfig &>(_obj_cfg);
+  BubbleResize bb_resizer;
+  auto resized = std::make_shared<const Image>(bb_resizer.ResizeBubble(
+      bb_cfg._bb_ref_img[cam], npix, _cam_list[cam]->max_intensity));
+  _ref_cache.emplace(key, resized);
+  return resized;
+#endif
+}
+
 std::vector<bool>
 BubbleShakeStrategy::selectShakeCam(const Object3D &obj,
                                     const std::vector<ROIInfo> &roi_info,
@@ -1298,19 +1332,14 @@ BubbleShakeStrategy::calShakeResidue(const Object3D &obj_candidate,
     const int r_int = std::round(r_px);
     int npix = r_int * 2 +
                1; // guarantee there is only a whole center pixel on ref_img
-    const auto &bb_cfg = static_cast<const BubbleConfig &>(
-        _obj_cfg); // to get the bubble reference image
-    BubbleResize bb_resizer;
-    const Image ref_img =
-        bb_resizer.ResizeBubble(bb_cfg._bb_ref_img[cam], npix,
-                                _cam_list[cam]->max_intensity);
+    const auto ref_img = getResizedBubbleRef(cam, npix);
 
     // calculate cross-correlation
     std::vector<double> corr_interp(4, 0);
-    corr_interp[0] = getImgCorr(roi_info[cam], x_low, y_low, ref_img);
-    corr_interp[1] = getImgCorr(roi_info[cam], x_high, y_low, ref_img);
-    corr_interp[2] = getImgCorr(roi_info[cam], x_high, y_high, ref_img);
-    corr_interp[3] = getImgCorr(roi_info[cam], x_low, y_high, ref_img);
+    corr_interp[0] = getImgCorr(roi_info[cam], x_low, y_low, *ref_img);
+    corr_interp[1] = getImgCorr(roi_info[cam], x_high, y_low, *ref_img);
+    corr_interp[2] = getImgCorr(roi_info[cam], x_high, y_high, *ref_img);
+    corr_interp[3] = getImgCorr(roi_info[cam], x_low, y_high, *ref_img);
 
     // bilinear interpolation
     AxisLimit grid_limit(x_low, x_high, y_low, y_high, 0, 0);
@@ -1350,12 +1379,7 @@ bool BubbleShakeStrategy::additionalObjectCheck(
     const int r_int = std::round(r_px);
     int npix = r_int * 2 +
                1; // guarantee there is only a whole center pixel on ref_img
-    const auto &bb_cfg = static_cast<const BubbleConfig &>(
-        _obj_cfg); // to get the bubble reference image
-    BubbleResize bb_resizer;
-    const Image ref_img =
-        bb_resizer.ResizeBubble(bb_cfg._bb_ref_img[cam], npix,
-                                _cam_list[cam]->max_intensity);
+    const auto ref_img = getResizedBubbleRef(static_cast<int>(cam), npix);
 
     // ====== 你原来 calShakeResidue 里那套插值 ======
     int x_low = static_cast<int>(std::floor(xc));
@@ -1365,10 +1389,10 @@ bool BubbleShakeStrategy::additionalObjectCheck(
 
     // calculate cross-correlation
     std::vector<double> corr_interp(4, 0);
-    corr_interp[0] = getImgCorr(roi_info[cam], x_low, y_low, ref_img);
-    corr_interp[1] = getImgCorr(roi_info[cam], x_high, y_low, ref_img);
-    corr_interp[2] = getImgCorr(roi_info[cam], x_high, y_high, ref_img);
-    corr_interp[3] = getImgCorr(roi_info[cam], x_low, y_high, ref_img);
+    corr_interp[0] = getImgCorr(roi_info[cam], x_low, y_low, *ref_img);
+    corr_interp[1] = getImgCorr(roi_info[cam], x_high, y_low, *ref_img);
+    corr_interp[2] = getImgCorr(roi_info[cam], x_high, y_high, *ref_img);
+    corr_interp[3] = getImgCorr(roi_info[cam], x_low, y_high, *ref_img);
 
     AxisLimit grid_limit(x_low, x_high, y_low, y_high, 0, 0);
     std::vector<double> center = {xc, yc};
