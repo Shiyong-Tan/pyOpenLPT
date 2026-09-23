@@ -96,18 +96,19 @@ class TrackLoaderWorker(QObject):
     finished = Signal(object, object, str, object)
     error = Signal(str)
 
-    def __init__(self, proj_dir):
+    def __init__(self, proj_dir, output_dir=None):
         super().__init__()
         self.proj_dir = proj_dir
+        self.output_dir = output_dir
 
     def run(self):
         try:
             # Read Output Folder Path from config.txt
             config_path = os.path.join(self.proj_dir, "config.txt")
-            output_dir = os.path.join(self.proj_dir, "Results")  # Default fallback
+            output_dir = self.output_dir or os.path.join(self.proj_dir, "Results")
             obj_type = "Tracer"
             
-            if os.path.exists(config_path):
+            if self.output_dir is None and os.path.exists(config_path):
                 with open(config_path, 'r') as f:
                     lines = f.readlines()
                     for i, line in enumerate(lines):
@@ -282,6 +283,8 @@ class TrackingView(QWidget):
         self.process.readyReadStandardError.connect(self._handle_stderr)
         self.process.finished.connect(self._on_process_finished)
         self.log_file = None
+        self._last_synced_project = None
+        self.active_run_config_path = None
         
         # Cache for statistics
         self.cached_proj_path = None
@@ -752,6 +755,36 @@ class TrackingView(QWidget):
         path_row.addWidget(self.proj_path_edit)
         path_row.addWidget(self.sync_btn)
         path_layout.addLayout(path_row)
+
+        output_label = QLabel("LPT Output Folder:")
+        output_label.setStyleSheet("color: #aaa;")
+        path_layout.addWidget(output_label)
+
+        output_row = QHBoxLayout()
+        self.lpt_output_path_edit = QLineEdit()
+        self.lpt_output_path_edit.setPlaceholderText(
+            "Defaults to the project's Results folder"
+        )
+        self.lpt_output_path_edit.setStyleSheet(
+            "background-color: #1a1a1a; color: #ccc; border: 1px solid #333;"
+        )
+        self.output_browse_btn = QPushButton()
+        self.output_browse_btn.setIcon(
+            qta.icon("fa5s.folder-open", color="#00d4ff")
+        )
+        self.output_browse_btn.setToolTip("Select LPT Output Folder")
+        self.output_browse_btn.setFixedSize(30, 30)
+        self.output_browse_btn.clicked.connect(self._browse_lpt_output)
+        output_row.addWidget(self.lpt_output_path_edit)
+        output_row.addWidget(self.output_browse_btn)
+        path_layout.addLayout(output_row)
+
+        self.use_vsc_cameras_cb = QCheckBox("Use VSC camera files")
+        self.use_vsc_cameras_cb.setChecked(False)
+        self.use_vsc_cameras_cb.setToolTip(
+            "Checked: use camFile_VSC. Unchecked: use the original camFile folder."
+        )
+        path_layout.addWidget(self.use_vsc_cameras_cb)
         layout.addWidget(path_group)
 
         # Execution Controls
@@ -888,6 +921,7 @@ class TrackingView(QWidget):
             path = self.settings_view.project_path.text()
             if path:
                 self.proj_path_edit.setText(path)
+                self._set_default_output_for_project(path)
 
     def _browse_project(self):
         """Manually select project directory."""
@@ -895,6 +929,161 @@ class TrackingView(QWidget):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Project Directory", current_dir)
         if dir_path:
             self.proj_path_edit.setText(dir_path)
+            self._set_default_output_for_project(dir_path)
+
+    def _set_default_output_for_project(self, proj_dir):
+        """Follow the project output setting until the user selects another project."""
+        normalized = os.path.normpath(proj_dir)
+        if normalized == self._last_synced_project:
+            return
+        self._last_synced_project = normalized
+        configured = ""
+        if self.settings_view and hasattr(self.settings_view, "output_path"):
+            configured = self.settings_view.output_path.text().strip()
+        if configured:
+            if not os.path.isabs(configured):
+                configured = os.path.join(normalized, configured)
+            output_dir = os.path.normpath(configured)
+        else:
+            output_dir = os.path.join(normalized, "Results")
+        self.lpt_output_path_edit.setText(output_dir)
+
+    def _browse_lpt_output(self):
+        proj_dir = self.proj_path_edit.text().strip()
+        current_dir = self.lpt_output_path_edit.text().strip()
+        if not current_dir:
+            current_dir = (
+                os.path.join(proj_dir, "Results")
+                if proj_dir else os.path.expanduser("~")
+            )
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Select LPT Output Folder", current_dir
+        )
+        if dir_path:
+            self.lpt_output_path_edit.setText(os.path.normpath(dir_path))
+
+    @staticmethod
+    def _natural_sort_key(name):
+        return [
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", name)
+        ]
+
+    @staticmethod
+    def _path_for_runtime_config(path, proj_dir):
+        path_drive = os.path.splitdrive(path)[0].lower()
+        project_drive = os.path.splitdrive(proj_dir)[0].lower()
+        if path_drive == project_drive:
+            return os.path.relpath(path, proj_dir).replace("\\", "/")
+        return path.replace("\\", "/")
+
+    def _prepare_lpt_run_config(self, proj_dir):
+        """Create a runtime config without modifying the project's config.txt."""
+        source_path = os.path.join(proj_dir, "config.txt")
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Master config file not found: {source_path}")
+
+        output_dir = self.lpt_output_path_edit.text().strip()
+        if not output_dir:
+            output_dir = os.path.join(proj_dir, "Results")
+        if not os.path.isabs(output_dir):
+            output_dir = os.path.join(proj_dir, output_dir)
+        output_dir = os.path.normpath(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        self.lpt_output_path_edit.setText(output_dir)
+
+        use_vsc = self.use_vsc_cameras_cb.isChecked()
+        camera_folder_name = "camFile_VSC" if use_vsc else "camFile"
+        camera_dir = os.path.join(proj_dir, camera_folder_name)
+        if not os.path.isdir(camera_dir):
+            raise FileNotFoundError(f"Camera folder not found: {camera_dir}")
+
+        prefix = "vsc_cam" if use_vsc else "cam"
+        camera_files = [
+            name for name in os.listdir(camera_dir)
+            if name.lower().endswith(".txt")
+            and name.lower().startswith(prefix)
+        ]
+        camera_files.sort(key=self._natural_sort_key)
+
+        with open(source_path, "r", encoding="utf-8") as source:
+            lines = source.readlines()
+
+        n_cam = None
+        for index, line in enumerate(lines):
+            if "# Number of Cameras" not in line:
+                continue
+            for value_line in lines[index + 1:]:
+                stripped = value_line.strip()
+                if stripped and not stripped.startswith("#"):
+                    n_cam = int(stripped.split(",")[0])
+                    break
+            break
+        if n_cam is None:
+            raise ValueError("Could not read '# Number of Cameras' from config.txt")
+        if len(camera_files) != n_cam:
+            raise ValueError(
+                f"Expected {n_cam} camera files in {camera_folder_name}, "
+                f"found {len(camera_files)}"
+            )
+
+        camera_header = next(
+            (i for i, line in enumerate(lines) if "# Camera File Path" in line),
+            None,
+        )
+        output_header = next(
+            (i for i, line in enumerate(lines) if "# Output Folder Path" in line),
+            None,
+        )
+        if camera_header is None or output_header is None:
+            raise ValueError("config.txt is missing the camera or output section")
+
+        camera_end = next(
+            (
+                i for i in range(camera_header + 1, len(lines))
+                if lines[i].lstrip().startswith("#")
+            ),
+            len(lines),
+        )
+        old_camera_lines = [
+            line.strip() for line in lines[camera_header + 1:camera_end]
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        intensities = []
+        for line in old_camera_lines:
+            parts = [part.strip() for part in line.split(",")]
+            intensities.append(
+                parts[1] if len(parts) > 1 and parts[1] else "255"
+            )
+        while len(intensities) < n_cam:
+            intensities.append("255")
+
+        lines[camera_header + 1:camera_end] = [
+            f"{camera_folder_name}/{name},{intensities[index]}\n"
+            for index, name in enumerate(camera_files)
+        ]
+
+        output_header = next(
+            i for i, line in enumerate(lines) if "# Output Folder Path" in line
+        )
+        output_value = next(
+            (
+                i for i in range(output_header + 1, len(lines))
+                if lines[i].strip() and not lines[i].lstrip().startswith("#")
+            ),
+            None,
+        )
+        if output_value is None:
+            raise ValueError("config.txt has no output-folder value")
+        lines[output_value] = (
+            self._path_for_runtime_config(output_dir, proj_dir) + "\n"
+        )
+
+        runtime_path = os.path.join(proj_dir, ".openlpt_runtime_config.txt")
+        with open(runtime_path, "w", encoding="utf-8", newline="") as target:
+            target.writelines(lines)
+        self.active_run_config_path = runtime_path
+        return runtime_path, output_dir, camera_folder_name
 
     def _run_tracking(self):
         """Execute OpenLPT.exe with pre-run checks."""
@@ -903,8 +1092,17 @@ class TrackingView(QWidget):
             self._append_log("[Error] Project directory not found. Please set it in Settings.\n")
             return
 
+        try:
+            config_path, output_dir, camera_source = (
+                self._prepare_lpt_run_config(proj_dir)
+            )
+        except Exception as exc:
+            self._append_log(f"[Error] Could not prepare LPT run: {exc}\n")
+            QMessageBox.warning(self, "Invalid LPT Run Settings", str(exc))
+            return
+
         # 1. Routine Checks
-        passed, error_msg = self._check_project_files(proj_dir)
+        passed, error_msg = self._check_project_files(proj_dir, config_path)
         if not passed:
             self.log_text.clear()
             self.vis_tabs.setCurrentWidget(self.log_text)
@@ -918,8 +1116,6 @@ class TrackingView(QWidget):
             )
             return
 
-        config_path = os.path.join(proj_dir, "config.txt")
-        
         # Find executable relative to GUI script
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         exe_path = os.path.join(base_dir, "build", "Release", "OpenLPT.exe")
@@ -940,6 +1136,12 @@ class TrackingView(QWidget):
             else:
                  self._append_log(f"[Info] Running: {exe_path} {config_path}\n")
             self._append_log(f"[Info] Logging to: {log_path}\n\n")
+            self._append_log(f"[Info] Camera source: {camera_source}\n")
+            self._append_log(f"[Info] Output folder: {output_dir}\n")
+            self._append_log(
+                f"[Info] Original config preserved: "
+                f"{os.path.join(proj_dir, 'config.txt')}\n\n"
+            )
         except Exception as e:
             self._append_log(f"[Error] Failed to create log file: {e}\n")
             return
@@ -955,11 +1157,11 @@ class TrackingView(QWidget):
             # Standalone .exe <config>
             self.process.start(exe_path, [config_path])
 
-    def _check_project_files(self, proj_dir):
+    def _check_project_files(self, proj_dir, config_path=None):
         """Verify existence of mandatory files/folders by parsing config.txt."""
         errors = []
         
-        config_path = os.path.join(proj_dir, "config.txt")
+        config_path = config_path or os.path.join(proj_dir, "config.txt")
         
         # Check config.txt
         if not os.path.exists(config_path):
@@ -1408,11 +1610,16 @@ class TrackingView(QWidget):
         if self.cached_proj_path != proj_dir:
             self.ui_updated = False
 
-        # Read Output Folder Path from config.txt
+        # Prefer the output selected for the LPT run. If none was selected,
+        # retain the legacy config.txt lookup.
+        selected_output = self.lpt_output_path_edit.text().strip()
+        output_dir = selected_output or os.path.join(proj_dir, "Results")
+        if output_dir and not os.path.isabs(output_dir):
+            output_dir = os.path.normpath(os.path.join(proj_dir, output_dir))
+
         config_path = os.path.join(proj_dir, "config.txt")
-        output_dir = os.path.join(proj_dir, "Results")  # Default fallback
         
-        if os.path.exists(config_path):
+        if not selected_output and os.path.exists(config_path):
             with open(config_path, 'r') as f:
                 lines = f.readlines()
                 for i, line in enumerate(lines):
@@ -1452,7 +1659,14 @@ class TrackingView(QWidget):
 
         # Setup Thread and Worker
         self.loader_thread = QThread()
-        self.loader_worker = TrackLoaderWorker(proj_dir)
+        selected_output = self.lpt_output_path_edit.text().strip()
+        if selected_output and not os.path.isabs(selected_output):
+            selected_output = os.path.normpath(
+                os.path.join(proj_dir, selected_output)
+            )
+        self.loader_worker = TrackLoaderWorker(
+            proj_dir, selected_output or None
+        )
         self.loader_worker.moveToThread(self.loader_thread)
 
         self.loader_thread.started.connect(self.loader_worker.run)
