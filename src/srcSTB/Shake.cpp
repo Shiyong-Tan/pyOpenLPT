@@ -194,66 +194,92 @@ void Shake::calResidueImage(const std::vector<std::unique_ptr<Object3D>> &objs,
   _img_res_list = img_orig; // deep copy; if your Image doesn't support
                             // operator= as deep copy, use explicit copy
 
-// 4) Parallelize across cameras (each thread owns one residual image)
-//    You can also parallelize rows inside the camera loop if Images are big.
-#pragma omp parallel for if (!omp_in_parallel())
-  for (int k = 0; k < n_cam; ++k) {
-    // 4.1 Skip inactive cameras, but keep slot alignment (residual stays as
-    // original) for IPR output, we need to calculate all cameras
-    if (!_cam_list[k]->is_active && !output_ipr)
+  // Build immutable projection metadata once. Every tile traverses these
+  // entries in the original object order, preserving each pixel's arithmetic
+  // order while allowing more than one worker per camera.
+  struct ResidualProjection {
+    const Object3D *obj;
+    PixelRange roi;
+  };
+  struct ResidualRowTile {
+    int cam;
+    int row_begin;
+    int row_end;
+  };
+
+  std::vector<std::vector<ResidualProjection>> projections(n_cam);
+  std::vector<ResidualRowTile> tiles;
+  constexpr int kResidualTileRows = 64;
+
+  for (int cam = 0; cam < n_cam; ++cam) {
+    // Keep slot alignment. For IPR output, residuals are calculated for all
+    // cameras, matching the original behavior.
+    if (!_cam_list[cam]->is_active && !output_ipr)
       continue;
 
-    Image &res = _img_res_list[k]; // get the reference
-    const Image &orig = img_orig[k];
-
-    // 4.2 For each object, subtract its projection over its ROI only
+    auto &cam_projections = projections[cam];
+    cam_projections.reserve(objs.size());
     for (size_t id_obj = 0; id_obj < objs.size(); ++id_obj) {
-      if (use_mask) {
-        if ((*flags)[id_obj] != ObjFlag::None)
-          continue; // skip ghost and repeated objects (flagged objects)
-      }
+      if (use_mask && (*flags)[id_obj] != ObjFlag::None)
+        continue;
+
       const Object3D *obj = objs[id_obj].get();
-
-      // --- Obtain ROI center from object's 2D projection; size from strategy
-      // ---
-      REQUIRE(obj->_obj2d_list[k] != nullptr, ErrorCode::InvalidArgument,
+      REQUIRE(obj->_obj2d_list[cam] != nullptr, ErrorCode::InvalidArgument,
               "No 2D projection in object.");
-      Pt2D pt_center = obj->_obj2d_list[k]->_pt_center;
-      double cx = pt_center[0], cy = pt_center[1];
+      const Pt2D pt_center = obj->_obj2d_list[cam]->_pt_center;
+      const auto sz = _strategy->calROISize(*obj, cam);
+      const PixelRange roi =
+          calROIBound(cam, pt_center[0], pt_center[1], sz.dx, sz.dy);
+      if (roi.row_max <= roi.row_min || roi.col_max <= roi.col_min)
+        continue;
+      cam_projections.push_back(ResidualProjection{obj, roi});
+    }
 
-      // Strategy returns (dx, dy) = half width/height (in pixels) for the ROI
-      // If your calROISize returns std::vector<double>, read [0],[1]; or change
-      // to a struct.
-      const auto sz = _strategy->calROISize(*obj, k);
-      double dx = sz.dx, dy = sz.dy;
+    const int n_rows = _cam_list[cam]->getNRow();
+    for (int row_begin = 0; row_begin < n_rows;
+         row_begin += kResidualTileRows) {
+      const int row_end = std::min(row_begin + kResidualTileRows, n_rows);
+      const bool has_projection =
+          std::any_of(cam_projections.begin(), cam_projections.end(),
+                      [row_begin, row_end](const ResidualProjection &entry) {
+                        return entry.roi.row_min < row_end &&
+                               entry.roi.row_max > row_begin;
+                      });
+      if (has_projection)
+        tiles.push_back(ResidualRowTile{cam, row_begin, row_end});
+    }
+  }
 
-      // Compute and clamp ROI bounds to the image
-      // projection size: one object size
-      const PixelRange roi = calROIBound(k, cx, cy, dx, dy);
-      if (roi.row_max < roi.row_min || roi.col_max < roi.col_min)
-        continue; // empty ROI
+  // Tiles never overlap in (camera,row), so workers write disjoint pixels.
+#pragma omp parallel for schedule(static) if (!omp_in_parallel())
+  for (std::ptrdiff_t tile_id = 0;
+       tile_id < static_cast<std::ptrdiff_t>(tiles.size()); ++tile_id) {
+    const ResidualRowTile &tile = tiles[static_cast<size_t>(tile_id)];
+    Image &res = _img_res_list[tile.cam];
+    const Image &orig = img_orig[tile.cam];
 
-      // 4.2.1 Iterate pixels in ROI and fuse projection into residual
-      //       NOTE: replace res.at(r,c) / orig.at(r,c) / projection accessor
-      //       with your actual image API.
-      for (int r = roi.row_min; r < roi.row_max; ++r) {
-        for (int c = roi.col_min; c < roi.col_max; ++c) {
-          const double p = _strategy->project2DInt(*obj, k, r, c);
-          if (p == 0.0)
-            continue; // cheap skip
-          // "Min" fusion for all types:
-          // residual := min(current residual, orig - projection_of_this_object)
-          double &rr = res(r, c);
-          const double o = orig(r, c);
-          const double cand = o - p;
-          if (cand < rr)
-            rr = cand;
-          if (output_ipr && rr < 0)
-            rr = 0.0; // IPR output: clamp negative to 0
+    for (const ResidualProjection &entry : projections[tile.cam]) {
+      const int row_begin = std::max(tile.row_begin, entry.roi.row_min);
+      const int row_end = std::min(tile.row_end, entry.roi.row_max);
+      if (row_begin >= row_end)
+        continue;
+
+      for (int row = row_begin; row < row_end; ++row) {
+        for (int col = entry.roi.col_min; col < entry.roi.col_max; ++col) {
+          const double projected =
+              _strategy->project2DInt(*entry.obj, tile.cam, row, col);
+          if (projected == 0.0)
+            continue;
+          double &residual = res(row, col);
+          const double candidate = orig(row, col) - projected;
+          if (candidate < residual)
+            residual = candidate;
+          if (output_ipr && residual < 0.0)
+            residual = 0.0;
         }
       }
-    } // end for each object
-  } // end per-camera loop
+    }
+  }
 }
 
 PixelRange Shake::calROIBound(int id_cam, double cx, double cy, double dx,
