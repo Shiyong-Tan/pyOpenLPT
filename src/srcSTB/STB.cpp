@@ -3,6 +3,30 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+
+// Non-owning nanoflann adapter for active long-track endpoints. The endpoint
+// vector and tree are immutable while the parallel queries execute.
+struct Pt3dCloud {
+  const std::vector<Pt3D> &points;
+
+  explicit Pt3dCloud(const std::vector<Pt3D> &points_in)
+      : points(points_in) {}
+
+  size_t kdtree_get_point_count() const { return points.size(); }
+
+  double kdtree_get_pt(size_t index, int dimension) const {
+    return points[index][dimension];
+  }
+
+  template <class BBOX> bool kdtree_get_bbox(BBOX &) const { return false; }
+};
+
+using KDTreePt3d = nanoflann::KDTreeSingleIndexAdaptor<
+    nanoflann::L2_Simple_Adaptor<double, Pt3dCloud>, Pt3dCloud, 3>;
+
+} // namespace
+
 STB::STB(const BasicSetting &setting, const std::string &type,
          const std::string &obj_cfg_path)
     : _basic_setting(setting) {
@@ -728,6 +752,16 @@ STB::checkRepeat(const std::vector<std::unique_ptr<Object3D>> &objs) const {
 
   const double tol = _obj_config->_sm_param.tol_3d_mm;
 
+#ifndef OPENLPT_DISABLE_CHECK_REPEAT_KDTREE
+  // Build once per frame, then answer one exact nearest-endpoint query per new
+  // object. The final norm comparison deliberately matches the original code
+  // so its inclusive boundary and floating-point behavior remain unchanged.
+  const Pt3dCloud endpoint_cloud(last_centers);
+  KDTreePt3d endpoint_tree(3, endpoint_cloud,
+                           nanoflann::KDTreeSingleIndexAdaptorParams(10));
+  endpoint_tree.buildIndex();
+#endif
+
   const int ni_obj3d = static_cast<int>(n_obj3d);
 
 #pragma omp parallel for if (!omp_in_parallel())
@@ -740,6 +774,7 @@ STB::checkRepeat(const std::vector<std::unique_ptr<Object3D>> &objs) const {
       r_obj = bubble->_r3d;
     }
 
+#ifdef OPENLPT_DISABLE_CHECK_REPEAT_KDTREE
     for (const Pt3D &q : last_centers) {
       Pt3D d = p - q;
       double dist = d.norm();
@@ -748,6 +783,17 @@ STB::checkRepeat(const std::vector<std::unique_ptr<Object3D>> &objs) const {
         break;
       }
     }
+#else
+    KDTreePt3d::IndexType nearest_index = 0;
+    double nearest_distance_squared = 0.0;
+    const size_t found = endpoint_tree.knnSearch(
+        p.data(), 1, &nearest_index, &nearest_distance_squared);
+    if (found != 0) {
+      Pt3D d = p - last_centers[nearest_index];
+      if (d.norm() <= tol + r_obj)
+        flags[i] = ObjFlag::Repeated;
+    }
+#endif
   }
 
   return flags;
