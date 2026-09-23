@@ -111,7 +111,7 @@ namespace coder {
 
                 void NeighborhoodProcessor::process2D(const ::coder::array<double, 2U>& in,
                     ::coder::array<bool, 2U>& out,
-                    const b_struct_T* fparams) const
+                    const ::coder::array<bool, 2U>& previous) const
                 {
                     array<bool, 1U> out_;
                     c_struct_T fparamsAugmented;
@@ -182,8 +182,8 @@ namespace coder {
                                 }
                             }
                             fparamsAugmented.pixel = in[pind - 1];
-                            out_[b_firstInd - 1] = fparams->bw[pind - 1];
-                            if (fparams->bw[pind - 1]) {
+                            out_[b_firstInd - 1] = previous[pind - 1];
+                            if (previous[pind - 1]) {
                                 //  Pixel has not already been set as non-max
                                 pind = 0;
                                 exitg1 = false;
@@ -194,7 +194,7 @@ namespace coder {
                                         exitg1 = true;
                                     }
                                     else if ((imnh_data[pind] == fparamsAugmented.pixel) &&
-                                        (!fparams->bw[imnhInds[pind] - 1])) {
+                                        (!previous[imnhInds[pind] - 1])) {
                                         //  Set pixel to zero if any equal neighbor is already set to zero
                                         out_[b_firstInd - 1] = false;
                                         exitg1 = true;
@@ -449,8 +449,8 @@ namespace coder {
                                     }
                                 }
                                 fparamsAugmented_pixel = in[b_pind];
-                                out[b_pind] = fparams->bw[b_pind];
-                                if (fparams->bw[b_pind]) {
+                                out[b_pind] = previous[b_pind];
+                                if (previous[b_pind]) {
                                     //  Pixel has not already been set as non-max
                                     imageSize1 = 0;
                                     exitg1 = false;
@@ -461,7 +461,7 @@ namespace coder {
                                             exitg1 = true;
                                         }
                                         else if ((b_imnh_data[imageSize1] == fparamsAugmented_pixel) &&
-                                            (!fparams->bw[imnhInds_data[imageSize1] - 1])) {
+                                            (!previous[imnhInds_data[imageSize1] - 1])) {
                                             //  Set pixel to zero if any equal neighbor is already set to zero
                                             out[b_pind] = false;
                                             exitg1 = true;
@@ -700,8 +700,8 @@ namespace coder {
                                     }
                                 }
                                 fparamsAugmented_pixel = in[b_pind];
-                                out[b_pind] = fparams->bw[b_pind];
-                                if (fparams->bw[b_pind]) {
+                                out[b_pind] = previous[b_pind];
+                                if (previous[b_pind]) {
                                     //  Pixel has not already been set as non-max
                                     imageSize1 = 0;
                                     exitg1 = false;
@@ -712,7 +712,7 @@ namespace coder {
                                             exitg1 = true;
                                         }
                                         else if ((b_imnh_data[imageSize1] == fparamsAugmented_pixel) &&
-                                            (!fparams->bw[b_imnhInds_data[imageSize1] - 1])) {
+                                            (!previous[b_imnhInds_data[imageSize1] - 1])) {
                                             //  Set pixel to zero if any equal neighbor is already set to zero
                                             out[b_pind] = false;
                                             exitg1 = true;
@@ -951,8 +951,8 @@ namespace coder {
                                     }
                                 }
                                 fparamsAugmented_pixel = in[b_pind];
-                                out[b_pind] = fparams->bw[b_pind];
-                                if (fparams->bw[b_pind]) {
+                                out[b_pind] = previous[b_pind];
+                                if (previous[b_pind]) {
                                     //  Pixel has not already been set as non-max
                                     imageSize1 = 0;
                                     exitg1 = false;
@@ -963,7 +963,7 @@ namespace coder {
                                             exitg1 = true;
                                         }
                                         else if ((b_imnh_data[imageSize1] == fparamsAugmented_pixel) &&
-                                            (!fparams->bw[c_imnhInds_data[imageSize1] - 1])) {
+                                            (!previous[c_imnhInds_data[imageSize1] - 1])) {
                                             //  Set pixel to zero if any equal neighbor is already set to zero
                                             out[b_pind] = false;
                                             exitg1 = true;
@@ -1202,8 +1202,8 @@ namespace coder {
                                     }
                                 }
                                 fparamsAugmented_pixel = in[b_pind];
-                                out[b_pind] = fparams->bw[b_pind];
-                                if (fparams->bw[b_pind]) {
+                                out[b_pind] = previous[b_pind];
+                                if (previous[b_pind]) {
                                     //  Pixel has not already been set as non-max
                                     imageSize1 = 0;
                                     exitg1 = false;
@@ -1214,7 +1214,7 @@ namespace coder {
                                             exitg1 = true;
                                         }
                                         else if ((b_imnh_data[imageSize1] == fparamsAugmented_pixel) &&
-                                            (!fparams->bw[d_imnhInds_data[imageSize1] - 1])) {
+                                            (!previous[d_imnhInds_data[imageSize1] - 1])) {
                                             //  Set pixel to zero if any equal neighbor is already set to zero
                                             out[b_pind] = false;
                                             exitg1 = true;
