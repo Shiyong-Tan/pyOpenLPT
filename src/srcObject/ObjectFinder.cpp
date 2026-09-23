@@ -1,3 +1,8 @@
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstring>
+#include <iterator>
 
 #include <omp.h>
 #include "ObjectFinder.h"
@@ -317,6 +322,206 @@ ObjectFinder2D::findBubble2D(Image const& img, BubbleConfig const& cfg)
     }
     out.shrink_to_fit();
     return out;
+}
+
+std::vector<std::vector<std::unique_ptr<Object2D>>>
+ObjectFinder2D::findBubble2DFixedBatch(const std::vector<Image>& images,
+                                       const std::vector<char>& active,
+                                       const BubbleConfig& cfg,
+                                       BubbleFixedBatchCache& cache)
+{
+    struct Plan {
+        int W = 0;
+        int H = 0;
+        int core = 0;
+        int halo = 0;
+        int nx = 0;
+        int ny = 0;
+    };
+    struct Job { std::size_t cam; int tx; int ty; };
+
+    std::vector<std::vector<std::unique_ptr<Object2D>>> output(images.size());
+    if (active.size() != images.size() ||
+        cfg._radius_min > cfg._radius_max) {
+        return output;
+    }
+
+    const double rmin = cfg._radius_min;
+    const double rmax = cfg._radius_max;
+    const double sense = cfg._sense;
+    const double metric_thres = 0.3;
+    const double d_th = std::min(2.0, 0.35 * rmax);
+    const double r_th = std::min(2.0, 0.25 * rmax);
+
+    std::vector<Plan> plans(images.size());
+    std::vector<std::vector<std::vector<BubbleTileDetection>>>
+        tile_results(images.size());
+    std::vector<Job> jobs;
+    if (cache.cameras.size() != images.size()) {
+        cache.cameras.clear();
+        cache.cameras.resize(images.size());
+    }
+
+    for (std::size_t cam = 0; cam < images.size(); ++cam) {
+        if (!active[cam]) continue;
+
+        Plan& plan = plans[cam];
+        plan.W = images[cam].getDimCol();
+        plan.H = images[cam].getDimRow();
+        if (plan.W <= 0 || plan.H <= 0) continue;
+
+        // This is the legacy nested-path geometry used by IPR. The camera-level
+        // OpenMP team makes T_inner equal to one, and the 768 cap produces the
+        // existing 2x2 grid for the validated 1280x800 inputs.
+        constexpr int n_target = 1;
+        const double core_ideal =
+            std::sqrt(static_cast<double>(plan.W) * plan.H / n_target);
+        plan.core = std::clamp(static_cast<int>(std::ceil(core_ideal)),
+                               static_cast<int>(2 * rmax + 8), 768);
+        plan.halo = static_cast<int>(std::ceil(rmax) + 3);
+        plan.nx = (plan.W + plan.core - 1) / plan.core;
+        plan.ny = (plan.H + plan.core - 1) / plan.core;
+
+        tile_results[cam].resize(static_cast<std::size_t>(plan.nx * plan.ny));
+        if (cache.cameras[cam].size() != tile_results[cam].size()) {
+            cache.cameras[cam].clear();
+            cache.cameras[cam].resize(tile_results[cam].size());
+        }
+        for (int ty = 0; ty < plan.ny; ++ty) {
+            for (int tx = 0; tx < plan.nx; ++tx) {
+                jobs.push_back(Job{cam, tx, ty});
+            }
+        }
+    }
+
+#pragma omp parallel for schedule(dynamic, 1)
+    for (std::ptrdiff_t job_id = 0;
+         job_id < static_cast<std::ptrdiff_t>(jobs.size()); ++job_id) {
+        const Job& job = jobs[static_cast<std::size_t>(job_id)];
+        const Plan& plan = plans[job.cam];
+        const Image& img = images[job.cam];
+
+        const int cx0 = job.tx * plan.core;
+        const int cy0 = job.ty * plan.core;
+        const int cx1 = std::min(cx0 + plan.core, plan.W);
+        const int cy1 = std::min(cy0 + plan.core, plan.H);
+        const int ix0 = std::max(0, cx0 - plan.halo);
+        const int iy0 = std::max(0, cy0 - plan.halo);
+        const int ix1 = std::min(cx1 + plan.halo, plan.W);
+        const int iy1 = std::min(cy1 + plan.halo, plan.H);
+
+        if (ix1 <= ix0 || iy1 <= iy0) continue;
+
+        const std::size_t tile_id =
+            static_cast<std::size_t>(job.ty * plan.nx + job.tx);
+        auto& entry = cache.cameras[job.cam][tile_id];
+        auto& detections = tile_results[job.cam][tile_id];
+
+        const int input_w = ix1 - ix0;
+        const int input_h = iy1 - iy0;
+        bool cache_hit = entry.valid && entry.ix0 == ix0 && entry.iy0 == iy0 &&
+            entry.ix1 == ix1 && entry.iy1 == iy1 &&
+            std::memcmp(&entry.radius_min, &rmin, sizeof(double)) == 0 &&
+            std::memcmp(&entry.radius_max, &rmax, sizeof(double)) == 0 &&
+            std::memcmp(&entry.sense, &sense, sizeof(double)) == 0 &&
+            entry.input.getDimRow() == input_h &&
+            entry.input.getDimCol() == input_w;
+
+        if (cache_hit) {
+            const double* source = img.data();
+            const double* snapshot = entry.input.data();
+            for (int row = 0; row < input_h; ++row) {
+                if (std::memcmp(source + (iy0 + row) * plan.W + ix0,
+                                snapshot + row * input_w,
+                                static_cast<std::size_t>(input_w) *
+                                    sizeof(double)) != 0) {
+                    cache_hit = false;
+                    break;
+                }
+            }
+        }
+
+        if (cache_hit) {
+            detections = entry.detections;
+            continue;
+        }
+
+        Image subimg = img.crop(iy0, iy1, ix0, ix1);
+        CircleIdentifier circle_id(subimg);
+        std::vector<Pt2D> centers;
+        std::vector<double> radii;
+        std::vector<double> metrics = circle_id.BubbleCenterAndSizeByCircle(
+            centers, radii, rmin, rmax, sense);
+
+        detections.reserve(centers.size());
+        for (std::size_t i = 0; i < centers.size(); ++i) {
+            const double gx = centers[i][0] + ix0;
+            const double gy = centers[i][1] + iy0;
+            if (gx >= cx0 && gx < cx1 && gy >= cy0 && gy < cy1) {
+                detections.push_back(
+                    BubbleTileDetection{Pt2D{gx, gy}, radii[i], metrics[i]});
+            }
+        }
+
+        entry.valid = false;
+        entry.ix0 = ix0;
+        entry.iy0 = iy0;
+        entry.ix1 = ix1;
+        entry.iy1 = iy1;
+        entry.radius_min = rmin;
+        entry.radius_max = rmax;
+        entry.sense = sense;
+        entry.input = subimg;
+        entry.detections = detections;
+        entry.valid = true;
+    }
+
+    for (std::size_t cam = 0; cam < images.size(); ++cam) {
+        if (!active[cam]) continue;
+
+        std::vector<BubbleTileDetection> global_detections;
+        std::size_t total = 0;
+        for (const auto& tile : tile_results[cam]) total += tile.size();
+        global_detections.reserve(total);
+        for (auto& tile : tile_results[cam]) {
+            global_detections.insert(global_detections.end(),
+                                     std::make_move_iterator(tile.begin()),
+                                     std::make_move_iterator(tile.end()));
+        }
+
+        std::sort(global_detections.begin(), global_detections.end(),
+            [](const BubbleTileDetection& a, const BubbleTileDetection& b) {
+                return a.metric > b.metric;
+            });
+
+        std::vector<BubbleTileDetection> deduped;
+        deduped.reserve(global_detections.size());
+        for (auto& detection : global_detections) {
+            bool duplicate = false;
+            for (const auto& kept : deduped) {
+                const double dx = detection.center[0] - kept.center[0];
+                const double dy = detection.center[1] - kept.center[1];
+                const double dist = std::sqrt(dx * dx + dy * dy);
+                const double dr = std::fabs(detection.radius - kept.radius);
+                if (dist <= d_th && dr <= r_th) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) deduped.push_back(detection);
+        }
+
+        auto& camera_output = output[cam];
+        camera_output.reserve(deduped.size());
+        for (const auto& detection : deduped) {
+            if (detection.metric < metric_thres) continue;
+            camera_output.emplace_back(
+                std::make_unique<Bubble2D>(detection.center, detection.radius));
+        }
+        camera_output.shrink_to_fit();
+    }
+
+    return output;
 }
 
 // std::vector<std::unique_ptr<Object2D>>
