@@ -15,7 +15,11 @@ from typing import Callable, Mapping, Sequence
 import cv2
 import numpy as np
 
-from .core import apply_processing_pipeline_with_settings, normalize_processing_settings
+from .core import (
+    apply_processing_pipeline_with_settings,
+    gpu_preprocessing_available,
+    normalize_processing_settings,
+)
 from .io import PlannedFrameTask, load_task_image, write_image_list_file
 
 
@@ -49,6 +53,8 @@ def _process_single_task(
     task_index: int,
     normalized_settings: dict,
     backgrounds: dict[int, np.ndarray],
+    gpu_backgrounds: dict[int, object] | None = None,
+    use_gpu: bool = False,
 ) -> tuple[int, PlannedFrameTask, str | None]:
     """
     Process a single task and return (task_index, task, error_message).
@@ -56,8 +62,29 @@ def _process_single_task(
     """
     try:
         raw_img = load_task_image(task)
-        bg = backgrounds.get(task.cam_idx)
-        processed_img = apply_processing_pipeline_with_settings(raw_img, bg, task.cam_idx, normalized_settings)
+        bg = (
+            gpu_backgrounds.get(task.cam_idx)
+            if use_gpu and gpu_backgrounds is not None
+            else backgrounds.get(task.cam_idx)
+        )
+        try:
+            processed_img = apply_processing_pipeline_with_settings(
+                raw_img,
+                bg,
+                task.cam_idx,
+                normalized_settings,
+                use_gpu=use_gpu,
+            )
+        except Exception:
+            if not use_gpu:
+                raise
+            processed_img = apply_processing_pipeline_with_settings(
+                raw_img,
+                backgrounds.get(task.cam_idx),
+                task.cam_idx,
+                normalized_settings,
+                use_gpu=False,
+            )
 
         ok = cv2.imwrite(str(task.output_path), processed_img)
         if not ok:
@@ -77,6 +104,7 @@ def run_batch_processing(
     progress_callback: ProgressCallback | None = None,
     continue_on_error: bool = True,
     workers: int = 1,
+    cpu_only: bool = False,
 ) -> BatchProcessingResult:
     """
     Run preprocessing for planned TIFF/CINE tasks and write per-camera image lists.
@@ -89,6 +117,7 @@ def run_batch_processing(
         progress_callback: Optional callback for progress updates.
         continue_on_error: If True, collect failures and continue; if False, raise on first failure.
         workers: Number of parallel workers (default=1 for sequential). Use 0 to use all available CPU cores.
+        cpu_only: Disable CUDA preprocessing and use the exact CPU pipeline only.
 
     Returns:
         BatchProcessingResult with processed counts, image lists, and failures.
@@ -97,6 +126,51 @@ def run_batch_processing(
     output_dir = Path(output_dir).expanduser().resolve()
     tasks = list(tasks)
     backgrounds = dict(backgrounds or {})
+
+    use_gpu = False
+    gpu_backgrounds: dict[int, object] | None = None
+    if not cpu_only:
+        available, detail = gpu_preprocessing_available()
+        if available:
+            try:
+                import cupy as cp
+
+                gpu_backgrounds = {
+                    cam_idx: cp.asarray(background)
+                    for cam_idx, background in backgrounds.items()
+                }
+                use_gpu = True
+                _emit_progress(
+                    progress_callback,
+                    "mode",
+                    0,
+                    len(tasks),
+                    f"GPU preprocessing: {detail}",
+                )
+            except Exception as exc:
+                _emit_progress(
+                    progress_callback,
+                    "mode",
+                    0,
+                    len(tasks),
+                    f"GPU unavailable; exact CPU fallback: {exc}",
+                )
+        else:
+            _emit_progress(
+                progress_callback,
+                "mode",
+                0,
+                len(tasks),
+                f"GPU unavailable; exact CPU fallback: {detail}",
+            )
+    else:
+        _emit_progress(
+            progress_callback,
+            "mode",
+            0,
+            len(tasks),
+            "CPU-only preprocessing (significantly slower)",
+        )
 
     if workers < 0:
         raise ValueError("workers must be >= 0")
@@ -127,7 +201,14 @@ def run_batch_processing(
     if workers <= 1:
         # Sequential processing (original behavior)
         for current, task in enumerate(tasks, start=1):
-            task_index, task, error = _process_single_task(task, current - 1, normalized_settings, backgrounds)
+            task_index, task, error = _process_single_task(
+                task,
+                current - 1,
+                normalized_settings,
+                backgrounds,
+                gpu_backgrounds,
+                use_gpu,
+            )
             results_by_index[task_index] = (task, error)
 
             if error is None:
@@ -144,7 +225,15 @@ def run_batch_processing(
         with ThreadPoolExecutor(max_workers=workers) as executor:
             # Submit all tasks
             future_to_index = {
-                executor.submit(_process_single_task, task, idx, normalized_settings, backgrounds): idx
+                executor.submit(
+                    _process_single_task,
+                    task,
+                    idx,
+                    normalized_settings,
+                    backgrounds,
+                    gpu_backgrounds,
+                    use_gpu,
+                ): idx
                 for idx, task in enumerate(tasks)
             }
 

@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--high-in", type=float, default=255, help="Upper input intensity for contrast adjustment.")
     parser.add_argument("--denoise", action="store_true", help="Enable denoise processing.")
     parser.add_argument(
+        "--cpu-only",
+        action="store_true",
+        help="Disable CUDA preprocessing (significantly slower).",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -305,13 +310,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             tasks = _build_cine_tasks(args.cine, output_dir, args.frames)
 
         backgrounds = _build_backgrounds(args)
-        result = run_batch_processing(
-            tasks,
-            output_dir=output_dir,
-            settings=_build_settings(args),
-            backgrounds=backgrounds,
-            workers=args.workers,
-        )
+        runner_kwargs = {
+            "output_dir": output_dir,
+            "settings": _build_settings(args),
+            "backgrounds": backgrounds,
+            "workers": args.workers,
+        }
+        # Keep compatibility with wrappers that replace the runner using the
+        # pre-GPU signature. The default path is already GPU-assisted.
+        if args.cpu_only:
+            runner_kwargs["cpu_only"] = True
+        result = run_batch_processing(tasks, **runner_kwargs)
     except (ImagePreprocessingIOError, ValueError, OSError) as exc:
         print(f"Error: {exc}")
         return 1

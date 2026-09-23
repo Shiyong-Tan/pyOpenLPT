@@ -5,6 +5,9 @@ Pure processing functions with no GUI dependencies.
 Extracted for CLI and programmatic use.
 """
 
+from functools import lru_cache
+import threading
+
 import numpy as np
 import cv2
 
@@ -89,7 +92,126 @@ def imadjust_opencv(img, low_in, high_in, low_out=0, high_out=255, gamma=1.0):
     return img.astype(np.uint8)
 
 
-def apply_processing_pipeline_with_settings(img_data, bg_data, cam_idx, settings):
+@lru_cache(maxsize=1)
+def _get_cupy():
+    """Load CuPy lazily and verify that a CUDA device is usable."""
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() < 1:
+        raise RuntimeError("no CUDA device is available")
+    cp.cuda.Device(0).use()
+    cp.empty((1,), dtype=cp.uint8)
+    return cp
+
+
+def gpu_preprocessing_available():
+    """Return ``(available, detail)`` for the exact CUDA path."""
+    try:
+        cp = _get_cupy()
+        props = cp.cuda.runtime.getDeviceProperties(0)
+        raw_name = (
+            props.get("name", b"CUDA device")
+            if isinstance(props, dict) else b"CUDA device"
+        )
+        name = (
+            raw_name.decode(errors="replace")
+            if isinstance(raw_name, bytes) else str(raw_name)
+        )
+        return True, name
+    except Exception as exc:
+        return False, str(exc)
+
+
+@lru_cache(maxsize=128)
+def _imadjust_uint8_lut(
+    low_in, high_in, low_out=0, high_out=255, gamma=1.0
+):
+    """Build the CUDA lookup table with the authoritative CPU operation."""
+    values = np.arange(256, dtype=np.uint8)
+    lut = imadjust_opencv(
+        values, low_in, high_in, low_out, high_out, gamma
+    )
+    lut.setflags(write=False)
+    return lut
+
+
+_GPU_LUTS = {}
+_GPU_LUT_LOCK = threading.Lock()
+
+
+def _gpu_imadjust_lut(cp, low_in, high_in):
+    key = (float(low_in), float(high_in), 0.0, 255.0, 1.0)
+    with _GPU_LUT_LOCK:
+        lut = _GPU_LUTS.get(key)
+        if lut is None:
+            lut = cp.asarray(_imadjust_uint8_lut(*key))
+            _GPU_LUTS[key] = lut
+    return lut
+
+
+def _apply_denoise_cpu(result):
+    """Run the original OpenCV denoise sequence without numerical changes."""
+    a = result.astype(np.float32)
+    kernel = np.ones((3, 3), np.uint8)
+    b = cv2.erode(a, kernel, iterations=1)
+    c = a - b
+    b = cv2.erode(a, kernel, iterations=1)
+    c = c - b
+
+    d = cv2.GaussianBlur(c, (0, 0), 0.5)
+    e = cv2.blur(d, (100, 100))
+    f = a - e
+
+    blurred_f = cv2.GaussianBlur(f, (0, 0), 1.0)
+    sharp = f + 0.8 * (f - blurred_f)
+    return np.clip(sharp, 0, 255).astype(np.uint8)
+
+
+def _apply_processing_pipeline_gpu(img_data, bg_data, cam_idx, settings):
+    """Run exact pointwise operations on CUDA with one upload/download."""
+    cp = _get_cupy()
+
+    if len(img_data.shape) == 3:
+        gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    else:
+        gray = img_data.astype(np.float32)
+    gray_gpu = cp.asarray(gray)
+
+    if settings["bg_enabled"] and bg_data is not None:
+        bg_gpu = (
+            bg_data if isinstance(bg_data, cp.ndarray) else cp.asarray(bg_data)
+        )
+        result_gpu = (
+            bg_gpu - gray_gpu if settings["invert"] else gray_gpu - bg_gpu
+        )
+        cp.maximum(result_gpu, cp.float32(0.0), out=result_gpu)
+    else:
+        result_gpu = gray_gpu
+
+    shift = int(settings["cine_shifts"].get(cam_idx, 0))
+    if shift > 0:
+        result_gpu = result_gpu * cp.float32(2.0 ** (-shift))
+    result_gpu = cp.clip(result_gpu, 0, 255).astype(cp.uint8)
+
+    if settings["invert"] and not (
+        settings["bg_enabled"] and bg_data is not None
+    ):
+        result_gpu = cp.uint8(255) - result_gpu
+
+    lut_gpu = _gpu_imadjust_lut(
+        cp, settings["low_in"], settings["high_in"]
+    )
+    result_gpu = lut_gpu[result_gpu]
+    result = cp.asnumpy(result_gpu)
+
+    if settings["denoise"]:
+        result = _apply_denoise_cpu(result)
+    return result.astype(np.uint8, copy=False)
+
+
+def apply_processing_pipeline_with_settings(
+    img_data, bg_data, cam_idx, settings, use_gpu=False
+):
     """
     Apply complete image preprocessing pipeline.
     
@@ -125,6 +247,11 @@ def apply_processing_pipeline_with_settings(img_data, bg_data, cam_idx, settings
     """
     settings = normalize_processing_settings(settings)
 
+    if use_gpu:
+        return _apply_processing_pipeline_gpu(
+            img_data, bg_data, cam_idx, settings
+        )
+
     # 0. Ensure grayscale and float32
     if len(img_data.shape) == 3:
         gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -156,19 +283,6 @@ def apply_processing_pipeline_with_settings(img_data, bg_data, cam_idx, settings
 
     # 5. Denoise
     if settings["denoise"]:
-        a = result.astype(np.float32)
-        kernel = np.ones((3, 3), np.uint8)
-        b = cv2.erode(a, kernel, iterations=1)
-        c = a - b
-        b = cv2.erode(a, kernel, iterations=1)
-        c = c - b
-
-        d = cv2.GaussianBlur(c, (0, 0), 0.5)
-        e = cv2.blur(d, (100, 100))
-        f = a - e
-
-        blurred_f = cv2.GaussianBlur(f, (0, 0), 1.0)
-        sharp = f + 0.8 * (f - blurred_f)
-        result = np.clip(sharp, 0, 255).astype(np.uint8)
+        result = _apply_denoise_cpu(result)
 
     return result.astype(np.uint8)
