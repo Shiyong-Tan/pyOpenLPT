@@ -49,6 +49,8 @@ public:
 
   // save tracks of one status
   void saveTracks(std::string const &file, std::deque<Track> &tracks);
+  void saveTracksCheckpoint(std::string const &file,
+                            std::deque<Track> &tracks);
 
   // save all tracks at any status
   void saveTracksAll(std::string const &folder, int frame);
@@ -56,6 +58,12 @@ public:
   // load tracks, only active long tracks and active short tracks are needed to
   // load
   void loadTracksAll(std::string const &folder, int frame);
+
+  // Frame-boundary checkpoints contain every in-memory track collection and
+  // the lossless Bubble reference state. They remain separate from scientific
+  // result snapshots so pausing does not change result-file segmentation.
+  bool canCheckpoint(int frame) const;
+  void saveCheckpoint(std::string const &checkpoint_root, int frame);
 
 private:
   BasicSetting _basic_setting; // basic settings such as frame range, fps, etc.

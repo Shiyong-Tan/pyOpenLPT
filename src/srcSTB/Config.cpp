@@ -352,11 +352,42 @@ bool BubbleConfig::readConfig(const std::string &filepath,
   _output_path = settings._output_path;
 
   if (settings._load_track) {
-    if (!_bb_ref_img.loadRefImg(_output_path, settings._n_cam)) {
-      std::cerr << "Warning: Failed to load bubble reference images from "
-                << _output_path << std::endl;
+    const fs::path track_path(settings._load_track_path);
+    const bool exact_checkpoint =
+        fs::exists(track_path / "CheckpointComplete.txt");
+
+    if (exact_checkpoint) {
+      if (!_bb_ref_img.loadExactRef(settings._load_track_path,
+                                    settings._n_cam)) {
+        THROW_FATAL_CTX(ErrorCode::IOfailure,
+                        "Exact checkpoint is missing or has an invalid "
+                        "BubbleRefExact.bin:",
+                        settings._load_track_path);
+      }
+      std::cout << "Loaded lossless bubble reference state from "
+                << settings._load_track_path << std::endl;
     } else {
-      std::cout << "Loaded bubble reference images from " << _output_path
+      bool loaded = _bb_ref_img.loadRefImg(_output_path, settings._n_cam);
+      fs::path legacy_ref_root;
+      if (!loaded) {
+        fs::path normalized = track_path.lexically_normal();
+        if (normalized.filename() == "ConvergeTrack")
+          legacy_ref_root = normalized.parent_path();
+        if (!legacy_ref_root.empty()) {
+          loaded = _bb_ref_img.loadRefImg(legacy_ref_root.string(),
+                                          settings._n_cam);
+        }
+      }
+
+      if (!loaded) {
+        THROW_FATAL_CTX(ErrorCode::IOfailure,
+                        "Resume requires bubble reference images, but none "
+                        "could be loaded from the output or legacy result "
+                        "folder:",
+                        _output_path);
+      }
+      std::cout << "Loaded legacy TIFF bubble reference images. Warning: "
+                   "integer TIFF storage cannot guarantee bit-exact resume."
                 << std::endl;
     }
   }

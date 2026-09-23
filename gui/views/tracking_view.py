@@ -1,6 +1,8 @@
 import matplotlib
 matplotlib.use('Agg') # MUST be first
 import matplotlib.pyplot as plt
+import hashlib
+import json
 import os
 import sys
 import qtawesome as qta
@@ -282,6 +284,13 @@ class TrackingView(QWidget):
         self.process.readyReadStandardError.connect(self._handle_stderr)
         self.process.finished.connect(self._on_process_finished)
         self.log_file = None
+        self.active_run_config_path = None
+        self.active_resume_frame = None
+        self._active_output_dir = None
+        self._paused_checkpoint_frame = None
+        self._pause_force_armed = False
+        self._tracking_stop_requested = False
+        self._backend_event_buffer = ""
         
         # Cache for statistics
         self.cached_proj_path = None
@@ -752,6 +761,16 @@ class TrackingView(QWidget):
         path_row.addWidget(self.proj_path_edit)
         path_row.addWidget(self.sync_btn)
         path_layout.addLayout(path_row)
+
+        self.resume_checkpoint_cb = QCheckBox(
+            "Resume latest safe checkpoint"
+        )
+        self.resume_checkpoint_cb.setChecked(False)
+        self.resume_checkpoint_cb.setToolTip(
+            "Resume from the newest complete frame-boundary checkpoint in "
+            "the configured output folder."
+        )
+        path_layout.addWidget(self.resume_checkpoint_cb)
         layout.addWidget(path_group)
 
         # Execution Controls
@@ -768,8 +787,8 @@ class TrackingView(QWidget):
         """)
         self.run_btn.clicked.connect(self._run_tracking)
         
-        self.stop_btn = QPushButton(" Stop Execution")
-        self.stop_btn.setIcon(qta.icon("fa5s.stop", color="white"))
+        self.stop_btn = QPushButton(" Pause Safely")
+        self.stop_btn.setIcon(qta.icon("fa5s.pause", color="white"))
         self.stop_btn.setFixedHeight(40)
         self.stop_btn.setStyleSheet("""
             QPushButton { background-color: #990000; color: white; font-weight: bold; border-radius: 4px; }
@@ -896,6 +915,239 @@ class TrackingView(QWidget):
         if dir_path:
             self.proj_path_edit.setText(dir_path)
 
+    @staticmethod
+    def _sha256_file(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _config_value_index(lines, header):
+        header_index = next(
+            (index for index, line in enumerate(lines) if header in line),
+            None,
+        )
+        if header_index is None:
+            return None
+        return next(
+            (
+                index for index in range(header_index + 1, len(lines))
+                if lines[index].strip()
+                and not lines[index].lstrip().startswith("#")
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _resolve_config_path(path, proj_dir):
+        value = path.strip().strip('"').strip("'")
+        if os.name == "nt":
+            match = re.match(r"^/mnt/([a-zA-Z])/(.*)$", value)
+            if match:
+                return os.path.normpath(
+                    f"{match.group(1).upper()}:/{match.group(2)}"
+                )
+        if os.path.isabs(value):
+            return os.path.normpath(value)
+        return os.path.normpath(os.path.join(proj_dir, value))
+
+    @staticmethod
+    def _runtime_config_path(path, proj_dir):
+        path_drive = os.path.splitdrive(path)[0].lower()
+        project_drive = os.path.splitdrive(proj_dir)[0].lower()
+        if path_drive == project_drive:
+            return os.path.relpath(path, proj_dir).replace("\\", "/")
+        return path.replace("\\", "/")
+
+    def _configured_paths(self, lines, proj_dir, header):
+        header_index = next(
+            (index for index, line in enumerate(lines) if header in line),
+            None,
+        )
+        if header_index is None:
+            return []
+        end = next(
+            (
+                index for index in range(header_index + 1, len(lines))
+                if lines[index].lstrip().startswith("#")
+            ),
+            len(lines),
+        )
+        paths = []
+        for line in lines[header_index + 1:end]:
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            value = value.split(",", 1)[0].strip()
+            paths.append(self._resolve_config_path(value, proj_dir))
+        return paths
+
+    def _run_identity(self, proj_dir, lines):
+        identity = {
+            "schema_version": 1,
+            "master_config_sha256": self._sha256_file(
+                os.path.join(proj_dir, "config.txt")
+            ),
+            "camera_files": [],
+            "image_lists": [],
+            "object_configs": [],
+        }
+        sections = (
+            ("camera_files", "# Camera File Path"),
+            ("image_lists", "# Image File Path"),
+            ("object_configs", "# STB Config Files"),
+        )
+        for key, header in sections:
+            for path in self._configured_paths(lines, proj_dir, header):
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(
+                        f"Cannot checkpoint missing run input: {path}"
+                    )
+                identity[key].append({
+                    "path": os.path.normcase(os.path.abspath(path)),
+                    "sha256": self._sha256_file(path),
+                })
+        return identity
+
+    def _project_output_and_objects(self, proj_dir, lines):
+        output_index = self._config_value_index(lines, "# Output Folder Path")
+        object_index = self._config_value_index(lines, "# Object Types")
+        if output_index is None or object_index is None:
+            raise ValueError(
+                "config.txt is missing its output-folder or object-type section"
+            )
+        output_dir = self._resolve_config_path(
+            lines[output_index].strip(), proj_dir
+        )
+        object_types = [
+            item.strip() for item in lines[object_index].strip().split(",")
+            if item.strip()
+        ]
+        if not object_types:
+            raise ValueError("config.txt contains no object types")
+        return output_dir, object_types
+
+    @staticmethod
+    def _checkpoint_required_files(frame, object_type):
+        files = [
+            "CheckpointComplete.txt",
+            f"LongTrackActive_{frame}.csv",
+            f"ShortTrackActive_{frame}.csv",
+            f"LongTrackInactivePending_{frame}.csv",
+            f"ExitTrackPending_{frame}.csv",
+            "run_identity.json",
+        ]
+        if object_type.strip().lower() == "bubble":
+            files.append("BubbleRefExact.bin")
+        return files
+
+    def _latest_complete_checkpoint(self, output_dir, object_types):
+        object_zero = os.path.join(output_dir, "Checkpoints", "object_0")
+        if not os.path.isdir(object_zero):
+            return None
+        candidates = []
+        for name in os.listdir(object_zero):
+            match = re.fullmatch(r"frame_(\d+)", name)
+            if match:
+                candidates.append(int(match.group(1)))
+        for frame in sorted(candidates, reverse=True):
+            folders = [
+                os.path.join(
+                    output_dir,
+                    "Checkpoints",
+                    f"object_{index}",
+                    f"frame_{frame}",
+                )
+                for index in range(len(object_types))
+            ]
+            complete = all(
+                all(
+                    os.path.isfile(os.path.join(folder, required))
+                    for required in self._checkpoint_required_files(
+                        frame, object_types[index]
+                    )
+                )
+                for index, folder in enumerate(folders)
+            )
+            if complete:
+                return frame, folders
+        return None
+
+    def _prepare_checkpoint_run(self, proj_dir):
+        """Write strict run identity and a resume-safe runtime config."""
+        source_path = os.path.join(proj_dir, "config.txt")
+        with open(source_path, "r", encoding="utf-8") as source:
+            lines = source.readlines()
+        output_dir, object_types = self._project_output_and_objects(
+            proj_dir, lines
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        identity = self._run_identity(proj_dir, lines)
+
+        resume_value = self._config_value_index(
+            lines, "# Flag to load previous track files"
+        )
+        long_path_value = self._config_value_index(
+            lines, "# Path to active long track files"
+        )
+        short_path_value = self._config_value_index(
+            lines, "# Path to active short track files"
+        )
+        if resume_value is None or long_path_value is None:
+            raise ValueError("config.txt is missing its resume section")
+
+        self.active_resume_frame = None
+        if self.resume_checkpoint_cb.isChecked():
+            latest = self._latest_complete_checkpoint(
+                output_dir, object_types
+            )
+            if latest is None:
+                raise ValueError(
+                    "No complete safe checkpoint was found in the configured "
+                    "output folder."
+                )
+            resume_frame, checkpoint_folders = latest
+            for checkpoint_dir in checkpoint_folders:
+                identity_path = os.path.join(
+                    checkpoint_dir, "run_identity.json"
+                )
+                with open(identity_path, "r", encoding="utf-8") as stream:
+                    checkpoint_identity = json.load(stream)
+                if checkpoint_identity != identity:
+                    raise ValueError(
+                        "Checkpoint inputs do not match the current config, "
+                        "camera files, image lists, or object configs."
+                    )
+            lines[resume_value] = f"1,{resume_frame}\n"
+            checkpoint_config_path = self._runtime_config_path(
+                checkpoint_folders[0], proj_dir
+            ).rstrip("/") + "/"
+            lines[long_path_value] = checkpoint_config_path + "\n"
+            if short_path_value is not None:
+                lines[short_path_value] = checkpoint_config_path + "\n"
+            self.active_resume_frame = resume_frame
+        else:
+            # The explicit checkbox owns continuation. Stale manual values such
+            # as "1,43000" must not silently start an incomplete legacy resume.
+            lines[resume_value] = "0,0\n"
+
+        identity_path = os.path.join(
+            output_dir, ".openlpt_current_run_identity.json"
+        )
+        identity_temp = identity_path + ".tmp"
+        with open(identity_temp, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(identity, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.replace(identity_temp, identity_path)
+
+        runtime_path = os.path.join(proj_dir, ".openlpt_runtime_config.txt")
+        with open(runtime_path, "w", encoding="utf-8", newline="") as target:
+            target.writelines(lines)
+        self.active_run_config_path = runtime_path
+        return runtime_path, output_dir
+
     def _run_tracking(self):
         """Execute OpenLPT.exe with pre-run checks."""
         proj_dir = self.proj_path_edit.text()
@@ -903,8 +1155,15 @@ class TrackingView(QWidget):
             self._append_log("[Error] Project directory not found. Please set it in Settings.\n")
             return
 
+        try:
+            config_path, output_dir = self._prepare_checkpoint_run(proj_dir)
+        except Exception as exc:
+            self._append_log(f"[Error] Could not prepare LPT run: {exc}\n")
+            QMessageBox.warning(self, "Invalid LPT Resume Settings", str(exc))
+            return
+
         # 1. Routine Checks
-        passed, error_msg = self._check_project_files(proj_dir)
+        passed, error_msg = self._check_project_files(proj_dir, config_path)
         if not passed:
             self.log_text.clear()
             self.vis_tabs.setCurrentWidget(self.log_text)
@@ -918,8 +1177,6 @@ class TrackingView(QWidget):
             )
             return
 
-        config_path = os.path.join(proj_dir, "config.txt")
-        
         # Find executable relative to GUI script
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         exe_path = os.path.join(base_dir, "build", "Release", "OpenLPT.exe")
@@ -940,6 +1197,14 @@ class TrackingView(QWidget):
             else:
                  self._append_log(f"[Info] Running: {exe_path} {config_path}\n")
             self._append_log(f"[Info] Logging to: {log_path}\n\n")
+            self._append_log(f"[Info] Output folder: {output_dir}\n")
+            if self.active_resume_frame is None:
+                self._append_log("[Info] Resume checkpoint: disabled\n")
+            else:
+                self._append_log(
+                    f"[Info] Resume checkpoint: frame "
+                    f"{self.active_resume_frame}\n"
+                )
         except Exception as e:
             self._append_log(f"[Error] Failed to create log file: {e}\n")
             return
@@ -948,6 +1213,26 @@ class TrackingView(QWidget):
         self._busy_begin('run_tracking', 'Running tracking')
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self._active_output_dir = output_dir
+        self._paused_checkpoint_frame = None
+        self._pause_force_armed = False
+        self._tracking_stop_requested = False
+        self._backend_event_buffer = ""
+        self.stop_btn.setText(" Pause Safely")
+        self.stop_btn.setIcon(qta.icon("fa5s.pause", color="white"))
+        pause_request = os.path.join(output_dir, ".openlpt_pause_requested")
+        try:
+            if os.path.exists(pause_request):
+                os.remove(pause_request)
+        except OSError as exc:
+            self._append_log(f"[Error] Cannot clear stale pause request: {exc}\n")
+            self._busy_end('run_tracking')
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            if self.log_file:
+                self.log_file.close()
+                self.log_file = None
+            return
         if use_python_module:
             # Python -m openlpt <config>
             self.process.start(sys.executable, ["-m", "openlpt", config_path])
@@ -955,11 +1240,11 @@ class TrackingView(QWidget):
             # Standalone .exe <config>
             self.process.start(exe_path, [config_path])
 
-    def _check_project_files(self, proj_dir):
+    def _check_project_files(self, proj_dir, config_path=None):
         """Verify existence of mandatory files/folders by parsing config.txt."""
         errors = []
         
-        config_path = os.path.join(proj_dir, "config.txt")
+        config_path = config_path or os.path.join(proj_dir, "config.txt")
         
         # Check config.txt
         if not os.path.exists(config_path):
@@ -1056,6 +1341,40 @@ class TrackingView(QWidget):
 
     def _stop_tracking(self):
         if self.process.state() != QProcess.ProcessState.NotRunning:
+            if not self._pause_force_armed:
+                if not self._active_output_dir:
+                    self._append_log(
+                        "[Error] Cannot determine the pause-request folder.\n"
+                    )
+                    return
+                pause_request = os.path.join(
+                    self._active_output_dir, ".openlpt_pause_requested"
+                )
+                try:
+                    with open(
+                        pause_request, "w", encoding="utf-8", newline="\n"
+                    ) as stream:
+                        stream.write("pause_after_current_frame\n")
+                except OSError as exc:
+                    self._append_log(
+                        f"[Error] Cannot request safe pause: {exc}\n"
+                    )
+                    return
+                self._tracking_stop_requested = True
+                self._pause_force_armed = True
+                self.stop_btn.setText(" Force Stop")
+                self.stop_btn.setIcon(qta.icon("fa5s.stop", color="white"))
+                self._append_log(
+                    "\n[Info] Safe pause requested. OpenLPT will finish the "
+                    "current frame and publish a complete checkpoint. Click "
+                    "Force Stop only if the backend does not respond.\n"
+                )
+                return
+
+            self._append_log(
+                "\n[Warning] Force stopping now; the current frame will not "
+                "be recoverable.\n"
+            )
             self.process.terminate()
             if not self.process.waitForFinished(2000):
                 self.process.kill()
@@ -1350,11 +1669,26 @@ class TrackingView(QWidget):
 
     def _handle_stdout(self):
         data = self.process.readAllStandardOutput().data().decode(errors='replace')
+        self._record_backend_events(data)
         self._append_log(data)
 
     def _handle_stderr(self):
         data = self.process.readAllStandardError().data().decode(errors='replace')
+        self._record_backend_events(data)
         self._append_log(data)
+
+    def _record_backend_events(self, text, flush=False):
+        """Parse backend markers without assuming QProcess chunk boundaries."""
+        combined = self._backend_event_buffer + text
+        lines = combined.splitlines(keepends=True)
+        if not flush and lines and not lines[-1].endswith(("\n", "\r")):
+            self._backend_event_buffer = lines.pop()
+        else:
+            self._backend_event_buffer = ""
+        for line in lines:
+            paused = re.search(r"OPENLPT_PAUSED\s+frame=(\d+)", line)
+            if paused:
+                self._paused_checkpoint_frame = int(paused.group(1))
 
     def _append_log(self, text):
         v_scroll = self.log_text.verticalScrollBar()
@@ -1377,13 +1711,51 @@ class TrackingView(QWidget):
     def _on_process_finished(self, exit_code, exit_status):
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        
+
+        self._record_backend_events("", flush=True)
+        safely_paused = self._paused_checkpoint_frame is not None
+        force_stopped = self._tracking_stop_requested and not safely_paused
+        if safely_paused:
+            status_str = (
+                f"safely paused after frame {self._paused_checkpoint_frame}"
+            )
+        elif force_stopped:
+            status_str = "after a forced stop"
+        elif exit_code == 0:
+            status_str = "successfully"
+        else:
+            status_str = f"with exit code {exit_code}"
+        self._append_log(f"\n[Info] Tracking finished {status_str}.\n")
+
+        if safely_paused:
+            self.resume_checkpoint_cb.setChecked(True)
+            self._append_log(
+                f"[Info] Resume latest safe checkpoint is ready at frame "
+                f"{self._paused_checkpoint_frame}.\n"
+            )
+
+        if self._active_output_dir:
+            pause_request = os.path.join(
+                self._active_output_dir, ".openlpt_pause_requested"
+            )
+            try:
+                if os.path.exists(pause_request):
+                    os.remove(pause_request)
+            except OSError as exc:
+                self._append_log(
+                    f"[Warning] Could not clear pause request: {exc}\n"
+                )
+
         if self.log_file:
             self.log_file.close()
             self.log_file = None
-            
-        status_str = "Successfully" if exit_code == 0 else f"with exit code {exit_code}"
-        self.log_text.append(f"\n[Info] Tracking finished {status_str}.")
+
+        self.stop_btn.setText(" Pause Safely")
+        self.stop_btn.setIcon(qta.icon("fa5s.pause", color="white"))
+        self._active_output_dir = None
+        self._pause_force_armed = False
+        self._tracking_stop_requested = False
+        self._backend_event_buffer = ""
         self._busy_end('run_tracking')
 
     def _load_track_statistics(self, force=False):
