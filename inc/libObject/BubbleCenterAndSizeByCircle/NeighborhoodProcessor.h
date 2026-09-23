@@ -19,9 +19,6 @@
 #include <omp.h>
 
 
-// Type Declarations
-struct b_struct_T;
-
 // Type Definitions
 namespace coder {
 namespace images {
@@ -34,7 +31,7 @@ public:
                                 int interiorStart[2], int interiorEnd[2]);
   void process2D(const ::coder::array<double, 2U> &in,
                  ::coder::array<bool, 2U> &out,
-                 const b_struct_T *fparams) const;
+                 const ::coder::array<bool, 2U> &previous) const;
   bool Neighborhood[9];
   int ImageSize[2];
   int InteriorStart[2];

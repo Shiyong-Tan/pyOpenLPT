@@ -20,6 +20,14 @@ endif()
 
 # Toggle: build Python bindings via pybind11
 option(PYOPENLPT "Build Python bindings (pybind11)" OFF)
+option(OPENLPT_GPU_EXACT_MORPHOLOGY
+       "Offload exact Boolean morphology propagation to CUDA" OFF)
+
+if (OPENLPT_GPU_EXACT_MORPHOLOGY)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
 
 # Optional: OpenMP detection (link per-target inside module cmake files)
 find_package(OpenMP QUIET COMPONENTS CXX)

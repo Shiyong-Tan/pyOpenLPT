@@ -157,6 +157,34 @@ openlpt_public_includes(CircleIdentifier)
 target_link_libraries(CircleIdentifier 
   PUBLIC ObjectInfo myMath Matrix
   PUBLIC OpenMP::OpenMP_CXX)
+if (OPENLPT_GPU_EXACT_MORPHOLOGY)
+  add_library(GpuExactMorphology STATIC
+    "${PROJECT_SOURCE_DIR}/src/srcObject/GpuExactMorphology.cu"
+  )
+  openlpt_public_includes(GpuExactMorphology)
+  set_target_properties(GpuExactMorphology PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+  )
+  if (DEFINED OPENLPT_CUDA_ARCHITECTURES)
+    set_target_properties(GpuExactMorphology PROPERTIES
+      CUDA_ARCHITECTURES "${OPENLPT_CUDA_ARCHITECTURES}"
+    )
+  elseif (CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+    set_target_properties(GpuExactMorphology PROPERTIES
+      CUDA_ARCHITECTURES native
+    )
+  endif()
+  target_compile_options(GpuExactMorphology PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+  )
+  target_compile_definitions(CircleIdentifier PRIVATE
+    OPENLPT_ENABLE_GPU_EXACT_MORPHOLOGY=1
+  )
+  target_link_libraries(CircleIdentifier PUBLIC GpuExactMorphology)
+  install(TARGETS GpuExactMorphology EXPORT OpenLPTTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  )
+endif()
 openlpt_apply_warnings(CircleIdentifier)
 
 # BubbleResize
