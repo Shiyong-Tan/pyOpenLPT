@@ -2,9 +2,13 @@
 #define SHAKE_H
 
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <type_traits> // ★ for std::underlying_type_t
+#include <utility>
 #include <vector>
 
 #include "Camera.h"
@@ -205,6 +209,16 @@ public:
   bool additionalObjectCheck(const Object3D &obj,
                              std::vector<ROIInfo> &roi_info,
                              const std::vector<bool> &shake_cam) const override;
+
+private:
+  using RefCacheKey = std::pair<int, int>; // (camera id, odd template size)
+
+  // Cache only resizes of the immutable BubbleRefImg input. Dynamic images
+  // derived from an object's ROI must continue to be resized independently.
+  std::shared_ptr<const Image> getResizedBubbleRef(int cam, int npix) const;
+
+  mutable std::shared_mutex _ref_cache_mutex;
+  mutable std::map<RefCacheKey, std::shared_ptr<const Image>> _ref_cache;
 };
 
 #endif // !SHAKE_H
