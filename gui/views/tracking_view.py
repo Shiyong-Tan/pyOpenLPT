@@ -484,7 +484,7 @@ class TrackingView(QWidget):
         
         # 2. Controls (RIGHT)
         self.ctrl_tabs = QTabWidget()
-        self.ctrl_tabs.setFixedWidth(370)
+        self.ctrl_tabs.setFixedWidth(320)
         self.ctrl_tabs.setStyleSheet("""
              QTabWidget::pane { border: 1px solid #444; background: #000000; }
              QTabBar::tab { background: #222; color: #aaa; padding: 8px; min-width: 120px; }
