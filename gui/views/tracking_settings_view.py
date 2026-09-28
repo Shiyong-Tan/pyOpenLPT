@@ -230,10 +230,12 @@ class TrackingSettingsView(QWidget):
         # X
         vol_grid.addWidget(QLabel("X Min/Max:"), 0, 0)
         self.vol_x_min = QDoubleSpinBox()
+        self.vol_x_min.setDecimals(6)
         self.vol_x_min.setRange(-10000, 10000)
         self.vol_x_min.setValue(-200)
         vol_grid.addWidget(self.vol_x_min, 0, 1)
         self.vol_x_max = QDoubleSpinBox()
+        self.vol_x_max.setDecimals(6)
         self.vol_x_max.setRange(-10000, 10000)
         self.vol_x_max.setValue(200)
         vol_grid.addWidget(self.vol_x_max, 0, 2)
@@ -241,10 +243,12 @@ class TrackingSettingsView(QWidget):
         # Y
         vol_grid.addWidget(QLabel("Y Min/Max:"), 1, 0)
         self.vol_y_min = QDoubleSpinBox()
+        self.vol_y_min.setDecimals(6)
         self.vol_y_min.setRange(-10000, 10000)
         self.vol_y_min.setValue(-200)
         vol_grid.addWidget(self.vol_y_min, 1, 1)
         self.vol_y_max = QDoubleSpinBox()
+        self.vol_y_max.setDecimals(6)
         self.vol_y_max.setRange(-10000, 10000)
         self.vol_y_max.setValue(200)
         vol_grid.addWidget(self.vol_y_max, 1, 2)
@@ -252,10 +256,12 @@ class TrackingSettingsView(QWidget):
         # Z
         vol_grid.addWidget(QLabel("Z Min/Max:"), 2, 0)
         self.vol_z_min = QDoubleSpinBox()
+        self.vol_z_min.setDecimals(6)
         self.vol_z_min.setRange(-10000, 10000)
         self.vol_z_min.setValue(-200)
         vol_grid.addWidget(self.vol_z_min, 2, 1)
         self.vol_z_max = QDoubleSpinBox()
+        self.vol_z_max.setDecimals(6)
         self.vol_z_max.setRange(-10000, 10000)
         self.vol_z_max.setValue(200)
         vol_grid.addWidget(self.vol_z_max, 2, 2)
@@ -506,17 +512,17 @@ class TrackingSettingsView(QWidget):
         
         actions_layout.addWidget(actions_title)
         
+        validate_btn = QPushButton(" Validate Settings")
+        validate_btn.setIcon(qta.icon("fa5s.check", color="white"))
+        validate_btn.clicked.connect(self._validate_settings)
+        actions_layout.addWidget(validate_btn)
+
         save_btn = QPushButton(" Save Configuration")
         save_btn.setIcon(qta.icon("fa5s.save", color="white"))
         save_btn.setObjectName("primaryButton")
         save_btn.clicked.connect(self._save_configuration)
         actions_layout.addWidget(save_btn)
 
-        validate_btn = QPushButton(" Validate Settings")
-        validate_btn.setIcon(qta.icon("fa5s.check", color="white"))
-        validate_btn.clicked.connect(self._validate_settings)
-        actions_layout.addWidget(validate_btn)
-        
         actions_layout.addStretch()
         
         layout.addWidget(actions_frame)
@@ -727,13 +733,12 @@ class TrackingSettingsView(QWidget):
             print(f"[TrackingSettings] Auto-saved {saved_count} camera params to {cam_dir}")
             calibrator.params_dirty = False # Clear dirty flag after successful save
             
-    def _save_configuration(self):
-        """Save config.txt and [type]Config.txt to project directory."""
-        project_dir = self.project_path.text().strip()
-        if not project_dir or not os.path.isdir(project_dir):
-            QMessageBox.warning(self, "Invalid Path", "Please select a valid Project Directory first.")
-            return
+    def _render_config_files(self, project_dir):
+        """Build the config.txt and [type]Config.txt CONTENTS from the
+        current UI state, without writing anything to disk.
 
+        Returns (master_config_text, stb_config_text, stb_config_name).
+        """
         project_dir = os.path.abspath(project_dir)
 
         def _clean_ui_path(path_text):
@@ -768,116 +773,141 @@ class TrackingSettingsView(QWidget):
         obj_type = self.obj_type_combo.currentText()
         stb_config_name = "tracerConfig.txt" if obj_type == "Tracer" else "bubbleConfig.txt"
         stb_config_rel = stb_config_name
-        stb_config_path_abs = os.path.join(project_dir, stb_config_name).replace('\\', '/')
-        master_config_path_abs = os.path.join(project_dir, "config.txt").replace('\\', '/')
+
+        master_lines = []
+        master_lines.append("# Frame Range: [startID,endID]")
+        master_lines.append(f"{self.frame_start_spin.value()},{self.frame_end_spin.value()}")
+
+        master_lines.append("# Frame Rate: [Hz]")
+        master_lines.append(f"{self.fps_spin.value()}")
+
+        master_lines.append("# Number of Threads: (0: use as many as possible)")
+        master_lines.append(f"{self.n_threads_spin.value()}")
+
+        master_lines.append("# Number of Cameras: ")
+        n_cams = self.n_cam_spin.value()
+        master_lines.append(f"{n_cams}")
+
+        master_lines.append("# Camera File Path, Max Intensity")
+        cam_dir_rel = _to_rel(self.camera_path_display.text())
+        for i in range(n_cams):
+            if i < len(self.detected_cam_files):
+                fname = self.detected_cam_files[i]
+                master_lines.append(f"{_join_rel(cam_dir_rel, fname)},255")
+            else:
+                master_lines.append(f"{_join_rel(cam_dir_rel, f'cam{i}.txt')},255")
+
+        master_lines.append("# Image File Path")
+        img_dir_rel = _to_rel(self.image_path_display.text())
+        for i in range(n_cams):
+            master_lines.append(f"{_join_rel(img_dir_rel, f'cam{i}ImageNames.txt')}")
+
+        master_lines.append("# View Volume: (xmin,xmax,ymin,ymax,zmin,zmax)")
+        vol_str = f"{self.vol_x_min.value()},{self.vol_x_max.value()}," \
+                  f"{self.vol_y_min.value()},{self.vol_y_max.value()}," \
+                  f"{self.vol_z_min.value()},{self.vol_z_max.value()}"
+        master_lines.append(f"{vol_str}")
+
+        master_lines.append("# Voxel to MM: e.g. use 1000^3 voxel, (xmax-xmin)/1000")
+        master_lines.append(f"{self.voxel_spin.value()}")
+
+        master_lines.append("# Output Folder Path: ")
+        master_lines.append(f"{_to_rel(self.output_path.text())}")
+
+        master_lines.append("# Object Types: ")
+        master_lines.append(f"{obj_type}")
+
+        master_lines.append("# STB Config Files:")
+        master_lines.append(f"{stb_config_rel}")
+
+        master_lines.append("# Flag to load previous track files, previous frameID")
+        resume_flag = 1 if self.resume_check.isChecked() else 0
+        master_lines.append(f"{resume_flag},{self.resume_frame_spin.value()}")
+
+        results_path_rel = _to_rel(self.output_path.text())
+        master_lines.append("# Path to active long track files")
+        master_lines.append(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/")
+        master_lines.append("# Path to active short track files")
+        master_lines.append(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/")
+
+        master_config_text = "\n".join(master_lines) + "\n"
+
+        stb_lines = []
+        stb_lines.append("############################")
+        stb_lines.append("######### Tracking #########")
+        stb_lines.append("############################")
+        stb_lines.append("######### Initial Phase ############## ")
+        stb_lines.append(f"{self.stb_initial_radius.value()} # Search radius for connecting tracks to objects")
+        stb_lines.append(f"{self.stb_initial_frames.value()} # Number of frames for initial phase")
+        stb_lines.append("######### Convergence Phase ############# ")
+        stb_lines.append(f"{self.stb_avg_spacing.value()} # Avg Interparticle spacing. (vox) to identify neighbour tracks ")
+        stb_lines.append("")
+
+        stb_lines.append("#########################")
+        stb_lines.append("######### Shake #########")
+        stb_lines.append("#########################")
+        stb_lines.append(f"{self.shake_width.value()} # shake width 0.25")
+        stb_lines.append("")
+
+        stb_lines.append("#################################")
+        stb_lines.append("######### Predict Field #########")
+        stb_lines.append("#################################")
+        stb_lines.append(f"{self.pred_grid_x.value()} # xgrid ")
+        stb_lines.append(f"{self.pred_grid_y.value()} # ygrid")
+        stb_lines.append(f"{self.pred_grid_z.value()} # zgrid")
+        stb_lines.append(f"{self.pred_search_radius.value()} # searchRadius [voxel]")
+        stb_lines.append("")
+
+        stb_lines.append("#######################")
+        stb_lines.append("######### IPR #########")
+        stb_lines.append("#######################")
+        stb_lines.append(f"{self.ipr_loop_spin.value()}   # No. of IPR loop")
+        stb_lines.append(f"{self.shake_loops.value()}   # No. of Shake loop")
+        stb_lines.append(f"{self.shake_ghost.value()} # ghost threshold")
+        stb_lines.append(f"{self.ipr_2d_tol.value()}   # 2D tolerance [px]")
+        stb_lines.append(f"{self.ipr_3d_tol.value()}  # 3D tolerance [voxel]")
+        stb_lines.append("")
+
+        stb_lines.append(f"{self.ipr_reduce_spin.value()} # number of reduced camera")
+        stb_lines.append(f"{self.ipr_reduced_spin.value()} # no. of ipr loops for each reduced camera combination")
+        stb_lines.append("")
+        stb_lines.append("")
+
+        stb_lines.append("###############################")
+        stb_lines.append("######### Object Info #########")
+        stb_lines.append("###############################")
+        if obj_type == "Tracer":
+            stb_lines.append(f"{self.tracer_int_thresh.value()} # 2D particle finder threshold")
+            stb_lines.append(f"{self.tracer_radius.value()} # Particle radius [px], for calculating residue image and shaking")
+        else:
+            stb_lines.append(f"{self.bubble_min_rad.value()}   # minimum bubble size to track")
+            stb_lines.append(f"{self.bubble_max_rad.value()}  # maximum bubble size to track")
+            stb_lines.append(f"{self.bubble_sens.value()} # sensitivity of identify circles")
+
+        stb_config_text = "\n".join(stb_lines) + "\n"
+
+        return master_config_text, stb_config_text, stb_config_name
+
+    def _save_configuration(self):
+        """Save config.txt and [type]Config.txt to project directory."""
+        project_dir = self.project_path.text().strip()
+        if not project_dir or not os.path.isdir(project_dir):
+            QMessageBox.warning(self, "Invalid Path", "Please select a valid Project Directory first.")
+            return
+
+        project_dir = os.path.abspath(project_dir)
 
         try:
-            # 1. Save Master config.txt
+            master_config_text, stb_config_text, stb_config_name = self._render_config_files(project_dir)
+
+            master_config_path_abs = os.path.join(project_dir, "config.txt").replace('\\', '/')
+            stb_config_path_abs = os.path.join(project_dir, stb_config_name).replace('\\', '/')
+
             with open(master_config_path_abs, 'w') as f:
-                f.write("# Frame Range: [startID,endID]\n")
-                f.write(f"{self.frame_start_spin.value()},{self.frame_end_spin.value()}\n")
-                
-                f.write("# Frame Rate: [Hz]\n")
-                f.write(f"{self.fps_spin.value()}\n")
-                
-                f.write("# Number of Threads: (0: use as many as possible)\n")
-                f.write(f"{self.n_threads_spin.value()}\n")
-                
-                f.write("# Number of Cameras: \n")
-                n_cams = self.n_cam_spin.value()
-                f.write(f"{n_cams}\n")
-                
-                fwrite_cam_info = "# Camera File Path, Max Intensity\n"
-                f.write(fwrite_cam_info)
-                cam_dir_rel = _to_rel(self.camera_path_display.text())
-                for i in range(n_cams):
-                    if i < len(self.detected_cam_files):
-                        # Use actual detected filename (e.g. vsc_cam1.txt)
-                        fname = self.detected_cam_files[i]
-                        f.write(f"{_join_rel(cam_dir_rel, fname)},255\n")
-                    else:
-                        # Fallback if request n_cams > detected files
-                        f.write(f"{_join_rel(cam_dir_rel, f'cam{i}.txt')},255\n")
-                
-                f.write("# Image File Path\n")
-                img_dir_rel = _to_rel(self.image_path_display.text())
-                for i in range(n_cams):
-                    f.write(f"{_join_rel(img_dir_rel, f'cam{i}ImageNames.txt')}\n")
-                
-                f.write("# View Volume: (xmin,xmax,ymin,ymax,zmin,zmax)\n")
-                vol_str = f"{self.vol_x_min.value()},{self.vol_x_max.value()}," \
-                          f"{self.vol_y_min.value()},{self.vol_y_max.value()}," \
-                          f"{self.vol_z_min.value()},{self.vol_z_max.value()}"
-                f.write(f"{vol_str}\n")
-                
-                f.write("# Voxel to MM: e.g. use 1000^3 voxel, (xmax-xmin)/1000\n")
-                f.write(f"{self.voxel_spin.value()}\n")
-                
-                f.write("# Output Folder Path: \n")
-                f.write(f"{_to_rel(self.output_path.text())}\n")
-                
-                f.write("# Object Types: \n")
-                f.write(f"{obj_type}\n")
-                
-                f.write("# STB Config Files:\n")
-                f.write(f"{stb_config_rel}\n")
-                
-                f.write("# Flag to load previous track files, previous frameID\n")
-                resume_flag = 1 if self.resume_check.isChecked() else 0
-                f.write(f"{resume_flag},{self.resume_frame_spin.value()}\n")
-                
-                results_path_rel = _to_rel(self.output_path.text())
-                f.write("# Path to active long track files\n")
-                f.write(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/\n")
-                f.write("# Path to active short track files\n")
-                f.write(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/\n")
+                f.write(master_config_text)
 
-            # 2. Save [type]Config.txt
             with open(stb_config_path_abs, 'w') as f:
-                f.write("############################\n")
-                f.write("######### Tracking #########\n")
-                f.write("############################\n")
-                f.write("######### Initial Phase ############## \n")
-                f.write(f"{self.stb_initial_radius.value()} # Search radius for connecting tracks to objects\n")
-                f.write(f"{self.stb_initial_frames.value()} # Number of frames for initial phase\n")
-                f.write("######### Convergence Phase ############# \n")
-                f.write(f"{self.stb_avg_spacing.value()} # Avg Interparticle spacing. (vox) to identify neighbour tracks \n\n")
-
-                f.write("#########################\n")
-                f.write("######### Shake #########\n")
-                f.write("#########################\n")
-                f.write(f"{self.shake_width.value()} # shake width 0.25\n\n")
-
-                f.write("#################################\n")
-                f.write("######### Predict Field #########\n")
-                f.write("#################################\n")
-                f.write(f"{self.pred_grid_x.value()} # xgrid \n")
-                f.write(f"{self.pred_grid_y.value()} # ygrid\n")
-                f.write(f"{self.pred_grid_z.value()} # zgrid\n")
-                f.write(f"{self.pred_search_radius.value()} # searchRadius [voxel]\n\n")
-
-                f.write("#######################\n")
-                f.write("######### IPR #########\n")
-                f.write("#######################\n")
-                f.write(f"{self.ipr_loop_spin.value()}   # No. of IPR loop\n")
-                f.write(f"{self.shake_loops.value()}   # No. of Shake loop\n")
-                f.write(f"{self.shake_ghost.value()} # ghost threshold\n")
-                f.write(f"{self.ipr_2d_tol.value()}   # 2D tolerance [px]\n")
-                f.write(f"{self.ipr_3d_tol.value()}  # 3D tolerance [voxel]\n\n")
-
-                f.write(f"{self.ipr_reduce_spin.value()} # number of reduced camera\n")
-                f.write(f"{self.ipr_reduced_spin.value()} # no. of ipr loops for each reduced camera combination\n\n\n")
-
-                f.write("###############################\n")
-                f.write("######### Object Info #########\n")
-                f.write("###############################\n")
-                if obj_type == "Tracer":
-                    f.write(f"{self.tracer_int_thresh.value()} # 2D particle finder threshold\n")
-                    f.write(f"{self.tracer_radius.value()} # Particle radius [px], for calculating residue image and shaking\n")
-                else:
-                    f.write(f"{self.bubble_min_rad.value()}   # minimum bubble size to track\n")
-                    f.write(f"{self.bubble_max_rad.value()}  # maximum bubble size to track\n")
-                    f.write(f"{self.bubble_sens.value()} # sensitivity of identify circles\n")
+                f.write(stb_config_text)
 
             QMessageBox.information(self, "Success", f"Configuration saved to:\n{master_config_path_abs}\n{stb_config_path_abs}")
             print(f"[TrackingSettings] Saved config files to {project_dir}")
@@ -969,6 +999,7 @@ class TrackingSettingsView(QWidget):
         
         if cams_data:
             self._estimate_ipr_tolerance_from_cam_errors(cams_data)
+        if self.detected_cam_files:
             self._estimate_volume_from_cameras(cams_data)
 
     def _estimate_ipr_tolerance_from_cam_errors(self, cams_data):
@@ -1190,155 +1221,79 @@ class TrackingSettingsView(QWidget):
             print(f"[TrackingSettings] Warning: failed to patch Rotation Vector in {os.path.basename(file_path)}: {e}")
 
     def _estimate_volume_from_cameras(self, cams_data):
-        """Estimate common view volume using adaptive voxel visibility search.
+        """Apply only a resolved, converged common-FOV estimate."""
+        from gui.utils.view_volume import CameraVisibility, estimate_volume
 
-        Priority of initial center candidates:
-        1) world origin [0,0,0]
-        2) robust center from camera axes intersections
-        """
+        def warn(reason):
+            print(f"[TrackingSettings] View volume unchanged: {reason}")
+            QMessageBox.warning(
+                self, "View Volume Estimate: Low Confidence",
+                f"{reason}\n\nThe current view volume and voxel scale were kept. "
+                "Check the camera calibration or adjust the volume manually.")
 
-        def get_center(cam):
-            if 't_inv' in cam:
-                return np.asarray(cam['t_inv'], dtype=np.float64)
-            if 'rvec' in cam and 'tvec' in cam:
-                R, _ = cv2.Rodrigues(cam['rvec'])
-                return (-R.T @ cam['tvec'].reshape(3, 1)).ravel()
-            return None
-
-        centers = [get_center(c) for c in cams_data]
-        centers = [c for c in centers if c is not None and np.all(np.isfinite(c))]
-        if len(centers) < 2:
+        if len(cams_data) != len(self.detected_cam_files):
+            warn("Some camera files could not be parsed.")
             return
-        centers = np.asarray(centers)
-
-        def estimate_initial_half(P_ref):
-            # pinhole FOV-based estimate at reference depth, with robust fallbacks
-            d_ref = np.median(np.linalg.norm(centers - P_ref, axis=1))
-            d_ref = max(float(d_ref), 50.0)
-
-            hx_list, hy_list = [], []
+        try:
+            classify = CameraVisibility(cams_data)
+            centers = []
             for cam in cams_data:
-                if 'K' not in cam or 'w' not in cam or 'h' not in cam:
+                if 't_inv' in cam:
+                    center = np.asarray(cam['t_inv'], dtype=float).reshape(3)
+                else:
+                    R, _ = cv2.Rodrigues(np.asarray(cam['rvec'], dtype=float))
+                    center = -R.T @ np.asarray(cam['tvec'], dtype=float).reshape(3)
+                if not np.isfinite(center).all():
+                    raise ValueError("A camera center is invalid.")
+                centers.append(center)
+            centers = np.asarray(centers)
+            candidates = [np.zeros(3)]
+            robust = self._robust_estimate_working_center(cams_data)
+            if robust is not None and np.isfinite(robust).all():
+                candidates.append(np.asarray(robust, dtype=float))
+
+            result = None
+            for center in candidates:
+                distance = float(np.median(np.linalg.norm(centers - center, axis=1)))
+                if distance <= 0 or not np.isfinite(distance):
                     continue
-                K = cam['K']
-                if K is None or K.shape != (3, 3):
-                    continue
-                fx = float(K[0, 0]) if abs(float(K[0, 0])) > 1e-12 else 0.0
-                fy = float(K[1, 1]) if abs(float(K[1, 1])) > 1e-12 else 0.0
-                if fx <= 0 or fy <= 0:
-                    continue
-                hx_list.append(d_ref * float(cam['w']) / (2.0 * fx))
-                hy_list.append(d_ref * float(cam['h']) / (2.0 * fy))
-
-            if hx_list and hy_list:
-                hx = max(10.0, min(hx_list) * 0.8)
-                hy = max(10.0, min(hy_list) * 0.8)
-            else:
-                # fallback from camera-center spread
-                spread = np.median(np.linalg.norm(centers - P_ref, axis=1))
-                spread = max(float(spread), 50.0)
-                hx = hy = 0.8 * spread
-
-            hz = max(20.0, 0.8 * d_ref)
-            return np.array([hx, hy, hz], dtype=np.float64)
-
-        def adaptive_search(P_ref):
-            # Start from FOV-estimated box
-            half = estimate_initial_half(P_ref)
-            bbmin = P_ref - half
-            bbmax = P_ref + half
-
-            for it in range(7):
-                span = np.maximum(bbmax - bbmin, 1.0)
-                step = float(np.clip(np.max(span) / 30.0, 2.0, 20.0))
-                vmin, vmax = self._common_fov_bbox_voxel(cams_data, bbmin, bbmax, step=step)
-
-                if vmin is None:
-                    # expand and retry
-                    c = 0.5 * (bbmin + bbmax)
-                    h = 0.5 * (bbmax - bbmin) * 1.5
-                    bbmin, bbmax = c - h, c + h
-                    print(f"[TrackingSettings] adaptive coarse iter={it+1}: empty, expanding bbox (x1.5)")
-                    continue
-
-                used = np.maximum(vmax - vmin, step)
-                c = 0.5 * (bbmin + bbmax)
-                h = 0.5 * (bbmax - bbmin)
-
-                # edge occupation: if close to edge, expand; otherwise shrink
-                left_gap = vmin - bbmin
-                right_gap = bbmax - vmax
-                edge_tol = np.maximum(0.1 * h, np.array([step, step, step], dtype=np.float64))
-
-                for ax in range(3):
-                    near_left = left_gap[ax] <= edge_tol[ax]
-                    near_right = right_gap[ax] <= edge_tol[ax]
-                    if near_left or near_right:
-                        h[ax] *= 1.3
-                    else:
-                        target_h = 0.5 * used[ax] + 2.0 * step
-                        h[ax] = max(target_h, h[ax] * 0.8)
-
-                new_bbmin, new_bbmax = c - h, c + h
-                rel = np.max(np.abs((new_bbmax - new_bbmin) - (bbmax - bbmin)) / np.maximum(bbmax - bbmin, 1.0))
-                bbmin, bbmax = new_bbmin, new_bbmax
-
-                print(
-                    f"[TrackingSettings] adaptive coarse iter={it+1}: step={step:.2f}mm, "
-                    f"span=({(bbmax[0]-bbmin[0]):.1f},{(bbmax[1]-bbmin[1]):.1f},{(bbmax[2]-bbmin[2]):.1f}), rel_change={rel:.3f}"
-                )
-
-                if rel < 0.05:
+                # Intrinsics set dimensionless FOV factors. All seed lengths
+                # scale with the camera geometry; there are no millimeter floors.
+                factors = []
+                for cam in cams_data:
+                    K = np.asarray(cam.get('K'), dtype=float)
+                    if K.shape == (3, 3) and np.isfinite(K).all() and min(abs(K[0, 0]), abs(K[1, 1])) > 0:
+                        factors.append([cam['w'] / (2 * abs(K[0, 0])), cam['h'] / (2 * abs(K[1, 1]))])
+                xy = np.min(factors, axis=0) if factors else np.ones(2)
+                half = distance * np.array([xy[0], xy[1], 0.8])
+                result = estimate_volume(classify, center - half, center + half)
+                print(f"[TrackingSettings] View volume: {result.reason} samples={result.samples}")
+                if result.confident:
                     break
-
-            # Final coarse extraction from converged box
-            final_span = np.maximum(bbmax - bbmin, 1.0)
-            final_step = float(np.clip(np.max(final_span) / 30.0, 2.0, 20.0))
-            return self._common_fov_bbox_voxel(cams_data, bbmin, bbmax, step=final_step)
-
-        # Origin first, robust center second
-        candidates = [
-            ("origin", np.array([0.0, 0.0, 0.0], dtype=np.float64)),
-        ]
-        P_robust = self._robust_estimate_working_center(cams_data)
-        if P_robust is not None:
-            candidates.append(("robust", P_robust))
-
-        bbmin1 = bbmax1 = None
-        for name, P_ref in candidates:
-            print(f"[TrackingSettings] Coarse search center={name}, P0={P_ref}")
-            bbmin1, bbmax1 = adaptive_search(P_ref)
-            if bbmin1 is not None:
-                break
-
-        if bbmin1 is None:
-            print("[TrackingSettings] No coarse common FOV found.")
+            if result is None or not result.confident:
+                warn(result.reason if result else "Camera geometry cannot define an initial search box.")
+                return
+        except (ValueError, KeyError, TypeError, cv2.error) as exc:
+            warn(str(exc))
             return
 
-        # Fine scan from coarse result; adaptive pad for small volumes
-        span1 = np.maximum(bbmax1 - bbmin1, 1.0)
-        pad = float(np.clip(0.1 * np.max(span1), 2.0, 20.0))
-        fine_step = float(np.clip(np.max(span1) / 80.0, 1.0, 2.0))
-        bbminF, bbmaxF = self._common_fov_bbox_voxel(cams_data, bbmin1 - pad, bbmax1 + pad, step=fine_step)
-
-        if bbminF is not None:
-            # Round outward to nearest multiple of 5
-            x_min = np.floor(bbminF[0] / 5.0) * 5.0
-            x_max = np.ceil(bbmaxF[0] / 5.0) * 5.0
-            y_min = np.floor(bbminF[1] / 5.0) * 5.0
-            y_max = np.ceil(bbmaxF[1] / 5.0) * 5.0
-            z_min = np.floor(bbminF[2] / 5.0) * 5.0
-            z_max = np.ceil(bbmaxF[2] / 5.0) * 5.0
-
-            self.vol_x_min.setValue(x_min)
-            self.vol_x_max.setValue(x_max)
-            self.vol_y_min.setValue(y_min)
-            self.vol_y_max.setValue(y_max)
-            self.vol_z_min.setValue(z_min)
-            self.vol_z_max.setValue(z_max)
-
-            voxel_size = (x_max - x_min) / 1000.0
-            self.voxel_spin.setValue(voxel_size)
+        lower_widgets = [self.vol_x_min, self.vol_y_min, self.vol_z_min]
+        upper_widgets = [self.vol_x_max, self.vol_y_max, self.vol_z_max]
+        # Round only to the UI's precision, not to a fixed 5 mm lattice.
+        lower = np.array([np.floor(v * 10 ** w.decimals()) / 10 ** w.decimals()
+                          for v, w in zip(result.minimum, lower_widgets)])
+        upper = np.array([np.ceil(v * 10 ** w.decimals()) / 10 ** w.decimals()
+                          for v, w in zip(result.maximum, upper_widgets)])
+        voxel = (upper[0] - lower[0]) / 1000.0
+        values = list(zip(lower, lower_widgets)) + list(zip(upper, upper_widgets))
+        if (np.any(upper <= lower)
+                or any(not w.minimum() <= v <= w.maximum() for v, w in values)
+                or not self.voxel_spin.minimum() <= voxel <= self.voxel_spin.maximum()):
+            warn("The estimate is outside the supported settings range.")
+            return
+        for value, widget in values:
+            widget.setValue(float(value))
+        self.voxel_spin.setValue(float(voxel))
 
     def _on_voxel_scale_changed(self):
         """Update 3D tolerance in voxels if scale changes."""
@@ -1411,112 +1366,6 @@ class TrackingSettingsView(QWidget):
         s = (b*e - c*d) / denom
         t = (a*e - b*d) / denom
         return 0.5 * ((C1 + s*a1) + (C2 + t*a2))
-
-    def _common_fov_bbox_voxel(self, cams, bbox_min, bbox_max, step):
-        """Check visibility on grid and return new bbox."""
-        # Limiting grid size to prevent memory issues
-        dim_limit = 60 # Smaller limit for performance
-        x_steps = int((bbox_max[0] - bbox_min[0]) / step)
-        y_steps = int((bbox_max[1] - bbox_min[1]) / step)
-        z_steps = int((bbox_max[2] - bbox_min[2]) / step)
-        
-        if x_steps > dim_limit or y_steps > dim_limit or z_steps > dim_limit:
-            step = max(step, (bbox_max - bbox_min).max() / dim_limit)
-            x_steps = int((bbox_max[0] - bbox_min[0]) / step)
-            y_steps = int((bbox_max[1] - bbox_min[1]) / step)
-            z_steps = int((bbox_max[2] - bbox_min[2]) / step)
-
-        xs = np.linspace(bbox_min[0], bbox_max[0], x_steps + 1)
-        ys = np.linspace(bbox_min[1], bbox_max[1], y_steps + 1)
-        zs = np.linspace(bbox_min[2], bbox_max[2], z_steps + 1)
-        
-        try:
-            X, Y, Z = np.meshgrid(xs, ys, zs, indexing="xy")
-            pts_w = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1).astype(np.float32)
-        except MemoryError:
-            return None, None
-
-        visible_all = np.ones(len(pts_w), dtype=bool)
-        pinplate_cam_cache = {}
-        lpt_mod = None
-        lpt_import_failed = False
-
-        for cam in cams:
-            model = str(cam.get('model', '')).strip().upper()
-            H = cam.get('h')
-            W = cam.get('w')
-
-            ok = None
-
-            if model == 'PINPLATE' and H is not None and W is not None and 'cam_file_path' in cam:
-                if lpt_mod is None and not lpt_import_failed:
-                    try:
-                        import pyopenlpt as lpt_mod
-                    except Exception:
-                        lpt_import_failed = True
-
-                if lpt_mod is not None:
-                    cam_path = cam['cam_file_path']
-                    cam_obj = pinplate_cam_cache.get(cam_path)
-                    if cam_obj is None:
-                        try:
-                            cam_obj = lpt_mod.Camera(cam_path)
-                            pinplate_cam_cache[cam_path] = cam_obj
-                        except Exception:
-                            cam_obj = None
-
-                    if cam_obj is not None:
-                        try:
-                            pts_world = [
-                                lpt_mod.Pt3D(float(p[0]), float(p[1]), float(p[2]))
-                                for p in pts_w
-                            ]
-                            try:
-                                proj_status = cam_obj.projectBatchStatus(pts_world, False)
-                            except TypeError:
-                                proj_status = cam_obj.projectBatchStatus(pts_world)
-
-                            ok_local = np.zeros(len(pts_w), dtype=bool)
-                            for idx, st in enumerate(proj_status):
-                                if not st or not st[0]:
-                                    continue
-                                uv = st[1]
-                                u = float(uv[0])
-                                v = float(uv[1])
-                                if 0 <= u < W and 0 <= v < H:
-                                    ok_local[idx] = True
-                            ok = ok_local
-                        except Exception:
-                            ok = None
-
-            if ok is None:
-                if not all(k in cam for k in ['K', 'rvec', 'tvec', 'h', 'w']):
-                    continue
-
-                K = cam['K']
-                dist = cam.get('dist', np.zeros(5))
-                rvec = cam['rvec']
-                tvec = cam['tvec']
-                H, W = cam['h'], cam['w']
-
-                img_pts, _ = cv2.projectPoints(pts_w, rvec, tvec, K, dist)
-                uv = img_pts.reshape(-1, 2)
-
-                R, _ = cv2.Rodrigues(rvec)
-                pts_c = (R @ pts_w.T + tvec.reshape(3,1)).T
-                Zc = pts_c[:, 2]
-
-                ok = (Zc > 0) & (uv[:,0] >= 0) & (uv[:,0] < W) & (uv[:,1] >= 0) & (uv[:,1] < H)
-
-            visible_all &= ok
-            if not np.any(visible_all):
-                return None, None
-
-        pts_common = pts_w[visible_all]
-        if len(pts_common) == 0:
-            return None, None
-
-        return pts_common.min(axis=0), pts_common.max(axis=0)
 
     def _validate_settings(self):
         """Validate current settings by running 2D detection and 3D matching on the configured start frame."""

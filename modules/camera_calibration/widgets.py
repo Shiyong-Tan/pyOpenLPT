@@ -1,7 +1,7 @@
 """
 Custom Range Slider Widget with two visual draggable handles.
 """
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QSpinBox, QAbstractSpinBox
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QSpinBox, QDoubleSpinBox, QAbstractSpinBox
 from PySide6.QtCore import Qt, Signal, QPoint, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QLinearGradient, QFontMetrics
 
@@ -29,23 +29,46 @@ class SimpleSlider(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
-        
+
         self._canvas = _SimpleSliderCanvas(self)
-        
-        self._label = QLabel(f"{initial:.{decimals}f}")
-        self._label.setFixedWidth(35)
-        self._label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self._label.setStyleSheet("color: #00d4ff; font-size: 10px;")
-        
+
+        # HZ_fix: editable numeric input so the value can be typed exactly
+        # (not only set via the slider handle). Two-way synced with the slider.
+        self._spin = QDoubleSpinBox()
+        self._spin.setDecimals(decimals)
+        self._spin.setRange(min_val, max_val)
+        self._spin.setSingleStep(round(10 ** (-decimals), decimals))
+        self._spin.setValue(initial)
+        self._spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._spin.setFixedWidth(46)
+        self._spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._spin.setStyleSheet(
+            "QDoubleSpinBox { color: #00d4ff; background: #1a1f26; "
+            "border: 1px solid #333; border-radius: 3px; font-size: 10px; padding: 1px 2px; }"
+        )
+        self._spin.valueChanged.connect(self._on_spin_changed)
+
         layout.addWidget(self._canvas, 1)
-        layout.addWidget(self._label)
-    
+        layout.addWidget(self._spin)
+
     def value(self):
         return self._value
-    
+
     def setValue(self, val):
         self._value = max(self._min, min(self._max, val))
-        self._label.setText(f"{self._value:.{self._decimals}f}")
+        self._set_spin_silently(self._value)
+        self._canvas.update()
+        self.valueChanged.emit(self._value)
+
+    def _set_spin_silently(self, val):
+        """Update the spinbox display without emitting its valueChanged."""
+        self._spin.blockSignals(True)
+        self._spin.setValue(val)
+        self._spin.blockSignals(False)
+
+    def _on_spin_changed(self, val):
+        """Handle a value typed/stepped into the spinbox."""
+        self._value = max(self._min, min(self._max, round(val, self._decimals)))
         self._canvas.update()
         self.valueChanged.emit(self._value)
 
@@ -123,7 +146,8 @@ class _SimpleSliderCanvas(QWidget):
     def _update_value(self, x):
         val = self._x_to_val(x)
         self._parent._value = round(val, self._parent._decimals)
-        self._parent._label.setText(f"{self._parent._value:.{self._parent._decimals}f}")
+        # HZ_fix: keep the editable spinbox in sync with the slider handle.
+        self._parent._set_spin_silently(self._parent._value)
         self.update()
         self._parent.valueChanged.emit(self._parent._value)
 

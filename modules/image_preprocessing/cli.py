@@ -36,14 +36,14 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  openlpt preprocess --input-root ./dataset --frames 0 99\n"
-            "  openlpt preprocess --input-list cam1.txt --input-list cam2.txt --output-dir processed\n"
-            "  openlpt preprocess --image cam1_0001.tif --image cam2_0001.tif --output-dir processed\n"
-            "  openlpt preprocess --image img1.tif --image img2.tif --camera-index 1 --output-dir processed\n"
-            "  openlpt preprocess --cine cam1.cine --cine cam2.cine --frames 0 99 --output-dir processed --background mean\n"
+            "  openlpt preprocess --input-list cam0.txt --input-list cam1.txt --output-dir processed\n"
+            "  openlpt preprocess --image cam0_0001.tif --image cam1_0001.tif --output-dir processed\n"
+            "  openlpt preprocess --image img1.tif --image img2.tif --camera-index 0 --output-dir processed\n"
+            "  openlpt preprocess --cine cam0.cine --cine cam1.cine --frames 0 99 --output-dir processed --background mean\n"
         ),
     )
 
-    parser.add_argument("--input-root", help="Root directory containing camera inputs such as Cam1/, Cam2/, ...")
+    parser.add_argument("--input-root", help="Root directory containing camera inputs such as cam0/, cam1/, ...")
     parser.add_argument("--input-list", action="append", default=[], help="TIFF image list text file. Repeat once per camera.")
     parser.add_argument("--image", action="append", default=[], help="Direct TIFF image path. Repeat for additional images.")
     parser.add_argument("--cine", action="append", default=[], help="CINE file path. Repeat once per camera.")
@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--camera-index",
         type=int,
-        help="Camera index for direct --image inputs when all images belong to one camera.",
+        help="0-based camera index for direct --image inputs when all images belong to one camera.",
     )
     parser.add_argument(
         "--frames",
@@ -90,8 +90,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     if args.input_root and args.camera_index is not None:
         parser.error("--camera-index is only supported with direct --image inputs")
 
-    if args.camera_index is not None and args.camera_index <= 0:
-        parser.error("--camera-index must be >= 1")
+    if args.camera_index is not None and args.camera_index < 0:
+        parser.error("--camera-index must be >= 0")
 
     if args.input_list and args.camera_index is not None:
         parser.error("--camera-index is only supported with direct --image inputs")
@@ -143,7 +143,7 @@ def _normalize_path_args(args: argparse.Namespace) -> None:
 
 def _build_tiff_tasks_from_lists(input_lists: Sequence[str], output_dir: str | Path):
     tasks = []
-    for cam_idx, input_list in enumerate(input_lists, start=1):
+    for cam_idx, input_list in enumerate(input_lists, start=0):
         tasks.extend(plan_tiff_tasks(cam_idx=cam_idx, output_dir=output_dir, image_list_files=[input_list]))
     return tasks
 
@@ -154,7 +154,7 @@ def _build_tiff_tasks_from_images(images: Sequence[str], output_dir: str | Path,
         tasks.extend(plan_tiff_tasks(cam_idx=camera_index, output_dir=output_dir, image_paths=list(images)))
         return tasks
 
-    for cam_idx, image_path in enumerate(images, start=1):
+    for cam_idx, image_path in enumerate(images, start=0):
         tasks.extend(plan_tiff_tasks(cam_idx=cam_idx, output_dir=output_dir, image_paths=[image_path]))
     return tasks
 
@@ -162,7 +162,7 @@ def _build_tiff_tasks_from_images(images: Sequence[str], output_dir: str | Path,
 def _build_cine_tasks(cines: Sequence[str], output_dir: str | Path, frames: Sequence[int]):
     start_frame, end_frame = frames
     tasks = []
-    for cam_idx, cine_path in enumerate(cines, start=1):
+    for cam_idx, cine_path in enumerate(cines, start=0):
         tasks.extend(
             plan_cine_tasks(
                 cam_idx=cam_idx,
@@ -192,7 +192,7 @@ def _build_tasks_from_input_root(args: argparse.Namespace, output_dir: Path):
         if args.frames is None:
             raise ImagePreprocessingIOError("--frames START END is required with CINE inputs")
         start_frame, end_frame = args.frames
-        for cam_idx, camera in enumerate(detected.cameras, start=1):
+        for cam_idx, camera in enumerate(detected.cameras, start=0):
             if camera.cine_path is None:
                 raise ImagePreprocessingIOError(f"Detected CINE camera has no CINE path: {camera.camera_name}")
             tasks.extend(
@@ -210,7 +210,7 @@ def _build_tasks_from_input_root(args: argparse.Namespace, output_dir: Path):
         parser_message = "--frames is only supported with CINE inputs"
         raise ImagePreprocessingIOError(parser_message)
 
-    for cam_idx, camera in enumerate(detected.cameras, start=1):
+    for cam_idx, camera in enumerate(detected.cameras, start=0):
         tasks.extend(plan_tiff_tasks(cam_idx=cam_idx, output_dir=output_dir, image_paths=list(camera.image_paths)))
     return tasks, detected
 
@@ -231,18 +231,18 @@ def _build_backgrounds(args: argparse.Namespace) -> dict[int, object]:
         if detected is None:
             raise ImagePreprocessingIOError("--input-root detection is unavailable")
         if detected.input_kind == "cine":
-            for cam_idx, camera in enumerate(detected.cameras, start=1):
+            for cam_idx, camera in enumerate(detected.cameras, start=0):
                 if camera.cine_path is None:
                     raise ImagePreprocessingIOError(f"Detected CINE camera has no CINE path: {camera.camera_name}")
                 backgrounds[cam_idx] = compute_mean_background_from_cine(cine_path=camera.cine_path, **common_kwargs)
             return backgrounds
 
-        for cam_idx, camera in enumerate(detected.cameras, start=1):
+        for cam_idx, camera in enumerate(detected.cameras, start=0):
             backgrounds[cam_idx] = compute_mean_background_from_tiff(image_paths=list(camera.image_paths), **common_kwargs)
         return backgrounds
 
     if args.input_list:
-        for cam_idx, input_list in enumerate(args.input_list, start=1):
+        for cam_idx, input_list in enumerate(args.input_list, start=0):
             backgrounds[cam_idx] = compute_mean_background_from_tiff(image_list_files=[input_list], **common_kwargs)
         return backgrounds
 
@@ -251,11 +251,11 @@ def _build_backgrounds(args: argparse.Namespace) -> dict[int, object]:
             backgrounds[args.camera_index] = compute_mean_background_from_tiff(image_paths=args.image, **common_kwargs)
             return backgrounds
 
-        for cam_idx, image_path in enumerate(args.image, start=1):
+        for cam_idx, image_path in enumerate(args.image, start=0):
             backgrounds[cam_idx] = compute_mean_background_from_tiff(image_paths=[image_path], **common_kwargs)
         return backgrounds
 
-    for cam_idx, cine_path in enumerate(args.cine, start=1):
+    for cam_idx, cine_path in enumerate(args.cine, start=0):
         backgrounds[cam_idx] = compute_mean_background_from_cine(cine_path=cine_path, **common_kwargs)
     return backgrounds
 

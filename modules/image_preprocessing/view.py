@@ -1923,9 +1923,6 @@ class ImagePreprocessingView(QWidget):
         sorted_items = [(cam_idx, images) for cam_idx, images in sorted(self.camera_images.items()) if images]
         if not sorted_items:
             raise ValueError("No loaded images were found for CLI generation.")
-        gui_uses_zero_based_cameras = any(cam_idx == 0 for cam_idx, _ in sorted_items)
-        if gui_uses_zero_based_cameras:
-            notes.append("GUI camera tabs are zero-based; the CLI command maps them to one-based cam1, cam2, ... outputs.")
 
         is_cine = all("#" in images[0] for _, images in sorted_items)
         if is_cine:
@@ -1959,13 +1956,12 @@ class ImagePreprocessingView(QWidget):
         else:
             if len(sorted_items) == 1:
                 cam_idx, images = sorted_items[0]
-                cli_cam_idx = cam_idx + 1 if gui_uses_zero_based_cameras else cam_idx
                 indices = self._selected_batch_indices(len(images))
                 if not indices:
                     raise ValueError("The selected batch range contains no images.")
                 for idx in indices:
                     cmd.extend(["--image", images[idx]])
-                cmd.extend(["--camera-index", str(cli_cam_idx)])
+                cmd.extend(["--camera-index", str(cam_idx)])
                 notes.append(
                     "For large TIFF batches, prefer --input-list instead of many --image arguments if an image-list file is available."
                 )
@@ -1975,8 +1971,7 @@ class ImagePreprocessingView(QWidget):
                     "so replace the placeholder --input-list paths below with your camera image list text files."
                 )
                 for cam_idx, _ in sorted_items:
-                    cli_cam_idx = cam_idx + 1 if gui_uses_zero_based_cameras else cam_idx
-                    cmd.extend(["--input-list", f"/path/to/cam{cli_cam_idx}ImageNames.txt"])
+                    cmd.extend(["--input-list", f"/path/to/cam{cam_idx}ImageNames.txt"])
 
         cmd.extend(["--output-dir", output_dir])
 

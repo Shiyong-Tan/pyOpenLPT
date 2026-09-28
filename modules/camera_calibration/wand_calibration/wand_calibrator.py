@@ -428,6 +428,7 @@ class WandCalibrator:
         self.image_size = (0, 0) # Needs update from UI or Detection
         self.final_params = {} # {cam_idx: {'R':..., 'T':..., 'K':..., 'dist':...}}
         self.points_3d = None  # Optimized 3D points from last calibration
+        self.points_3d_frame_ids = []  # Frame ID for each consecutive A/B point pair
         self.per_frame_errors = {}  # {frame_idx: {'cam_errors': {cam_id: err}, 'len_error': float}}
         self.params_dirty = False  # True when new results are available but not yet exported
         self.dist_coeff_num = 2  # Number of radial distortion coefficients (0-4)
@@ -469,19 +470,30 @@ class WandCalibrator:
         
         # Get current wand data
         wand_data = self.wand_points_filtered if self.wand_points_filtered else self.wand_points
-        frame_list = sorted(wand_data.keys())
-        print(f"[calculate_per_frame_errors] Using {'FILTERED' if self.wand_points_filtered else 'ALL'} data: {len(frame_list)} frames")
+        point_frame_ids = list(getattr(self, 'points_3d_frame_ids', []))
+        if len(self.points_3d) != len(point_frame_ids) * 2:
+            print(
+                "[calculate_per_frame_errors] Missing or inconsistent 3D point/frame "
+                "mapping; skipping diagnostics rather than pairing frames positionally."
+            )
+            return {}
+
+        print(
+            f"[calculate_per_frame_errors] Using "
+            f"{'FILTERED' if self.wand_points_filtered else 'ALL'} data: "
+            f"{len(wand_data)} observed frames, {len(point_frame_ids)} reconstructed frames"
+        )
         
         self.per_frame_errors = {}
         
-        for i, fid in enumerate(frame_list):
-            obs = wand_data[fid]  # {cam_idx: [[x1,y1,r1],[x2,y2,r2]]}
+        for i, fid in enumerate(point_frame_ids):
+            obs = wand_data.get(fid)
+            if obs is None:
+                continue
             
             # Get 3D points for this frame
             idx_A = i * 2
             idx_B = i * 2 + 1
-            if idx_B >= len(self.points_3d):
-                continue
             pt3d_A = self.points_3d[idx_A]
             pt3d_B = self.points_3d[idx_B]
             
@@ -982,6 +994,7 @@ class WandCalibrator:
         self.wand_points_filtered = None # Reset filtered set
         self.per_frame_errors = {}
         self.points_3d = None
+        self.points_3d_frame_ids = []
         self.final_params = {}
         
         count_raw = 0
@@ -1336,6 +1349,7 @@ class WandCalibrator:
         # Save current state so we can restore if needed
         old_final_params = getattr(self, 'final_params', {}).copy()
         old_points_3d = getattr(self, 'points_3d', None)
+        old_points_3d_frame_ids = list(getattr(self, 'points_3d_frame_ids', []))
         
         try:
             # Use max_nfev directly to limit optimization
@@ -1352,11 +1366,13 @@ class WandCalibrator:
             # Restore state (we only want the RMS, not to keep these params as final)
             self.final_params = old_final_params
             self.points_3d = old_points_3d
+            self.points_3d_frame_ids = old_points_3d_frame_ids
             
             return success, msg, rms
         except Exception as e:
             self.final_params = old_final_params
             self.points_3d = old_points_3d
+            self.points_3d_frame_ids = old_points_3d_frame_ids
             return False, str(e), float('inf')
     
     # [DELETED LEGACY DEF]
@@ -2831,6 +2847,7 @@ class WandCalibrator:
         
         # Save points for visualization
         self.points_3d = points_3d
+        self.points_3d_frame_ids = list(frame_list)
         
         # Parse results using recentered camera parameters
         params_consistent = res.x.copy()
