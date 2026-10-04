@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QButtonGroup,
     QComboBox, QDoubleSpinBox
 )
-from PySide6.QtCore import Qt, QProcess, QIODevice, Signal, Slot, QObject, QThread, QCoreApplication, QSize, QTimer, QPoint, QPointF, QRectF
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QIODevice, Signal, Slot, QObject, QThread, QCoreApplication, QSize, QTimer, QPoint, QPointF, QRectF
 from PySide6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QMouseEvent, QWheelEvent
 
 class ZoomableLabel(QLabel):
@@ -752,6 +752,14 @@ class TrackingView(QWidget):
         path_row.addWidget(self.proj_path_edit)
         path_row.addWidget(self.sync_btn)
         path_layout.addLayout(path_row)
+
+        self.lpt_cpu_only_cb = QCheckBox("CPU only (significantly slower)")
+        self.lpt_cpu_only_cb.setChecked(False)
+        self.lpt_cpu_only_cb.setToolTip(
+            "Disable optional exact CUDA-assisted kernels for this LPT run."
+        )
+        self.lpt_cpu_only_cb.setStyleSheet("color: #f0b35a;")
+        path_layout.addWidget(self.lpt_cpu_only_cb)
         layout.addWidget(path_group)
 
         # Execution Controls
@@ -896,6 +904,25 @@ class TrackingView(QWidget):
         if dir_path:
             self.proj_path_edit.setText(dir_path)
 
+    @staticmethod
+    def _windows_to_wsl_path(path):
+        drive, tail = os.path.splitdrive(os.path.abspath(path))
+        if not drive:
+            return path.replace("\\", "/")
+        unix_tail = tail.lstrip("\\/").replace("\\", "/")
+        return f"/mnt/{drive[0].lower()}/{unix_tail}"
+
+    @classmethod
+    def _wsl_launch_arguments(cls, runner, config_path, cpu_only):
+        arguments = ["-d", "u22", "--"]
+        if cpu_only:
+            arguments.extend(["env", "CUDA_VISIBLE_DEVICES=-1"])
+        arguments.extend([
+            cls._windows_to_wsl_path(runner),
+            cls._windows_to_wsl_path(config_path),
+        ])
+        return arguments
+
     def _run_tracking(self):
         """Execute OpenLPT.exe with pre-run checks."""
         proj_dir = self.proj_path_edit.text()
@@ -920,14 +947,23 @@ class TrackingView(QWidget):
 
         config_path = os.path.join(proj_dir, "config.txt")
         
-        # Find executable relative to GUI script
+        # Prefer a native managed build. On Windows, use an installed validated
+        # WSL bundle when no MSVC executable is present.
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         exe_path = os.path.join(base_dir, "build", "Release", "OpenLPT.exe")
+        wsl_runner = os.path.join(
+            base_dir, "build", "Release", "run_openlpt_exact.sh"
+        )
+        use_native_exe = os.path.isfile(exe_path)
+        use_wsl_binary = (
+            os.name == "nt"
+            and not use_native_exe
+            and os.path.isfile(wsl_runner)
+        )
         
-        use_python_module = False
-        if not os.path.exists(exe_path):
+        use_python_module = not use_native_exe and not use_wsl_binary
+        if use_python_module:
             self._append_log(f"[Info] Managed binary not found at {exe_path}. Falling back to python module.\n")
-            use_python_module = True
 
         # Prepare log file
         log_path = os.path.join(proj_dir, "log.txt")
@@ -935,7 +971,12 @@ class TrackingView(QWidget):
             self.log_file = open(log_path, "w")
             self.log_text.clear()
             self.vis_tabs.setCurrentWidget(self.log_text)
-            if use_python_module:
+            if use_wsl_binary:
+                 self._append_log(
+                     f"[Info] Running optimized WSL backend: "
+                     f"{wsl_runner} {config_path}\n"
+                 )
+            elif use_python_module:
                  self._append_log(f"[Info] Running: {sys.executable} -m openlpt {config_path}\n")
             else:
                  self._append_log(f"[Info] Running: {exe_path} {config_path}\n")
@@ -948,7 +989,26 @@ class TrackingView(QWidget):
         self._busy_begin('run_tracking', 'Running tracking')
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        if use_python_module:
+        cpu_only = self.lpt_cpu_only_cb.isChecked()
+        self._append_log(
+            "[Info] LPT compute mode: "
+            + (
+                "CPU only (significantly slower)\n"
+                if cpu_only
+                else "exact GPU-assisted when available; automatic CPU fallback\n"
+            )
+        )
+        process_environment = QProcessEnvironment.systemEnvironment()
+        if cpu_only:
+            process_environment.insert("CUDA_VISIBLE_DEVICES", "-1")
+        self.process.setProcessEnvironment(process_environment)
+
+        if use_wsl_binary:
+            arguments = self._wsl_launch_arguments(
+                wsl_runner, config_path, cpu_only
+            )
+            self.process.start("wsl.exe", arguments)
+        elif use_python_module:
             # Python -m openlpt <config>
             self.process.start(sys.executable, ["-m", "openlpt", config_path])
         else:
