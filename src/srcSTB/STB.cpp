@@ -1,5 +1,7 @@
 #include "STB.h"
 #include <cmath>
+#include <iomanip>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 
@@ -977,6 +979,134 @@ void STB::saveTracksAll(const std::string &folder, int frame) {
   std::cout << "  Saved all tracks to folder: " << folder << std::endl;
 }
 
+bool STB::canCheckpoint(int frame) const {
+  return frame - _basic_setting._frame_start >=
+         _obj_config->_stb_param._n_initial_frames - 1;
+}
+
+void STB::saveCheckpoint(const std::string &checkpoint_root, int frame) {
+  namespace fs = std::filesystem;
+  if (!canCheckpoint(frame)) {
+    throw std::runtime_error(
+        "Checkpoint requested before the initial tracking phase completed.");
+  }
+
+  const std::string frame_name = "frame_" + std::to_string(frame);
+  const fs::path root(checkpoint_root);
+  const fs::path final_dir = root / frame_name;
+  const fs::path temp_dir = root / ("." + frame_name + ".tmp");
+  const fs::path backup_dir = root / ("." + frame_name + ".old");
+
+  std::error_code ec;
+  fs::create_directories(root, ec);
+  if (ec)
+    throw std::runtime_error("Cannot create checkpoint root: " +
+                             root.string());
+  fs::remove_all(temp_dir, ec);
+  ec.clear();
+  fs::create_directories(temp_dir, ec);
+  if (ec)
+    throw std::runtime_error("Cannot create temporary checkpoint: " +
+                             temp_dir.string());
+
+  const std::string suffix = std::to_string(frame) + ".csv";
+  saveTracksCheckpoint((temp_dir / ("LongTrackActive_" + suffix)).string(),
+                       _long_track_active);
+  saveTracksCheckpoint((temp_dir / ("ShortTrackActive_" + suffix)).string(),
+                       _short_track_active);
+  saveTracksCheckpoint(
+      (temp_dir / ("LongTrackInactivePending_" + suffix)).string(),
+      _long_track_inactive);
+  saveTracksCheckpoint((temp_dir / ("ExitTrackPending_" + suffix)).string(),
+                       _exit_track);
+
+  if (_obj_config->kind() == ObjectKind::Bubble) {
+    auto &bubble_cfg = static_cast<BubbleConfig &>(*_obj_config);
+    if (!bubble_cfg._bb_ref_img.saveExactRef(temp_dir.string(),
+                                             _basic_setting._n_cam)) {
+      fs::remove_all(temp_dir, ec);
+      throw std::runtime_error(
+          "Cannot save lossless Bubble reference checkpoint state.");
+    }
+  }
+
+  const fs::path identity_source =
+      fs::path(_basic_setting._output_path) / ".openlpt_current_run_identity.json";
+  if (fs::exists(identity_source)) {
+    fs::copy_file(identity_source, temp_dir / "run_identity.json",
+                  fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+      fs::remove_all(temp_dir, ec);
+      throw std::runtime_error("Cannot copy run identity into checkpoint.");
+    }
+  }
+
+  {
+    std::ofstream marker(temp_dir / "CheckpointComplete.txt",
+                         std::ios::out | std::ios::trunc);
+    if (!marker.is_open()) {
+      fs::remove_all(temp_dir, ec);
+      throw std::runtime_error("Cannot write checkpoint completion marker.");
+    }
+    marker << "OPENLPT_CHECKPOINT_V1\n";
+    marker << "frame=" << frame << "\n";
+    marker << "object_kind="
+           << (_obj_config->kind() == ObjectKind::Bubble ? "Bubble" : "Tracer")
+           << "\n";
+    marker.flush();
+    if (!marker.good()) {
+      fs::remove_all(temp_dir, ec);
+      throw std::runtime_error("Checkpoint completion marker write failed.");
+    }
+  }
+
+  // Publish only a complete directory, retaining the previous snapshot until
+  // the replacement has been fully written.
+  fs::remove_all(backup_dir, ec);
+  ec.clear();
+  if (fs::exists(final_dir)) {
+    fs::rename(final_dir, backup_dir, ec);
+    if (ec) {
+      fs::remove_all(temp_dir, ec);
+      throw std::runtime_error("Cannot preserve previous checkpoint version.");
+    }
+  }
+  fs::rename(temp_dir, final_dir, ec);
+  if (ec) {
+    std::error_code restore_ec;
+    if (fs::exists(backup_dir))
+      fs::rename(backup_dir, final_dir, restore_ec);
+    fs::remove_all(temp_dir, restore_ec);
+    throw std::runtime_error("Cannot publish completed checkpoint.");
+  }
+  fs::remove_all(backup_dir, ec);
+
+  // Keep the newest two complete checkpoints for bounded rollback.
+  std::vector<std::pair<int, fs::path>> complete;
+  for (const auto &entry : fs::directory_iterator(root)) {
+    if (!entry.is_directory())
+      continue;
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("frame_", 0) != 0 ||
+        !fs::exists(entry.path() / "CheckpointComplete.txt"))
+      continue;
+    try {
+      complete.emplace_back(std::stoi(name.substr(6)), entry.path());
+    } catch (...) {
+      continue;
+    }
+  }
+  std::sort(complete.begin(), complete.end(),
+            [](const auto &left, const auto &right) {
+              return left.first > right.first;
+            });
+  for (std::size_t i = 2; i < complete.size(); ++i)
+    fs::remove_all(complete[i].second, ec);
+
+  std::cout << "OPENLPT_CHECKPOINT frame=" << frame
+            << " path=" << final_dir.string() << std::endl;
+}
+
 void STB::saveTracks(std::string const &file, std::deque<Track> &tracks) {
   std::ofstream output(file, std::ios::out);
   REQUIRE_CTX(output.is_open(), ErrorCode::IOfailure,
@@ -1014,6 +1144,44 @@ void STB::saveTracks(std::string const &file, std::deque<Track> &tracks) {
   }
 
   output.close();
+}
+
+void STB::saveTracksCheckpoint(std::string const &file,
+                               std::deque<Track> &tracks) {
+  std::ofstream output(file, std::ios::out);
+  REQUIRE_CTX(output.is_open(), ErrorCode::IOfailure,
+              "Cannot open checkpoint file:", file);
+
+  // max_digits10 guarantees binary64 -> decimal -> binary64 round-tripping.
+  output << std::defaultfloat
+         << std::setprecision(std::numeric_limits<double>::max_digits10);
+
+  const int n_cam = _basic_setting._n_cam;
+  const ObjectKind kind = _obj_config->kind();
+  output << "TrackID,FrameID,WorldX,WorldY,WorldZ";
+  switch (kind) {
+  case ObjectKind::Tracer:
+    for (int i = 0; i < n_cam; ++i)
+      output << ",cam" << i << "_x(col),cam" << i << "_y(row)";
+    break;
+  case ObjectKind::Bubble:
+    output << ",R3D";
+    for (int i = 0; i < n_cam; ++i) {
+      output << ",cam" << i << "_x(col),cam" << i << "_y(row),cam" << i
+             << "_rpx";
+    }
+    break;
+  default:
+    break;
+  }
+  output << "\n";
+
+  for (size_t i = 0; i < tracks.size(); ++i)
+    tracks[i].saveTrack(output, static_cast<int>(i));
+
+  output.close();
+  REQUIRE_CTX(output.good(), ErrorCode::IOfailure,
+              "Checkpoint track write failed:", file);
 }
 
 void STB::loadTracks(const std::string &file, std::deque<Track> &tracks) {
@@ -1085,5 +1253,34 @@ void STB::loadTracksAll(std::string const &folder, int frame) {
 
     loadTracks(path,
                it.dst); // dst has _long_track_active and _short_track_active
+  }
+
+  const std::filesystem::path checkpoint_dir(folder);
+  if (std::filesystem::exists(checkpoint_dir / "CheckpointComplete.txt")) {
+    const std::string inactive_path =
+        (checkpoint_dir /
+         ("LongTrackInactivePending_" + s + ".csv"))
+            .string();
+    const std::string exit_path =
+        (checkpoint_dir / ("ExitTrackPending_" + s + ".csv")).string();
+    if (!std::filesystem::exists(inactive_path) ||
+        !std::filesystem::exists(exit_path)) {
+      THROW_FATAL_CTX(ErrorCode::IOfailure,
+                      "Incomplete frame-boundary checkpoint:", folder);
+    }
+    loadTracks(inactive_path, _long_track_inactive);
+    loadTracks(exit_path, _exit_track);
+
+    if (_obj_config->kind() == ObjectKind::Bubble) {
+      const auto &bubble_cfg = static_cast<const BubbleConfig &>(*_obj_config);
+      if (!bubble_cfg._bb_ref_img._is_valid) {
+        THROW_FATAL_CTX(ErrorCode::IOfailure,
+                        "Lossless Bubble reference state was not loaded for "
+                        "checkpoint:",
+                        folder);
+      }
+    }
+    std::cout << "Loaded complete frame-boundary checkpoint from " << folder
+              << std::endl;
   }
 }

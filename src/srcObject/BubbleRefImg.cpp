@@ -1,7 +1,10 @@
 #include "BubbleRefImg.h"
 #include "Camera.h"
 #include "ImageIO.h"
+#include <array>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <tiffio.h>
 
@@ -443,6 +446,109 @@ bool BubbleRefImg::loadRefImg(std::string folder, int n_cam) {
     _intRef_list[i] = (nsum > 0) ? (sum / nsum) : 0.0;
   }
 
+  _is_valid = true;
+  return true;
+}
+
+bool BubbleRefImg::saveExactRef(const std::string &folder, int n_cam) const {
+  namespace fs = std::filesystem;
+  if (!_is_valid || n_cam <= 0 ||
+      static_cast<int>(_img_Ref_list.size()) != n_cam ||
+      static_cast<int>(_intRef_list.size()) != n_cam) {
+    return false;
+  }
+
+  const fs::path path = fs::path(folder) / "BubbleRefExact.bin";
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out.is_open())
+    return false;
+
+  constexpr std::array<char, 8> magic{'O', 'L', 'P', 'T', 'B', 'R', 'F', '1'};
+  const std::int32_t count = static_cast<std::int32_t>(n_cam);
+  out.write(magic.data(), static_cast<std::streamsize>(magic.size()));
+  out.write(reinterpret_cast<const char *>(&count), sizeof(count));
+
+  for (int cam = 0; cam < n_cam; ++cam) {
+    const Image &img = _img_Ref_list[cam];
+    const std::int32_t rows = img.getDimRow();
+    const std::int32_t cols = img.getDimCol();
+    if (rows <= 0 || cols <= 0)
+      return false;
+    out.write(reinterpret_cast<const char *>(&rows), sizeof(rows));
+    out.write(reinterpret_cast<const char *>(&cols), sizeof(cols));
+    out.write(reinterpret_cast<const char *>(&_intRef_list[cam]),
+              sizeof(double));
+    for (std::int32_t row = 0; row < rows; ++row) {
+      for (std::int32_t col = 0; col < cols; ++col) {
+        const double value = img(row, col);
+        out.write(reinterpret_cast<const char *>(&value), sizeof(value));
+      }
+    }
+  }
+
+  out.flush();
+  return out.good();
+}
+
+bool BubbleRefImg::loadExactRef(const std::string &folder, int n_cam) {
+  namespace fs = std::filesystem;
+  _is_valid = false;
+  if (folder.empty() || n_cam <= 0)
+    return false;
+
+  const fs::path path = fs::path(folder) / "BubbleRefExact.bin";
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open())
+    return false;
+
+  constexpr std::array<char, 8> expected{'O', 'L', 'P', 'T', 'B', 'R', 'F',
+                                          '1'};
+  std::array<char, 8> magic{};
+  std::int32_t count = 0;
+  in.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+  in.read(reinterpret_cast<char *>(&count), sizeof(count));
+  if (!in.good() || magic != expected || count != n_cam)
+    return false;
+
+  std::vector<Image> images;
+  std::vector<double> intensities;
+  images.reserve(n_cam);
+  intensities.reserve(n_cam);
+  for (int cam = 0; cam < n_cam; ++cam) {
+    std::int32_t rows = 0;
+    std::int32_t cols = 0;
+    double intensity = 0.0;
+    in.read(reinterpret_cast<char *>(&rows), sizeof(rows));
+    in.read(reinterpret_cast<char *>(&cols), sizeof(cols));
+    in.read(reinterpret_cast<char *>(&intensity), sizeof(intensity));
+    // Bubble references are small ROIs. A hard upper bound prevents a damaged
+    // checkpoint from requesting an unreasonable allocation before failure.
+    if (!in.good() || rows <= 0 || cols <= 0 || rows > 4096 || cols > 4096) {
+      return false;
+    }
+
+    Image img(rows, cols, 0.0);
+    for (std::int32_t row = 0; row < rows; ++row) {
+      for (std::int32_t col = 0; col < cols; ++col) {
+        double value = 0.0;
+        in.read(reinterpret_cast<char *>(&value), sizeof(value));
+        if (!in.good())
+          return false;
+        img(row, col) = value;
+      }
+    }
+    images.emplace_back(std::move(img));
+    intensities.push_back(intensity);
+  }
+
+  char trailing = 0;
+  if (in.read(&trailing, 1))
+    return false;
+  if (!in.eof())
+    return false;
+
+  _img_Ref_list = std::move(images);
+  _intRef_list = std::move(intensities);
   _is_valid = true;
   return true;
 }
