@@ -169,19 +169,103 @@ runSingleIPRIteration(const std::vector<std::shared_ptr<Camera>> &camera_models,
     // must pass this before shaking
     auto &bb_cfg = static_cast<BubbleConfig &>(cfg);
 
-      if (!bb_cfg._bb_ref_img._is_valid) {
-        const bool ok = bb_cfg._bb_ref_img.calBubbleRefImg(
-            objs_out,       // std::vector<std::unique_ptr<Object3D>>
-            o2d_list_all,   // std::vector<std::vector<std::unique_ptr<Object2D>>>
-            camera_models,  // std::vector<std::shared_ptr<Camera>>
-            images,         // const std::vector<Image>&
-            bb_cfg._output_path // output folder
-        );
+    if (!bb_cfg._bb_ref_img._is_valid) {
+      // Keep the strict match above as the scientific reconstruction. If it
+      // cannot seed BubbleRef, use the normal 1.5x IPR tolerance schedule only
+      // to construct the appearance template, then discard those auxiliary
+      // objects.
+      bool ok = bb_cfg._bb_ref_img.calBubbleRefImg(
+          objs_out, o2d_list_all, camera_models, images,
+          bb_cfg._output_path);
+
+      const double strict_tol = bb_cfg._sm_param.tol_2d_px;
+      double bootstrap_tol = strict_tol;
+      const int bootstrap_steps = std::max(1, bb_cfg._ipr_param.n_loop_ipr);
+      const auto bootstrapPopulationIsAdequate =
+          [&camera_models, &images](
+              const std::vector<std::unique_ptr<Object3D>> &candidates) {
+            constexpr std::size_t kMinBootstrapMatches = 12;
+            std::vector<const Object3D *> eligible;
+            eligible.reserve(candidates.size());
+            for (const auto &candidate : candidates) {
+              if (!candidate ||
+                  candidate->_obj2d_list.size() < camera_models.size())
+                continue;
+              bool usable = true;
+              for (std::size_t cam = 0; cam < camera_models.size(); ++cam) {
+                if (!camera_models[cam] || !camera_models[cam]->is_active)
+                  continue;
+                const auto *bubble = static_cast<const Bubble2D *>(
+                    candidate->_obj2d_list[cam].get());
+                if (!bubble || bubble->_r_px <= 5.0) {
+                  usable = false;
+                  break;
+                }
+              }
+              if (usable)
+                eligible.push_back(candidate.get());
+            }
+            if (eligible.size() < kMinBootstrapMatches)
+              return false;
+
+            for (std::size_t cam = 0; cam < camera_models.size(); ++cam) {
+              if (!camera_models[cam] || !camera_models[cam]->is_active)
+                continue;
+              bool occupied[4] = {false, false, false, false};
+              const double mid_x = images[cam].getDimCol() / 2.0;
+              const double mid_y = images[cam].getDimRow() / 2.0;
+              for (const Object3D *candidate : eligible) {
+                const auto *bubble = static_cast<const Bubble2D *>(
+                    candidate->_obj2d_list[cam].get());
+                const int quadrant =
+                    (bubble->_pt_center[0] >= mid_x ? 1 : 0) +
+                    (bubble->_pt_center[1] >= mid_y ? 2 : 0);
+                occupied[quadrant] = true;
+              }
+              const int occupied_count = static_cast<int>(occupied[0]) +
+                                         static_cast<int>(occupied[1]) +
+                                         static_cast<int>(occupied[2]) +
+                                         static_cast<int>(occupied[3]);
+              if (occupied_count < 2)
+                return false;
+            }
+            return true;
+          };
+
+      for (int step = 1; !ok && step < bootstrap_steps; ++step) {
+        bootstrap_tol *= 1.5;
+        std::vector<std::unique_ptr<Object3D>> bootstrap_objs;
+        try {
+          bb_cfg._sm_param.tol_2d_px = bootstrap_tol;
+          StereoMatch bootstrap_match(camera_models, o2d_list_all, bb_cfg);
+          bootstrap_objs = bootstrap_match.match();
+          bb_cfg._sm_param.tol_2d_px = strict_tol;
+        } catch (...) {
+          bb_cfg._sm_param.tol_2d_px = strict_tol;
+          throw;
+        }
+
+        std::cout << "\n\tBubbleRef bootstrap: strict tolerance "
+                  << strict_tol << " px supplied " << objs_out.size()
+                  << " matches; schedule step " << step << " at "
+                  << bootstrap_tol << " px supplied "
+                  << bootstrap_objs.size() << ".";
+        if (bootstrapPopulationIsAdequate(bootstrap_objs)) {
+          ok = bb_cfg._bb_ref_img.calBubbleRefImg(
+              bootstrap_objs, o2d_list_all, camera_models, images,
+              bb_cfg._output_path);
+        } else {
+          std::cout << " (bootstrap population below 12 spatially "
+                       "distributed radius-qualified matches)";
+        }
+      }
 
       if (!ok) {
-        THROW_FATAL_CTX(ErrorCode::NoEnoughData,
-                        "Cannot obtain bubble reference image.",
-                        "IPR::runSingleIPRIteration");
+        THROW_FATAL_CTX(
+            ErrorCode::NoEnoughData,
+            std::string("Cannot obtain bubble reference image: ") +
+                bb_cfg._bb_ref_img.lastError(),
+            "IPR::runSingleIPRIteration");
       }
       std::cout << "\tObtained bubble reference image!";
     }

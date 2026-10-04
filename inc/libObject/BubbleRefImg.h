@@ -32,6 +32,8 @@ public:
   // Load reference images from folder and RECALCULATE intensity
   bool loadRefImg(std::string folder, int n_cam);
 
+  const std::string &lastError() const { return _last_error; }
+
   const Image &operator[](int camID) const { return _img_Ref_list[camID]; };
 
   double getIntRef(int camID) const { return _intRef_list[camID]; };
@@ -39,6 +41,7 @@ public:
   bool _is_valid = false;
 
 private:
+  std::string _last_error;
   std::vector<Image> _img_Ref_list; // reference images for each camera
   std::vector<double>
       _intRef_list; // average intensity of reference images for each camera
