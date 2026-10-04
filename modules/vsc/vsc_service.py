@@ -6,6 +6,9 @@ import os
 import re
 import csv
 import shutil
+import hashlib
+import json
+from datetime import datetime, timezone
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Callable
 from collections import defaultdict
@@ -16,6 +19,10 @@ from .camera_io import (
     project_point
 )
 from .optimizer import VSCOptimizer
+from .dataset_identity import (
+    compute_dataset_fingerprint,
+    compute_frame_range_fingerprint,
+)
 
 
 class VSCService:
@@ -65,16 +72,25 @@ class VSCService:
         self.tolerance_mode = 'default'
         self.tolerance_value = 5.0
         self._tolerance_thresholds = None
+        self.frame_start: Optional[int] = None
+        self.frame_end: Optional[int] = None
         
     def set_params(self, min_track_len: int = 15, sample_points: int = 20000,
                    min_valid_points: int = 2000, tolerance_mode: str = 'default',
-                   tolerance_value: float = 5.0):
+                   tolerance_value: float = 5.0,
+                   frame_start: Optional[int] = None,
+                   frame_end: Optional[int] = None):
         """Set VSC parameters."""
         self.min_track_len = min_track_len
         self.sample_points = sample_points
         self.min_valid_points = min_valid_points
         self.tolerance_mode = tolerance_mode
         self.tolerance_value = tolerance_value
+        self.frame_start = None if frame_start is None else int(frame_start)
+        self.frame_end = None if frame_end is None else int(frame_end)
+        if (self.frame_start is not None and self.frame_end is not None
+                and self.frame_end < self.frame_start):
+            raise ValueError("VSC source frame end must be >= source frame start")
     
     def _log(self, msg: str):
         """Log message to callback and file."""
@@ -197,7 +213,15 @@ class VSCService:
             
             # Step 7: Save cameras and update config
             self._log("\n[Step 7] Saving optimized cameras...")
+            input_camera_files = {}
+            for cam_idx, path in sorted(self.camera_paths.items()):
+                if os.path.isfile(path):
+                    input_camera_files[f"cam{cam_idx}"] = {
+                        "path": os.path.abspath(path),
+                        "sha256": self._sha256_file(path),
+                    }
             self._save_cameras()
+            self._save_provenance(correspondences, input_camera_files)
             self._update_config()
             
             vsc_data['cameras_optim'] = copy.deepcopy(self.cameras)
@@ -644,6 +668,12 @@ class VSCService:
                         try:
                             orig_id = int(row[0])
                             frame_id = int(row[1])
+                            if orig_id > local_max_id_in_file:
+                                local_max_id_in_file = orig_id
+                            if self.frame_start is not None and frame_id < self.frame_start:
+                                continue
+                            if self.frame_end is not None and frame_id > self.frame_end:
+                                continue
                             is_bubble = (self.obj_type == "Bubble")
                             x, y, z = float(row[2]), float(row[3]), float(row[4])
                             r3d_mm = 0.0
@@ -689,9 +719,6 @@ class VSCService:
                             
                             tracks[track_id].append((frame_id, x, y, z, r3d_mm, cam_2d))
                             
-                            if orig_id > local_max_id_in_file:
-                                local_max_id_in_file = orig_id
-                                
                         except (ValueError, IndexError):
                             continue
                 
@@ -700,6 +727,76 @@ class VSCService:
                     max_id_overall += (local_max_id_in_file + 1)
         
         return dict(tracks)
+
+    @staticmethod
+    def _sha256_file(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, 'rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _save_provenance(self, correspondences: List[dict], input_hashes=None):
+        """Save a hash-bound record of the data used to generate this VSC."""
+        output_dir = os.path.join(self.proj_dir, "camFile_VSC")
+        frame_ids = sorted({
+            int(item['frame_id'])
+            for item in correspondences
+            if 'frame_id' in item
+        })
+        camera_hashes = {}
+        for cam_idx in sorted(self.cameras):
+            path = os.path.join(output_dir, f"vsc_cam{cam_idx}.txt")
+            if os.path.isfile(path):
+                camera_hashes[os.path.basename(path)] = self._sha256_file(path)
+
+        input_hashes = input_hashes or {}
+        actual_range = (frame_ids[0], frame_ids[-1]) if frame_ids else None
+        manifest = {
+            "schema_version": 1,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "source_project_path": os.path.abspath(self.proj_dir),
+            "source_trial": os.path.basename(os.path.normpath(self.proj_dir)),
+            "source_label": os.path.basename(os.path.normpath(self.proj_dir)),
+            "source_dataset_fingerprint": compute_dataset_fingerprint(self.proj_dir),
+            "source_frame_range_fingerprint": (
+                compute_frame_range_fingerprint(self.proj_dir, actual_range)
+                if actual_range
+                else {"available": False, "reason": "No VSC frames"}
+            ),
+            "requested_frame_range": {
+                "start": self.frame_start,
+                "end": self.frame_end,
+            },
+            "actual_correspondence_frame_range": {
+                "start": frame_ids[0] if frame_ids else None,
+                "end": frame_ids[-1] if frame_ids else None,
+                "unique_frames": len(frame_ids),
+            },
+            "valid_correspondences": len(correspondences),
+            "settings": {
+                "min_track_length": self.min_track_len,
+                "sample_points": self.sample_points,
+                "min_valid_points": self.min_valid_points,
+                "tolerance_mode": self.tolerance_mode,
+                "tolerance_value_px": self.tolerance_value,
+            },
+            "input_camera_files": input_hashes,
+            "vsc_camera_sha256": camera_hashes,
+        }
+        path = os.path.join(output_dir, "vsc_provenance.json")
+        temp_path = path + ".tmp"
+        with open(temp_path, 'w', encoding='utf-8', newline='\n') as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+            stream.write('\n')
+        os.replace(temp_path, path)
+        self._log(
+            "  VSC provenance: "
+            f"trial={manifest['source_trial']}, "
+            f"frames={manifest['actual_correspondence_frame_range']['start']}.."
+            f"{manifest['actual_correspondence_frame_range']['end']}, "
+            f"saved={path}"
+        )
     
     def _filter_good_tracks(self, tracks: Dict[int, List]) -> Dict[int, List]:
         """Filter tracks with length >= min_track_len."""
