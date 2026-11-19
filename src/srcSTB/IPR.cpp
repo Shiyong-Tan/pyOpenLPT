@@ -138,8 +138,6 @@ runSingleIPRIteration(const std::vector<std::shared_ptr<Camera>> &camera_models,
 
   // 2) Stereo matching (may parallelize internally; active set is fixed this
   // pass)
-  StereoMatch stereo_match(camera_models, o2d_list_all, cfg);
-
   const clock_t t_match_start = clock();
 
   // note: the 2D information of objs_out won't be updated since it may be used
@@ -147,7 +145,12 @@ runSingleIPRIteration(const std::vector<std::shared_ptr<Camera>> &camera_models,
   //       or calibrate camera or OTF parameter
   //       2D information will be updated in shaking
 
-  objs_out = stereo_match.match();
+  {
+    // Constructor-built matching indexes require immutable inputs for the
+    // matcher lifetime. End it before bubble-reference configuration updates.
+    StereoMatch stereo_match(camera_models, o2d_list_all, cfg);
+    objs_out = stereo_match.match();
+  }
 
   const clock_t t_match_end = clock();
   const double t_sec = double(t_match_end - t_match_start) / CLOCKS_PER_SEC;

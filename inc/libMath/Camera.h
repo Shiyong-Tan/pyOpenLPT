@@ -134,7 +134,8 @@ protected:
       * @param param Pinhole-compatible camera parameters.
       * @return Undistorted normalized image point.
       */
-    static Pt2D undistort(const Pt2D& pt_img_dist, const PinholeParam& param);
+    static Pt2D undistort(const Pt2D& pt_img_dist, const PinholeParam& param,
+                         double residual_eps = UNDISTORT_EPS);
 };
 
 class CameraFactory {
@@ -159,6 +160,11 @@ public:
                            bool is_print_detail = false) const override;
     /** @brief Back-project one distorted image point to world-space line. */
     StatusOr<Line3D> lineOfSight(const Pt2D& pt_img_dist) const override;
+    /** Checked matching-boundary conversion to undistorted pixels (not normalized
+     * coordinates). Requires finite forward residual <= 1e-6 pixels; false
+     * rejects the observation, including finite inverse fallbacks. Does not
+     * alter shared refractive inversion or measured-pixel LOS semantics. */
+    bool matchingPixel(const Pt2D& measured, Pt2D& undistorted_pixel) const;
     /** @brief Image height in pixels. */
     int getNRow() const override;
     /** @brief Image width in pixels. */

@@ -44,6 +44,56 @@ StereoMatch::StereoMatch(
                   std::to_string(n_active) + "].",
               "match_cam_count = " + std::to_string(match_cam_count));
 
+  _pinhole_matching = true;
+  for (const auto& cam : _cam_list)
+    if (cam && cam->is_active && cam->type() != CameraType::Pinhole)
+      _pinhole_matching = false;
+  _matching_pixels.resize(n_cams);
+  _matching_valid.resize(n_cams);
+  _valid_counts.resize(n_cams, 0);
+  _matching_idmaps.resize(n_cams);
+  if (_pinhole_matching) {
+    for (int c=0;c<n_cams;++c) {
+      if (!_cam_list[c] || !_cam_list[c]->is_active) continue;
+      const auto& cam = static_cast<const PinholeCamera&>(*_cam_list[c]);
+      const auto& p = cam.param();
+      auto finiteMatrix = [](const Matrix<double>& m) {
+        if (m.getDimRow()!=3 || m.getDimCol()!=3) return false;
+        for(int i=0;i<3;++i) for(int j=0;j<3;++j)
+          if(!std::isfinite(m(i,j))) return false;
+        return true;
+      };
+      bool valid = finiteMatrix(p.cam_mtx) && finiteMatrix(p.r_mtx) &&
+                   finiteMatrix(p.r_mtx_inv);
+      for(int i=0;i<3;++i)
+        valid = valid && std::isfinite(p.t_vec[i]) && std::isfinite(p.t_vec_inv[i]);
+      if(valid) {
+        auto identity=p.r_mtx*p.r_mtx_inv;
+        for(int i=0;i<3;++i) for(int j=0;j<3;++j)
+          valid=valid && std::abs(identity(i,j)-(i==j?1.:0.))<=1e-8;
+      }
+      if (valid) valid = p.cam_mtx(0,0)!=0 && p.cam_mtx(1,1)!=0;
+      if (p.is_distorted) valid = valid &&
+        (p.n_dist_coeff==4 || p.n_dist_coeff==5 || p.n_dist_coeff==8 || p.n_dist_coeff==12) &&
+        p.dist_coeff.size()==static_cast<size_t>(p.n_dist_coeff);
+      for(double k:p.dist_coeff) valid = valid && std::isfinite(k);
+      REQUIRE(valid, ErrorCode::InvalidArgument,
+              "StereoMatch: invalid pinhole calibration on camera " + std::to_string(c));
+      const size_t n = _obj2d_list[c].size();
+      _matching_pixels[c].resize(n);
+      _matching_valid[c].resize(n,0);
+      for(size_t id=0;id<n;++id) {
+        const auto* obj = _obj2d_list[c][id];
+        if(obj && cam.matchingPixel(obj->_pt_center,_matching_pixels[c][id])) {
+          _matching_valid[c][id]=1;
+          ++_valid_counts[c];
+        }
+      }
+      _matching_idmaps[c]=std::make_unique<IDMap>(1,1,_obj_cfg._sm_param.idmap_cell_px);
+      _matching_idmaps[c]->rebuildCoordinates(_matching_pixels[c],_matching_valid[c]);
+    }
+  }
+
   // ---- (Re)build IDMaps for all active cams once (used by
   // buildMatch/checkMatch). ----
   _idmaps.clear();
@@ -71,7 +121,7 @@ std::vector<std::unique_ptr<Object3D>> StereoMatch::match() const {
     for (int i = 0; i < n_cams; ++i) {
       if (!_cam_list[i] || !_cam_list[i]->is_active)
         continue;
-      const size_t sz = _obj2d_list[i].size();
+      const size_t sz = _pinhole_matching ? _valid_counts[i] : _obj2d_list[i].size();
       if (sz < best) {
         best = sz;
         ref_cam = i;
@@ -104,6 +154,7 @@ std::vector<std::unique_ptr<Object3D>> StereoMatch::match() const {
 
 #pragma omp for schedule(dynamic, 32)
     for (int id_ref = 0; id_ref < static_cast<int>(ref_obs.size()); ++id_ref) {
+      if (_pinhole_matching && !_matching_valid[ref_cam][id_ref]) continue;
       // One candidate initialized with -1 everywhere and ref_cam filled.
       std::vector<int> match_candidate_id(n_cams, -1);
       match_candidate_id[ref_cam] = id_ref;
@@ -200,6 +251,9 @@ void StereoMatch::buildMatch(
   }
 
   // ---- Collect active cams & pool (exclude ref) in one pass ----
+  if (_pinhole_matching && (ref_cam<0 || ref_id<0 ||
+      ref_id>=static_cast<int>(_matching_valid[ref_cam].size()) ||
+      !_matching_valid[ref_cam][ref_id])) return;
   std::vector<int> active_cams;
   active_cams.reserve(n_cams);
   std::vector<int> pool_cams;
@@ -457,13 +511,13 @@ void StereoMatch::enumerateCandidatesOnCam(
   out_candidates.clear();
   if (target_cam < 0 || target_cam >= static_cast<int>(_idmaps.size()))
     return;
-  IDMap *idm = _idmaps[target_cam].get();
+  IDMap *idm = (_pinhole_matching ? _matching_idmaps[target_cam] : _idmaps[target_cam]).get();
   if (!idm || los3d.empty())
     return;
 
   // 1) Project LOS -> 2D image lines on this camera
   std::vector<Line2D> lines_px;
-  if (!buildLinesOnCam(los3d, target_cam, lines_px) || lines_px.empty())
+  if (!buildMatchingLines(los3d, target_cam, lines_px) || lines_px.empty())
     return;
 
   // 2) Compute per-row strip intersection in CELL indices
@@ -493,7 +547,8 @@ void StereoMatch::enumerateCandidatesOnCam(
     if (!o)
       continue;
     const Pt2D &q_t = o->_pt_center;
-    if (checkBackProjection(target_cam, q_t, chosen_cams, chosen_pts)) {
+    if (_pinhole_matching ? checkMatchingBackProjection(target_cam, q_t, chosen_cams, chosen_pts)
+                         : checkBackProjection(target_cam, q_t, chosen_cams, chosen_pts)) {
       out_candidates[write++] = pid;
     }
   }
@@ -1063,7 +1118,56 @@ std::vector<std::unique_ptr<Object3D>> StereoMatch::triangulateMatch(
 }
 
 // ---- helper: make a 2D line on camera 'cam_id' from a 3D LOS ----
-inline bool StereoMatch::makeLine2DFromLOS3D(int cam_id, const Line3D &los,
+bool StereoMatch::makeMatchingLine(int cam_id, const Line3D& los, Line2D& out) const {
+  if (!_pinhole_matching) return makeLine2DFromLOS3D(cam_id,los,out);
+  const auto& p = static_cast<const PinholeCamera&>(*_cam_list[cam_id]).param();
+  // Plane through target center and world LOS, represented in target frame.
+  Pt3D a = p.r_mtx * (los.pt - p.t_vec_inv);
+  Pt3D d = p.r_mtx * los.unit_vector;
+  double sa=0, sd=0, position_scale=0;
+  for(int i=0;i<3;++i) {
+    if(!std::isfinite(a[i]) || !std::isfinite(d[i])) return false;
+    sa=std::max(sa,std::abs(a[i])); sd=std::max(sd,std::abs(d[i]));
+    position_scale=std::max({position_scale,std::abs(los.pt[i]),std::abs(p.t_vec_inv[i])});
+  }
+  if(!(sa>64*std::numeric_limits<double>::epsilon()*position_scale) || !(sd>0)) return false;
+  auto n=myMATH::cross(a/sa,d/sd);
+  // Relative degeneracy guard; no world-unit-dependent +1/+2 samples.
+  if(n.norm()<=64*std::numeric_limits<double>::epsilon()) return false;
+  if(std::hypot(n[0],n[1])<=64*std::numeric_limits<double>::epsilon()*n.norm()) return false;
+  const double A=n[0]/p.cam_mtx(0,0), B=n[1]/p.cam_mtx(1,1);
+  const double C=n[2]-A*p.cam_mtx(0,2)-B*p.cam_mtx(1,2);
+  const double h=std::hypot(A,B);
+  if(!(h>0) || !std::isfinite(h)) return false;
+  const double nx=A/h, ny=B/h, distance=-C/h;
+  out.pt={nx*distance,ny*distance}; out.unit_vector={-ny,nx};
+  return std::isfinite(out.pt[0]) && std::isfinite(out.pt[1]);
+}
+
+bool StereoMatch::buildMatchingLines(const std::vector<Line3D>& los, int cam,
+                                     std::vector<Line2D>& lines) const {
+  lines.clear();
+  for(const auto& ray:los) {
+    Line2D line; if(!makeMatchingLine(cam,ray,line)) return false;
+    lines.push_back(line);
+  }
+  return true;
+}
+
+bool StereoMatch::checkMatchingBackProjection(int cam, const Pt2D& measured,
+    const std::vector<int>& chosen_cams, const std::vector<Pt2D>& chosen_measured) const {
+  auto ray=_cam_list[cam]->lineOfSight(measured); if(!ray) return false;
+  if(chosen_cams.size()!=chosen_measured.size()) return false;
+  for(size_t i=0;i<chosen_cams.size();++i) {
+    int ci=chosen_cams[i]; Pt2D q; Line2D line;
+    if(!static_cast<const PinholeCamera&>(*_cam_list[ci]).matchingPixel(chosen_measured[i],q) ||
+       !makeMatchingLine(ci,ray.value(),line) ||
+       !(myMATH::dist2(q,line)<=std::pow(_obj_cfg._sm_param.tol_2d_px,2))) return false;
+  }
+  return true;
+}
+
+bool StereoMatch::makeLine2DFromLOS3D(int cam_id, const Line3D &los,
                                               Line2D &out_line) const {
   // TODO(refraction): This workaround avoids projecting los.pt (interface point)
   // to reduce boundary degeneracy in refractive projection. It does NOT address
@@ -1093,7 +1197,7 @@ inline bool StereoMatch::makeLine2DFromLOS3D(int cam_id, const Line3D &los,
 
 // ---- helper: project a set of LOS to 2D lines on a camera (re-uses output
 // buffer) ----
-inline bool StereoMatch::buildLinesOnCam(const std::vector<Line3D> &los3d,
+bool StereoMatch::buildLinesOnCam(const std::vector<Line3D> &los3d,
                                          int cam_id,
                                          std::vector<Line2D> &out_lines) const {
   out_lines.clear();
@@ -1349,33 +1453,38 @@ int StereoMatch::selectSecondCameraByLineLength(
 
   auto segLenOnCam = [&](int cam) -> double {
     Line2D L;
-    if (!makeLine2DFromLOS3D(cam, los_ref, L))
+    if (!makeMatchingLine(cam, los_ref, L))
       return std::numeric_limits<double>::infinity();
+    // Extreme matching extents use an exact-scan index: the length heuristic
+    // has a neutral score, rather than clipping to a fictitious sensor/grid.
+    if (_pinhole_matching && _matching_idmaps[cam]->scansAll()) return 0.;
     const double px = L.pt[0], py = L.pt[1];
     const double ux = L.unit_vector[0], uy = L.unit_vector[1];
 
-    const double W = static_cast<double>(_cam_list[cam]->getNCol());
-    const double H = static_cast<double>(_cam_list[cam]->getNRow());
+    const double ox = _pinhole_matching ? _matching_idmaps[cam]->originX() : 0.;
+    const double oy = _pinhole_matching ? _matching_idmaps[cam]->originY() : 0.;
+    const double W = _pinhole_matching ? _matching_idmaps[cam]->extentX() : double(_cam_list[cam]->getNCol());
+    const double H = _pinhole_matching ? _matching_idmaps[cam]->extentY() : double(_cam_list[cam]->getNRow());
 
     auto in = [](double v, double lo, double hi) { return v >= lo && v <= hi; };
     auto push_if = [&](double x, double y, std::vector<Pt2D> &v) {
-      if (in(x, 0.0, W) && in(y, 0.0, H))
+      if (in(x, ox, ox+W) && in(y, oy, oy+H))
         v.emplace_back(x, y);
     };
 
     std::vector<Pt2D> pts;
     pts.reserve(4);
     if (std::fabs(ux) > 1e-12) {
-      double t = (0.0 - px) / ux;
-      push_if(0.0, py + t * uy, pts);
-      t = (W - 1 - px) / ux;
-      push_if(W - 1, py + t * uy, pts);
+      double t = (ox - px) / ux;
+      push_if(ox, py + t * uy, pts);
+      t = (ox+W - 1 - px) / ux;
+      push_if(ox+W - 1, py + t * uy, pts);
     }
     if (std::fabs(uy) > 1e-12) {
-      double t = (0.0 - py) / uy;
-      push_if(px + t * ux, 0.0, pts);
-      t = (H - 1 - py) / uy;
-      push_if(px + t * ux, H - 1, pts);
+      double t = (oy - py) / uy;
+      push_if(px + t * ux, oy, pts);
+      t = (oy+H - 1 - py) / uy;
+      push_if(px + t * ux, oy+H - 1, pts);
     }
     // de-dup corners
     const double eps = 1e-9;
@@ -1424,7 +1533,7 @@ int StereoMatch::selectNextCameraByMaxPairAngle(
   std::vector<Line2D> lines_px; // reused buffer
 
   for (int cam : remaining_cams) {
-    if (!buildLinesOnCam(los3d, cam, lines_px))
+    if (!buildMatchingLines(los3d, cam, lines_px))
       continue;
 
     double score = 0.0;
@@ -1462,7 +1571,14 @@ IDMap::IDMap(int img_rows_px, int img_cols_px, int cell_px)
 }
 
 void IDMap::rebuild(const std::vector<const Object2D *> &objs) {
-  _objs = &objs;
+  _objs = objs;
+  if (_coordinate_mode) {
+    _rows_cell=std::max(1,_img_rows_px/_cell_px+(_img_rows_px%_cell_px?1:0));
+    _cols_cell=std::max(1,_img_cols_px/_cell_px+(_img_cols_px%_cell_px?1:0));
+    _buckets.assign(_rows_cell*_cols_cell,{});
+  }
+  _coordinate_mode = false;
+  _scan_all=false; _origin_x=_origin_y=0.; _coordinates.clear();
   // clear buckets
   for (auto &v : _buckets)
     v.clear();
@@ -1470,11 +1586,50 @@ void IDMap::rebuild(const std::vector<const Object2D *> &objs) {
   const int n = static_cast<int>(objs.size());
   for (int pid = 0; pid < n; ++pid) {
     const Object2D *o = objs[pid];
+    if (!o || !std::isfinite(o->_pt_center[0]) || !std::isfinite(o->_pt_center[1]) ||
+        o->_pt_center[0]<0 || o->_pt_center[1]<0 ||
+        o->_pt_center[0]>=double(_cols_cell)*_cell_px ||
+        o->_pt_center[1]>=double(_rows_cell)*_cell_px) continue;
     int cx = static_cast<int>(std::floor(o->_pt_center[0] / _cell_px));
     int cy = static_cast<int>(std::floor(o->_pt_center[1] / _cell_px));
     if (cx < 0 || cy < 0 || cx >= _cols_cell || cy >= _rows_cell)
       continue;
     _buckets[idx(cy, cx)].push_back(pid);
+  }
+}
+
+void IDMap::rebuildCoordinates(const std::vector<Pt2D>& pixels,
+                              const std::vector<unsigned char>& valid) {
+  REQUIRE(pixels.size()==valid.size(),ErrorCode::InvalidArgument,"IDMap validity size mismatch");
+  _coordinate_mode=true; _coordinates=pixels; _objs.clear(); _scan_all=false;
+  double xmin=0,ymin=0,xmax=0,ymax=0; bool first=true;
+  std::vector<int> ids;
+  for(size_t i=0;i<pixels.size();++i) {
+    const auto& q=pixels[i];
+    if(!valid[i] || !std::isfinite(q[0]) || !std::isfinite(q[1])) continue;
+    ids.push_back(static_cast<int>(i));
+    if(first) { xmin=xmax=q[0]; ymin=ymax=q[1]; first=false; }
+    xmin=std::min(xmin,q[0]); xmax=std::max(xmax,q[0]);
+    ymin=std::min(ymin,q[1]); ymax=std::max(ymax,q[1]);
+  }
+  _origin_x=std::floor(xmin/_cell_px)*_cell_px;
+  _origin_y=std::floor(ymin/_cell_px)*_cell_px;
+  double cols=std::floor((xmax-_origin_x)/_cell_px)+1;
+  double rows=std::floor((ymax-_origin_y)/_cell_px)+1;
+  // Guard BEFORE integer conversion or allocation. A sparse extreme outlier
+  // never drops unrelated valid IDs: fall back to bounded exact scanning.
+  constexpr double max_cells=1000000;
+  if(!std::isfinite(rows) || !std::isfinite(cols) || rows<1 || cols<1 ||
+     rows>max_cells || cols>max_cells || rows*cols>max_cells) {
+    _scan_all=true; _rows_cell=_cols_cell=1;
+    _buckets.assign(1,std::move(ids)); return;
+  }
+  _rows_cell=static_cast<int>(rows); _cols_cell=static_cast<int>(cols);
+  _buckets.assign(_rows_cell*_cols_cell,{});
+  for(int id:ids) {
+    int cx=static_cast<int>(std::floor((pixels[id][0]-_origin_x)/_cell_px));
+    int cy=static_cast<int>(std::floor((pixels[id][1]-_origin_y)/_cell_px));
+    _buckets[idx(cy,cx)].push_back(id);
   }
 }
 
@@ -1518,6 +1673,7 @@ void IDMap::computeStripIntersection(const std::vector<Line2D> &lines_px,
                                      std::vector<RowSpan> &spans) const {
   // Start with full-span on every row (inclusive indices)
   spans.assign(_rows_cell, RowSpan{0, _cols_cell - 1});
+  if (_scan_all) return;
 
   const double hw = 0.5 * _cell_px;       // half cell width in pixels
   const double hh = 0.5 * _cell_px;       // half cell height in pixels
@@ -1528,10 +1684,18 @@ void IDMap::computeStripIntersection(const std::vector<Line2D> &lines_px,
   const double eps_c = 1e-9; // bias for robust ceil/floor at boundaries
 
   for (const Line2D &L : lines_px) {
+    if (!std::isfinite(L.pt[0]) || !std::isfinite(L.pt[1]) ||
+        !std::isfinite(L.unit_vector[0]) || !std::isfinite(L.unit_vector[1]) ||
+        !(std::hypot(L.unit_vector[0],L.unit_vector[1])>0)) {
+      spans.assign(_rows_cell,RowSpan{1,0}); return;
+    }
     // Line in normal form: n · x + d = 0, where n is unit-length
     const Pt2D u = normalized(L.unit_vector); // ensure unit direction
     const Pt2D n{-u[1], u[0]};                // unit normal
-    const double d = -(n[0] * L.pt[0] + n[1] * L.pt[1]);
+    const double d = -(n[0] * (L.pt[0]-_origin_x) + n[1] * (L.pt[1]-_origin_y));
+    // Overflow in a new-domain strip estimate cannot justify dropping IDs;
+    // retain conservative spans and let exact point checks decide.
+    if (_coordinate_mode && !std::isfinite(d)) continue;
 
     for (int cy = 0; cy < _rows_cell; ++cy) {
       RowSpan &row = spans[cy];
@@ -1585,8 +1749,24 @@ void IDMap::computeStripIntersection(const std::vector<Line2D> &lines_px,
         // eps_c nudges the ceil/floor to be robust against floating rounding at
         // boundaries. ceil and floor is used because proj_extent has already
         // enlarged the range
-        a = static_cast<int>(std::ceil(x_left * to_index - 0.5 - eps_c));
-        b = static_cast<int>(std::floor(x_right * to_index - 0.5 + eps_c));
+        if (_coordinate_mode) {
+          double left=std::ceil(x_left * to_index - 0.5 - eps_c);
+          double right=std::floor(x_right * to_index - 0.5 + eps_c);
+          // New matching index: clamp BEFORE integer conversion. Keep legacy
+          // raw indexing arithmetic separate for mixed-model compatibility.
+          a = static_cast<int>(std::clamp(left,0.,double(_cols_cell)));
+          b = static_cast<int>(std::clamp(right,-1.,double(_cols_cell-1)));
+        } else {
+          // Preserve the established MSVC legacy overflow sentinel/rejection,
+          // without invoking undefined floating-to-integer conversion.
+          auto legacyIndex=[](double v) {
+            if(!std::isfinite(v) || v<std::numeric_limits<int>::min() ||
+               v>std::numeric_limits<int>::max()) return std::numeric_limits<int>::min();
+            return static_cast<int>(v);
+          };
+          a = legacyIndex(std::ceil(x_left * to_index - 0.5 - eps_c));
+          b = legacyIndex(std::floor(x_right * to_index - 0.5 + eps_c));
+        }
 
         // Clamp to valid column range
         a = std::max(0, a);
@@ -1612,19 +1792,25 @@ void IDMap::visitPointsInRowSpans(const std::vector<RowSpan> &spans,
                                   std::vector<int> &out_indices) const {
   out_indices.clear();
 
-  if (!_objs || lines_px.empty() || spans.empty())
+  if (lines_px.empty() || spans.size()!=static_cast<size_t>(_rows_cell))
     return;
 
   // Precompute unit directions (required by cross-product distance)
   std::vector<Pt2D> U(lines_px.size());
   for (size_t i = 0; i < lines_px.size(); ++i)
-    U[i] = normalized(lines_px[i].unit_vector);
+    {
+      const auto& L=lines_px[i];
+      if (!std::isfinite(L.pt[0]) || !std::isfinite(L.pt[1]) ||
+          !std::isfinite(L.unit_vector[0]) || !std::isfinite(L.unit_vector[1]) ||
+          !(std::hypot(L.unit_vector[0],L.unit_vector[1])>0)) return;
+      U[i] = normalized(L.unit_vector);
+    }
 
   const double tol2 = tol_px * tol_px;
-  const auto &objs = *_objs;
+  const size_t count = _coordinate_mode ? _coordinates.size() : _objs.size();
 
   // Dedup bitmap: a point may appear in multiple cells along the row-span
-  std::vector<unsigned char> seen(objs.size(), 0);
+  std::vector<unsigned char> seen(count, 0);
 
   // Iterate every row of cells
   const int rowsC = _rows_cell;
@@ -1634,15 +1820,15 @@ void IDMap::visitPointsInRowSpans(const std::vector<RowSpan> &spans,
       continue; // invalid span -> nothing on this row
 
     // Iterate each cell in the inclusive [x_min, x_max] range
-    for (int cx = row.x_min; cx <= row.x_max; ++cx) {
+    for (int cx = std::max(0,row.x_min); cx <= std::min(_cols_cell-1,row.x_max); ++cx) {
       const auto &cell = _buckets[idx(cy, cx)];
       for (int pid : cell) {
-        if (pid < 0 || static_cast<size_t>(pid) >= objs.size())
+        if (pid < 0 || static_cast<size_t>(pid) >= count)
           continue;
         if (seen[pid])
           continue;
 
-        const Pt2D &q = objs[pid]->_pt_center;
+        const Pt2D &q = _coordinate_mode ? _coordinates[pid] : _objs[pid]->_pt_center;
 
         // Precise distance check w.r.t. all lines: |(q - p) x u| <= tol
         for (size_t i = 0; i < lines_px.size(); ++i) {
@@ -1653,7 +1839,7 @@ void IDMap::visitPointsInRowSpans(const std::vector<RowSpan> &spans,
           const double z =
               dy * u[0] -
               dx * u[1]; // signed 2D cross (perp distance if u is unit)
-          if (z * z > tol2)
+          if (!std::isfinite(z) || z * z > tol2)
             goto reject_point;
         }
 

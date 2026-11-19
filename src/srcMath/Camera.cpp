@@ -252,7 +252,7 @@ Pt2D Camera::distort(Pt2D const& pt_img_undist,
 // Input: distorted image coordinate in pixels.
 // Output: normalized undistorted image coordinate.
 Pt2D Camera::undistort(Pt2D const& pt_img_dist,
-                       PinholeParam const& param) {
+                       PinholeParam const& param, double residual_eps) {
     double fx = param.cam_mtx(0, 0);
     double fy = param.cam_mtx(1, 1);
     double cx = param.cam_mtx(0, 2);
@@ -271,7 +271,7 @@ Pt2D Camera::undistort(Pt2D const& pt_img_dist,
         double error = std::numeric_limits<double>::max();
         int iter = 0;
 
-        while (error > UNDISTORT_EPS && iter < UNDISTORT_MAX_ITER) {
+        while (error > residual_eps && iter < UNDISTORT_MAX_ITER) {
             double r2 = x * x + y * y;
             double a1 = 2 * x * y;
             double a2 = r2 + 2 * x * x;
@@ -353,7 +353,7 @@ void loadDistCoeff(const std::string& dist_coeff_str, PinholeParam& p) {
     while (dist_coeff_stream >> dist_coeff) {
         p.dist_coeff.push_back(dist_coeff);
         id++;
-        if (dist_coeff > SMALLNUMBER) {
+        if (std::abs(dist_coeff) > SMALLNUMBER) {
             p.is_distorted = true;
         }
         if (dist_coeff_stream.peek() == ',') {
@@ -422,6 +422,33 @@ StatusOr<Line3D> PinholeCamera::lineOfSight(const Pt2D& pt_img_dist) const {
         Status st = mapExceptionToStatus(e, "PinholeCamera::lineOfSight");
         return STATUS_OR_ERR_CTX(Line3D, st.err.code, st.err.message, st.err.context);
     }
+}
+
+bool PinholeCamera::matchingPixel(const Pt2D& measured, Pt2D& pixel) const {
+    if (!std::isfinite(measured[0]) || !std::isfinite(measured[1])) return false;
+    const auto& K = _param.cam_mtx;
+    if (K.getDimRow()!=3 || K.getDimCol()!=3) return false;
+    if (_param.is_distorted &&
+        ((_param.n_dist_coeff!=4 && _param.n_dist_coeff!=5 &&
+          _param.n_dist_coeff!=8 && _param.n_dist_coeff!=12) ||
+         _param.dist_coeff.size()!=static_cast<size_t>(_param.n_dist_coeff))) return false;
+    if (K(0,0) == 0 || K(1,1) == 0 ||
+        !std::isfinite(K(0,0)) || !std::isfinite(K(1,1)) ||
+        !std::isfinite(K(0,2)) || !std::isfinite(K(1,2))) return false;
+    const Pt2D u = undistort(measured, _param, 1e-9);
+    if (!std::isfinite(u[0]) || !std::isfinite(u[1])) return false;
+    const Pt2D redistorted = distort(u, _param);
+    if (!std::isfinite(redistorted[0]) || !std::isfinite(redistorted[1]) ||
+        std::hypot(redistorted[0]-measured[0], redistorted[1]-measured[1]) > 1e-6)
+        return false;
+    pixel = {K(0,0)*u[0]+K(0,2), K(1,1)*u[1]+K(1,2)};
+    auto ray = lineOfSight(measured);
+    if (!ray) return false;
+    for (int i=0;i<3;++i)
+        if (!std::isfinite(ray.value().pt[i]) ||
+            !std::isfinite(ray.value().unit_vector[i])) return false;
+    return std::isfinite(pixel[0]) && std::isfinite(pixel[1]) &&
+           ray.value().unit_vector.norm() > 0;
 }
 
 int PinholeCamera::getNRow() const { return _param.n_row; }

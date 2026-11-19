@@ -1,6 +1,14 @@
 # Enable testing with CTest
 enable_testing()
 
+# Focused current-API regression; failures remain active in Release builds.
+add_executable(test_distortion_matching ${CMAKE_HOME_DIRECTORY}/test/test_distortion_matching.cpp)
+target_compile_definitions(StereoMatch PUBLIC OPENLPT_EXPOSE_PRIVATE)
+target_link_libraries(test_distortion_matching PRIVATE StereoMatch Camera Config BubbleRefImg)
+add_test(NAME test_distortion_matching COMMAND test_distortion_matching)
+set_tests_properties(test_distortion_matching PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 60)
+
 # test header
 set(TESTHEADERFILES
     ${CMAKE_HOME_DIRECTORY}/test/test.h

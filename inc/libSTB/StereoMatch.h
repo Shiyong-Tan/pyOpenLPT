@@ -8,8 +8,16 @@
  * Notes:
  * - A 2D observation may be reused across different matches until the prune
  * step.
- * - Per-call inputs are bound at the start of match() via internal pointers.
- *   Do not call match() concurrently on the same instance.
+ * - Immutable-input lifetime contract: cameras/calibration (including param(),
+ *   pose, intrinsics, active flags and ordering), config, source observation
+ *   vectors (size/order), objects and measured pixels must stay unchanged and
+ *   alive for the ENTIRE matcher lifetime. Destroy/reconstruct before changes.
+ *   Constructor-built indexes are snapshots, not setter-invalidated caches.
+ *   This contract also applies to binding-created matchers: retaining a camera
+ *   or config Python object does not make its mutable calibration snapshot-safe.
+ * - Repeated match() calls require unchanged inputs; no same-instance concurrent
+ *   call guarantee. All-pinhole tol_2d_px is Euclidean UNDISTORTED pixels, not a
+ *   distorted-image noise guarantee. Mixed active models retain legacy pixels.
  */
 #pragma once
 #include <algorithm>
@@ -47,14 +55,24 @@ public:
   std::vector<std::unique_ptr<Object3D>> match() const;
 
 private:
-  // ---- bound per-call inputs (read-only during a match) ----
+  // ---- lifetime-bound immutable inputs (read-only, also between calls) ----
   const std::vector<std::shared_ptr<Camera>> &_cam_list;
   const ObjectConfig &_obj_cfg;
   std::vector<std::vector<const Object2D *>> _obj2d_list;
+  bool _pinhole_matching = false;
+  std::vector<std::vector<Pt2D>> _matching_pixels;
+  std::vector<std::vector<unsigned char>> _matching_valid;
+  std::vector<size_t> _valid_counts;
+  std::vector<std::unique_ptr<IDMap>> _matching_idmaps;
+  bool makeMatchingLine(int cam, const Line3D& los, Line2D& line) const;
+  bool buildMatchingLines(const std::vector<Line3D>& los, int cam,
+                          std::vector<Line2D>& lines) const;
+  bool checkMatchingBackProjection(int cam, const Pt2D& measured,
+      const std::vector<int>& chosen_cams, const std::vector<Pt2D>& chosen_measured) const;
 
   // ---- shared accelerators usable by build/check during a match ----
   std::vector<std::unique_ptr<IDMap>>
-      _idmaps; // one per camera (nullptr if inactive)
+      _idmaps; // legacy RAW-coordinate view, including exposed getIDMap
   // _idmaps must be built in the contructor, because match() const cannot
   // change any member variable due to "const".
 
@@ -136,8 +154,18 @@ public:
   IDMap(int img_rows_px, int img_cols_px, int cell_px);
 
   // Rebuild the buckets for this camera using a contiguous array of 2D objects.
-  // 'objs' must outlive the IDMap while you iterate.
+  // The pointed-to objects must outlive the IDMap; the pointer vector is copied.
   void rebuild(const std::vector<const Object2D *> &objs);
+  // Owned matching-space coordinates, original IDs (invalid entries excluded).
+  // Bounds include negative/beyond-sensor observations. Excessive extents use a
+  // bounded single bucket with exact scanning instead of unbounded allocation.
+  void rebuildCoordinates(const std::vector<Pt2D>& pixels,
+                          const std::vector<unsigned char>& valid);
+  double originX() const { return _origin_x; }
+  double originY() const { return _origin_y; }
+  double extentX() const { return double(_cols_cell)*_cell_px; }
+  double extentY() const { return double(_rows_cell)*_cell_px; }
+  bool scansAll() const { return _scan_all; }
 
   // Compute per-row intersection of K LOS strips; result in CELL indices.
   // 'spans' is resized to rowsCell(), each entry holds [cx_min, cx_max]
@@ -176,7 +204,9 @@ private:
   // Buckets: one vector<int> per cell (row-major)
   std::vector<std::vector<int>> _buckets;
 
-  // Pointer to external storage of Object2D* for coordinate access during
-  // enumeration
-  const std::vector<const Object2D *> *_objs = nullptr;
+  // Raw-coordinate object view for legacy enumeration.
+  std::vector<const Object2D *> _objs; // owns pointer vector, not objects
+  std::vector<Pt2D> _coordinates;
+  bool _coordinate_mode = false, _scan_all = false;
+  double _origin_x = 0, _origin_y = 0;
 };
