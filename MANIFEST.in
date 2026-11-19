@@ -1,0 +1,9 @@
+include CMakeLists.txt
+include cmake/openLPT.cmake cmake/bindings.cmake
+recursive-include inc *.h *.hpp *.hxx
+recursive-include src *.c *.cpp *.cxx *.h *.hpp
+include inc/libtiff/CMakeLists.txt inc/libtiff/libtiff.def
+recursive-include inc/libtiff *.c *.cxx *.h.cmake.in
+prune inc/libtiff/install
+prune test
+prune tests
