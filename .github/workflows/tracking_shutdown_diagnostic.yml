@@ -1,0 +1,152 @@
+name: Diagnostic - tracking shutdown (not a release gate)
+
+on:
+  push:
+    branches: [diagnostics/tracking-shutdown-d45-r2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect-linux-stack:
+    if: github.ref == 'refs/heads/diagnostics/tracking-shutdown-d45-r2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DIAG_ROOT: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown
+      HOME: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/home
+      TMP: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/tmp
+      TEMP: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/tmp
+      TMPDIR: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/tmp
+      XDG_CACHE_HOME: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/cache
+      XDG_CONFIG_HOME: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/config
+      XDG_DATA_HOME: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/data
+      XDG_STATE_HOME: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/state
+      CONDA_ENVS_PATH: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/envs
+      CONDA_PKGS_DIRS: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/conda-pkgs
+      CONDARC: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/condarc
+      CONDA_NO_PLUGINS: 'true'
+      CONDA_SOLVER: classic
+      PIP_CACHE_DIR: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/cache/pip
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUNBUFFERED: '1'
+      PYTHONNOUSERSITE: '1'
+      PYTHONPYCACHEPREFIX: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/cache/pycache
+      DEBUGINFOD_URLS: ''
+      DEBUGINFOD_CACHE_PATH: ${{ github.workspace }}/.opencode/diagnostics/tracking_shutdown/cache/debuginfod
+      GDBHISTFILE: /dev/null
+      CMAKE_BUILD_PARALLEL_LEVEL: '4'
+      MAX_JOBS: '4'
+      CFLAGS: -g -fno-omit-frame-pointer
+      CXXFLAGS: -g -fno-omit-frame-pointer
+
+    steps:
+      - name: Initialize workspace-local diagnostic storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME" "$TMPDIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+            "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$CONDA_ENVS_PATH" \
+            "$CONDA_PKGS_DIRS" "$DIAG_ROOT/evidence"
+          printf 'envs_dirs:\n  - %s\npkgs_dirs:\n  - %s\n' \
+            "$CONDA_ENVS_PATH" "$CONDA_PKGS_DIRS" > "$CONDARC"
+
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 2
+          persist-credentials: false
+          set-safe-directory: false
+          clean: false
+
+      - name: Reinitialize workspace-local diagnostic storage after checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME" "$TMPDIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+            "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$CONDA_ENVS_PATH" \
+            "$CONDA_PKGS_DIRS" "$DIAG_ROOT/evidence"
+          printf 'envs_dirs:\n  - %s\npkgs_dirs:\n  - %s\n' \
+            "$CONDA_ENVS_PATH" "$CONDA_PKGS_DIRS" > "$CONDARC"
+          test -s "$CONDARC"
+          test -w "$CONDARC"
+          for directory in "$HOME" "$TMPDIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+            "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$CONDA_ENVS_PATH" \
+            "$CONDA_PKGS_DIRS" "$DIAG_ROOT/evidence"; do
+            probe="$directory/.write-probe"
+            printf 'writable\n' > "$probe"
+            test -s "$probe"
+            rm -- "$probe"
+          done
+
+      - name: Verify source, bootstrap OpenLPT, build symbols, collect once
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          # Per-process address-space ceiling, NOT an aggregate cgroup limit.
+          ulimit -v 8388608
+          exec > >(tee "$DIAG_ROOT/evidence/bootstrap.log") 2>&1
+          trap 'rc=$?; printf "bootstrap_exit=%s\n" "$rc" > "$DIAG_ROOT/evidence/bootstrap-status.txt"' EXIT
+          base=d45cbccf7430300937df911700beafdc0eddc829
+          git diff --exit-code "$base" -- src inc openlpt.py setup.py CMakeLists.txt cmake _version.py pyproject.toml
+          test "$(git rev-parse HEAD^)" = "$base"
+          expected=$(printf '%s\n' .github/scripts/tracking_shutdown_diagnostic.py .github/workflows/tracking_shutdown_diagnostic.yml | sort)
+          actual=$(git diff --name-only "$base" HEAD | sort)
+          test "$actual" = "$expected"
+          git diff --quiet
+          git diff --cached --quiet
+          git rev-parse HEAD "$base^{tree}" | tee "$DIAG_ROOT/evidence/source-identity.txt"
+          missing=0
+          for tool in gdb cmake gcc g++ make readelf ldd git; do
+            command -v "$tool" || { printf 'MISSING_TOOL=%s\n' "$tool" | tee -a "$DIAG_ROOT/evidence/missing-tools.txt"; missing=1; }
+          done
+          conda_exe=$(command -v conda || true)
+          if [ -z "$conda_exe" ] && [ -n "${CONDA:-}" ] && [ -x "$CONDA/bin/conda" ]; then
+            conda_exe="$CONDA/bin/conda"
+          fi
+          if [ -z "$conda_exe" ]; then echo MISSING_TOOL=conda | tee -a "$DIAG_ROOT/evidence/missing-tools.txt"; missing=1; fi
+          if [ "$missing" != 0 ]; then
+            echo 'BLOCKED: preinstalled tools missing; no system installation authorized.' \
+              | tee -a "$DIAG_ROOT/evidence/missing-tools.txt"
+            exit 3
+          fi
+          printf 'compiler_jobs=4\naddress_space_per_process_bytes=8589934592\ncore_limit='
+          ulimit -c
+          gcc --version
+          g++ --version
+          cmake --version
+          gdb --version
+          cat /proc/meminfo | head -5
+          "$conda_exe" --version
+          # No setup-python, apt, sudo, global pip, or base-env installation.
+          # Exact failed-run Python requested; solver failure is a visible blocker.
+          "$conda_exe" create --yes --name OpenLPT --override-channels \
+            --channel conda-forge --no-default-packages python=3.12.16 pip
+          py() { "$conda_exe" run --no-capture-output --name OpenLPT python -I -B -X utf8 "$@"; }
+          py -c 'import os,sys; from pathlib import Path; p=Path(sys.prefix).resolve(); assert p == Path(os.environ["CONDA_ENVS_PATH"]).resolve()/"OpenLPT"; assert os.environ["CONDA_DEFAULT_ENV"] == "OpenLPT"; print(sys.executable, sys.version)'
+          # Bounded native-CLI dependencies; no GUI/evaluator is exercised.
+          py -m pip install 'pybind11==3.1.0' 'setuptools>=61' wheel \
+            'numpy>=2.2.0' 'opencv-python>=4.8.0'
+          py .github/scripts/tracking_shutdown_diagnostic.py prepare
+          export CMAKE_TOOLCHAIN_FILE="$DIAG_ROOT/symbols-toolchain.cmake"
+          py -m pip install "$DIAG_ROOT/build-source" -v --no-build-isolation --no-deps
+          py -m pip list --format=json > "$DIAG_ROOT/evidence/packages.json"
+          "$conda_exe" list --name OpenLPT --json > "$DIAG_ROOT/evidence/conda-packages.json"
+          py .github/scripts/tracking_shutdown_diagnostic.py collect
+          # Every native case (including import) runs as a separate GDB inferior.
+          py .github/scripts/tracking_shutdown_diagnostic.py diagnose
+          git diff --exit-code "$base" -- src inc openlpt.py setup.py CMakeLists.txt cmake _version.py pyproject.toml
+          echo 'Diagnostic collection completed; this is NOT tracking acceptance.'
+
+      - name: Upload fresh diagnostic evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracking-shutdown-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .opencode/diagnostics/tracking_shutdown/evidence/
+          include-hidden-files: false
+          if-no-files-found: error
+          retention-days: 7
