@@ -5,6 +5,12 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish distributions to PyPI'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   build_wheels:
@@ -12,7 +18,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Keep arm64 wheels on Sequoia so Homebrew selects its macOS 15 bottle.
+        os: [ubuntu-latest, windows-latest, macos-15]
 
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +52,7 @@ jobs:
   upload_pypi:
     needs: [build_wheels, build_sdist]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
     steps:
       - uses: actions/download-artifact@v4
         with:

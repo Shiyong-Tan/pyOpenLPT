@@ -1,13 +1,13 @@
 name: Sync to Lab Repository
 
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - 'v*'
   workflow_dispatch: # 允许手动触发
     inputs:
+      sync:
+        description: 'Sync to the lab repository'
+        type: boolean
+        required: false
+        default: false
       tag_name:
         description: '要同步的标签名称 (例如 v2.1.0)'
         required: false
@@ -15,6 +15,7 @@ on:
 
 jobs:
   repo-sync:
+    if: github.event_name == 'workflow_dispatch' && inputs.sync == true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code

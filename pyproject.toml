@@ -73,5 +73,20 @@ test-command = "python -c \"import openlpt; print('OpenLPT imported successfully
 before-all = "yum install -y libomp-devel || apt-get update && apt-get install -y libomp-dev || true"
 
 [tool.cibuildwheel.macos]
-before-build = "brew install libomp"
+# Use the host-compatible bottle; never relabel a newer-OS dylib as macOS 15.
+before-build = """
+brew install --force-bottle libomp &&
+libomp_load_commands=$(otool -l "$(brew --prefix libomp)/lib/libomp.dylib") &&
+printf '%s\\n' "$libomp_load_commands" |
+awk '
+  $1 == "cmd" { modern = ($2 == "LC_BUILD_VERSION"); legacy = ($2 == "LC_VERSION_MIN_MACOSX") }
+  (modern && $1 == "minos") || (legacy && $1 == "version") {
+    print "libomp minimum macOS:", $2
+    split($2, v, ".")
+    if (v[1] + 0 > 15 || (v[1] + 0 == 15 && (v[2] + 0 > 0 || v[3] + 0 > 0))) bad = 1
+    seen = 1
+  }
+  END { if (!seen || bad) exit 1 }
+'
+"""
 environment = { LDFLAGS="-L$(brew --prefix libomp)/lib", CPPFLAGS="-I$(brew --prefix libomp)/include", MACOSX_DEPLOYMENT_TARGET="15.0" }
